@@ -674,7 +674,11 @@ mod tests {
         require_gvisor!();
         let (exit_code, output) = run_gvisor_with_output(&unique_name("gv-cwd"), "pwd");
         assert_eq!(exit_code, 0);
-        assert_eq!(output.trim(), "/", "Default cwd should be /");
+        assert_eq!(
+            output.trim(),
+            "/workspace",
+            "Default cwd should be /workspace"
+        );
     }
 
     // -----------------------------------------------------------------------

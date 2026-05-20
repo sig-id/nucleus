@@ -21,7 +21,7 @@ mod tests {
         assert_eq!(config.process.args, vec!["/bin/sh"]);
         assert_eq!(config.hostname, Some("test".to_string()));
         assert!(config.process.no_new_privileges);
-        assert_eq!(config.process.cwd, "/");
+        assert_eq!(config.process.cwd, "/workspace");
     }
 
     #[test]
@@ -60,6 +60,7 @@ mod tests {
         assert!(mount_dests.contains(&"/proc"));
         assert!(mount_dests.contains(&"/dev"));
         assert!(mount_dests.contains(&"/tmp"));
+        assert!(mount_dests.contains(&"/home/agent"));
         assert!(mount_dests.contains(&"/sys"));
     }
 

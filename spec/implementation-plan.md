@@ -10,6 +10,7 @@
 
 ### 1.2 CLI Interface
 - [x] Implement argument parsing with clap
+- [x] Document stable programmatic launch config via `nucleus run --config` and `--config-fd`
 - [x] Validate input parameters
 - [x] Parse resource limits (512M, 1G, etc.)
 - [x] Add --help and --version
@@ -100,6 +101,7 @@
 - [x] execve(2) wrapper
 - [x] Handle signals (SIGTERM, SIGKILL)
 - [x] Reap zombie processes
+- [x] PTY/console mode with controlling TTY, OCI console socket handoff, and raw byte stream semantics
 
 ## Phase 7: Testing & Documentation (Week 7)
 

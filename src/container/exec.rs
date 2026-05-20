@@ -65,6 +65,14 @@ impl Container {
             crate::audit::redact_command(&self.config.command)
         );
 
+        std::env::set_current_dir(&self.config.workdir).map_err(|e| {
+            NucleusError::ExecError(format!(
+                "Failed to set working directory to {}: {}",
+                self.config.workdir.display(),
+                e
+            ))
+        })?;
+
         let program = CString::new(self.config.command[0].as_str())
             .map_err(|e| NucleusError::ExecError(format!("Invalid program name: {}", e)))?;
 
@@ -84,9 +92,14 @@ impl Container {
                 .map_err(|e| NucleusError::ExecError(format!("Invalid environment PATH: {}", e)))?,
             CString::new("TERM=xterm")
                 .map_err(|e| NucleusError::ExecError(format!("Invalid environment TERM: {}", e)))?,
-            CString::new("HOME=/")
-                .map_err(|e| NucleusError::ExecError(format!("Invalid environment HOME: {}", e)))?,
         ];
+        if !self.config.environment.iter().any(|(key, _)| key == "HOME") {
+            env.push(
+                CString::new(format!("HOME={}", self.config.home.display())).map_err(|e| {
+                    NucleusError::ExecError(format!("Invalid environment HOME: {}", e))
+                })?,
+            );
+        }
 
         // Pass through sd_notify socket if enabled.
         // Validate the socket path to prevent the container from communicating
@@ -148,8 +161,8 @@ impl Container {
             }
             env.push(CString::new(format!("{}={}", key, value)).map_err(|e| {
                 NucleusError::ExecError(format!(
-                    "Invalid environment variable {}={}: {}",
-                    key, value, e
+                    "Invalid environment variable value for {}: {}",
+                    key, e
                 ))
             })?);
         }
@@ -191,6 +204,7 @@ impl Container {
                     Signal::SIGQUIT,
                     Signal::SIGUSR1,
                     Signal::SIGUSR2,
+                    Signal::SIGWINCH,
                 ] {
                     sigset.add(sig);
                 }

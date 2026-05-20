@@ -53,6 +53,8 @@ mod tests {
         assert!(matches!(config.network, NetworkMode::None));
         assert!(matches!(config.context_mode, ContextMode::Copy));
         assert!(config.secrets.is_empty());
+        assert_eq!(config.home, PathBuf::from("/home/agent"));
+        assert!(config.provider_configs.is_empty());
         assert!(config.environment.is_empty());
         assert!(!config.sd_notify);
         assert!(config.use_gvisor);
@@ -403,6 +405,46 @@ mod tests {
             .with_allow_degraded_security(true);
 
         assert!(config.validate_production_mode().is_ok());
+    }
+
+    #[test]
+    fn test_strict_agent_mode_does_not_require_production_rootfs() {
+        let config = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
+            .with_service_mode(ServiceMode::StrictAgent);
+
+        assert!(config.validate_strict_agent_mode().is_ok());
+        assert!(config.validate_production_mode().is_ok());
+        assert!(config.rootfs_path.is_none());
+    }
+
+    #[test]
+    fn test_strict_agent_mode_rejects_relaxed_security_flags() {
+        let degraded = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
+            .with_service_mode(ServiceMode::StrictAgent)
+            .with_allow_degraded_security(true);
+        let chroot = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
+            .with_service_mode(ServiceMode::StrictAgent)
+            .with_allow_chroot_fallback(true);
+
+        assert!(degraded.validate_strict_agent_mode().is_err());
+        assert!(chroot.validate_strict_agent_mode().is_err());
+    }
+
+    #[test]
+    fn test_strict_agent_mode_requires_cgroup_control_but_not_memory_cpu() {
+        let config = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
+            .with_service_mode(ServiceMode::StrictAgent);
+        let unlimited = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
+            .with_service_mode(ServiceMode::StrictAgent)
+            .with_limits(ResourceLimits::unlimited());
+
+        assert!(config.validate_strict_agent_mode().is_ok());
+        assert!(unlimited.validate_strict_agent_mode().is_err());
     }
 
     // --- ContainerState ---

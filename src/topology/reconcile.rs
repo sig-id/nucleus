@@ -499,6 +499,11 @@ fn build_service_run_command(
         args.push(cidr.clone());
     }
 
+    for domain in &svc.egress_domains {
+        args.push("--egress-domain".to_string());
+        args.push(domain.clone());
+    }
+
     for port in &svc.egress_tcp_ports {
         args.push("--egress-tcp-port".to_string());
         args.push(port.to_string());
@@ -902,6 +907,7 @@ name = "test"
 rootfs = "/nix/store/web"
 command = ["/bin/web"]
 memory = "256M"
+egress_domains = ["api.example.com"]
 "#;
         let config = TopologyConfig::from_toml(toml).unwrap();
         let svc = config.services.get("web").unwrap();
@@ -912,6 +918,9 @@ memory = "256M"
         assert!(args
             .windows(2)
             .any(|pair| { pair[0] == "--topology-config-hash" && pair[1] == "42" }));
+        assert!(args
+            .windows(2)
+            .any(|pair| { pair[0] == "--egress-domain" && pair[1] == "api.example.com" }));
         assert!(args.iter().any(|arg| arg == "--quiet-id"));
     }
 

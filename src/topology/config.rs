@@ -104,6 +104,10 @@ pub struct ServiceDef {
     #[serde(default)]
     pub egress_allow: Vec<String>,
 
+    /// Allowed exact egress domains
+    #[serde(default)]
+    pub egress_domains: Vec<String>,
+
     /// Allowed egress TCP ports
     #[serde(default)]
     pub egress_tcp_ports: Vec<u16>,
@@ -383,6 +387,24 @@ impl TopologyConfig {
                 }
             }
 
+            for cidr in &svc.egress_allow {
+                crate::network::validate_egress_cidr(cidr).map_err(|e| {
+                    crate::error::NucleusError::ConfigError(format!(
+                        "Service '{}' has invalid egress_allow entry '{}': {}",
+                        name, cidr, e
+                    ))
+                })?;
+            }
+
+            for domain in &svc.egress_domains {
+                crate::network::validate_egress_domain(domain).map_err(|e| {
+                    crate::error::NucleusError::ConfigError(format!(
+                        "Service '{}' has invalid egress_domains entry '{}': {}",
+                        name, domain, e
+                    ))
+                })?;
+            }
+
             // Validate volume mounts reference existing volume defs
             for vol_mount in &svc.volumes {
                 let parsed = parse_service_volume_mount(vol_mount)?;
@@ -477,6 +499,7 @@ networks = ["internal"]
 nat_backend = "userspace"
 port_forwards = ["8443:8443"]
 egress_allow = ["10.42.0.0/24"]
+egress_domains = ["api.example.com"]
 
 [[services.web.depends_on]]
 service = "postgres"
@@ -491,7 +514,27 @@ condition = "healthy"
             config.services["web"].nat_backend,
             crate::network::NatBackend::Userspace
         );
+        assert_eq!(
+            config.services["web"].egress_domains,
+            vec!["api.example.com"]
+        );
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_rejects_invalid_egress_domain() {
+        let toml = r#"
+name = "bad"
+
+[services.web]
+rootfs = "/nix/store/web"
+command = ["/bin/web"]
+memory = "256M"
+egress_domains = ["*.example.com"]
+"#;
+        let config = TopologyConfig::from_toml(toml).unwrap();
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("egress_domains"));
     }
 
     #[test]

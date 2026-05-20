@@ -1,22 +1,24 @@
 use crate::audit::{audit, audit_error, AuditEventType};
 use crate::container::{
     ContainerConfig, ContainerState, ContainerStateManager, ContainerStateParams, OciStatus,
-    ServiceMode,
+    ServiceMode, WorkspaceMode,
 };
 use crate::error::{NucleusError, Result, StateTransition};
 use crate::filesystem::{
-    audit_mounts, bind_mount_host_paths, bind_mount_rootfs, create_dev_nodes, create_minimal_fs,
-    mask_proc_paths, mount_procfs, mount_secrets_inmemory, mount_volumes, snapshot_context_dir,
-    switch_root, validate_production_rootfs_path, verify_context_manifest,
+    audit_mounts, bind_mount_host_paths, bind_mount_rootfs, copy_workspace_in, create_dev_nodes,
+    create_minimal_fs, mask_proc_paths, mount_home_tmpfs, mount_procfs, mount_provider_configs,
+    mount_secrets_inmemory, mount_volumes, mount_workspace, snapshot_context_dir, switch_root,
+    sync_workspace_out, validate_production_rootfs_path, verify_context_manifest,
     verify_rootfs_attestation, FilesystemState, LazyContextPopulator, TmpfsMount,
 };
 use crate::isolation::{NamespaceManager, UserNamespaceMapper};
 use crate::network::{BridgeDriver, BridgeNetwork, NatBackend, NetworkMode, UserspaceNetwork};
-use crate::resources::Cgroup;
+use crate::resources::{Cgroup, ResourceStats};
 use crate::security::{
     CapabilityManager, GVisorRuntime, LandlockManager, OciContainerState, OciHooks,
     SeccompDenyLogger, SeccompManager, SeccompTraceReader, SecurityState,
 };
+use crate::telemetry::{CleanupEvent, ContainerControlEvent, EventSink, ExitStatusEvent};
 use caps::{CapSet, Capability, CapsHashSet};
 use nix::sys::signal::{kill, Signal};
 use nix::sys::signal::{pthread_sigmask, SigSet, SigmaskHow};
@@ -27,12 +29,14 @@ use nix::unistd::{
 };
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use tempfile::Builder;
 use tracing::{debug, error, info, info_span, warn};
+
+use super::console::{NativeConsoleRelay, NativePty};
 
 /// Container runtime that orchestrates all isolation mechanisms
 ///
@@ -47,6 +51,7 @@ pub struct Container {
     /// Pre-resolved runsc path, resolved before fork so that user-namespace
     /// UID changes don't block PATH-based lookup.
     pub(super) runsc_path: Option<String>,
+    pub(super) event_sink: Option<EventSink>,
 }
 
 /// Handle returned by `Container::create()` representing a container whose
@@ -62,6 +67,8 @@ pub struct CreatedContainer {
     pub(super) trace_reader: Option<SeccompTraceReader>,
     pub(super) deny_logger: Option<SeccompDenyLogger>,
     pub(super) exec_fifo_path: Option<PathBuf>,
+    pub(super) native_console_master: Option<OwnedFd>,
+    pub(super) event_sink: Option<EventSink>,
     pub(super) _lifecycle_span: tracing::Span,
 }
 
@@ -70,7 +77,13 @@ impl Container {
         Self {
             config,
             runsc_path: None,
+            event_sink: None,
         }
+    }
+
+    pub fn with_event_sink(mut self, event_sink: Option<EventSink>) -> Self {
+        self.event_sink = event_sink;
+        self
     }
 
     /// Run the container (convenience wrapper: create + start)
@@ -85,10 +98,11 @@ impl Container {
         self.create_internal(true)
     }
 
-    /// H6: Close all file descriptors > 2 in the child process after fork.
+    /// H6: Mark all file descriptors > 2 close-on-exec in the child process after fork.
     ///
-    /// This prevents leaking host sockets, pipes, and state files into the
-    /// container. Uses close_range(2) when available, falls back to /proc/self/fd.
+    /// This prevents leaking host sockets, pipes, and state files into the executed
+    /// workload while preserving setup-time pipes and PTY handles until exec.
+    /// Uses close_range(2) when available, falls back to /proc/self/fd.
     fn sanitize_fds() {
         // Try close_range(3, u32::MAX, CLOSE_RANGE_CLOEXEC) first – it's
         // O(1) on Linux 5.9+ and marks all FDs as close-on-exec.
@@ -99,8 +113,8 @@ impl Container {
         if ret == 0 {
             return;
         }
-        // Fallback: iterate /proc/self/fd and close individually.
-        // Collect fds first, then close – closing during iteration would
+        // Fallback: iterate /proc/self/fd and set FD_CLOEXEC individually.
+        // Collect fds first, then update – changing fds during iteration would
         // invalidate the ReadDir's own directory fd.
         if let Ok(entries) = std::fs::read_dir("/proc/self/fd") {
             let fds: Vec<i32> = entries
@@ -110,7 +124,7 @@ impl Container {
                 .filter(|&fd| fd > 2)
                 .collect();
             for fd in fds {
-                unsafe { libc::close(fd) };
+                unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
             }
         }
     }
@@ -220,6 +234,150 @@ impl Container {
         Ok(())
     }
 
+    fn prepare_workspace_staging(
+        config: &mut ContainerConfig,
+        runtime_base_override: Option<&Path>,
+        host_is_root: bool,
+        needs_external_userns_mapping: bool,
+    ) -> Result<()> {
+        if config.workspace.mode != WorkspaceMode::CopyInOut {
+            return Ok(());
+        }
+
+        let source = config.workspace.host_path.clone().ok_or_else(|| {
+            NucleusError::ConfigError(
+                "--workspace-mode copy-in-out requires --workspace".to_string(),
+            )
+        })?;
+        let parent = runtime_base_override
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| {
+                dirs::runtime_dir()
+                    .map(|d| d.join("nucleus"))
+                    .unwrap_or_else(std::env::temp_dir)
+            });
+        std::fs::create_dir_all(&parent).map_err(|e| {
+            NucleusError::FilesystemError(format!(
+                "Failed to create workspace staging parent {:?}: {}",
+                parent, e
+            ))
+        })?;
+
+        let staging = parent.join(format!("workspace-{}", config.id));
+        if staging.exists() {
+            return Err(NucleusError::FilesystemError(format!(
+                "Workspace staging directory already exists: {}",
+                staging.display()
+            )));
+        }
+        std::fs::create_dir(&staging).map_err(|e| {
+            NucleusError::FilesystemError(format!(
+                "Failed to create workspace staging directory {:?}: {}",
+                staging, e
+            ))
+        })?;
+        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o700)).map_err(
+            |e| {
+                NucleusError::FilesystemError(format!(
+                    "Failed to secure workspace staging directory {:?}: {}",
+                    staging, e
+                ))
+            },
+        )?;
+
+        copy_workspace_in(&source, &staging)?;
+
+        if host_is_root && needs_external_userns_mapping {
+            let user_config = config.user_ns_config.as_ref().ok_or_else(|| {
+                NucleusError::ExecError("Missing user namespace configuration".to_string())
+            })?;
+            let host_uid = Self::mapped_host_id_for_container_id(
+                &user_config.uid_mappings,
+                0,
+                "uid mappings",
+            )?;
+            let host_gid = Self::mapped_host_id_for_container_id(
+                &user_config.gid_mappings,
+                0,
+                "gid mappings",
+            )?;
+            Self::chown_tree_no_symlinks(&staging, host_uid, host_gid)?;
+        }
+
+        config.workspace.staging_path = Some(staging);
+        Ok(())
+    }
+
+    fn chown_tree_no_symlinks(path: &Path, uid: u32, gid: u32) -> Result<()> {
+        let metadata = std::fs::symlink_metadata(path).map_err(|e| {
+            NucleusError::FilesystemError(format!(
+                "Failed to stat workspace staging path {:?}: {}",
+                path, e
+            ))
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Ok(());
+        }
+
+        chown(path, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid))).map_err(|e| {
+            NucleusError::FilesystemError(format!(
+                "Failed to chown workspace staging path {:?} to {}:{}: {}",
+                path, uid, gid, e
+            ))
+        })?;
+
+        if metadata.is_dir() {
+            for entry in std::fs::read_dir(path).map_err(|e| {
+                NucleusError::FilesystemError(format!(
+                    "Failed to read workspace staging dir {:?}: {}",
+                    path, e
+                ))
+            })? {
+                let entry = entry.map_err(|e| {
+                    NucleusError::FilesystemError(format!(
+                        "Failed to read workspace staging entry in {:?}: {}",
+                        path, e
+                    ))
+                })?;
+                Self::chown_tree_no_symlinks(&entry.path(), uid, gid)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn sync_workspace_copy_in_out(config: &ContainerConfig) -> Result<()> {
+        if config.workspace.mode != WorkspaceMode::CopyInOut {
+            return Ok(());
+        }
+        let Some(staging) = config.workspace.staging_path.as_ref() else {
+            return Err(NucleusError::FilesystemError(
+                "copy-in-out workspace missing staging path".to_string(),
+            ));
+        };
+        let Some(host_path) = config.workspace.host_path.as_ref() else {
+            return Err(NucleusError::FilesystemError(
+                "copy-in-out workspace missing host path".to_string(),
+            ));
+        };
+
+        sync_workspace_out(staging, host_path)
+    }
+
+    fn cleanup_workspace_staging(config: &ContainerConfig) {
+        if config.workspace.mode != WorkspaceMode::CopyInOut {
+            return;
+        }
+        if let Some(staging) = config.workspace.staging_path.as_ref() {
+            if let Err(e) = std::fs::remove_dir_all(staging) {
+                warn!(
+                    "Failed to remove workspace staging directory {:?}: {}",
+                    staging, e
+                );
+            }
+        }
+    }
+
     fn mapped_host_id_for_container_id(
         mappings: &[crate::isolation::IdMapping],
         container_id: u32,
@@ -294,11 +452,14 @@ impl Container {
         }
 
         // C2: When running as root without user namespace, enable UID remapping
-        // in production mode (mandatory) or warn in other modes. Without user
+        // in strict modes (mandatory) or warn in relaxed agent mode. Without user
         // namespace, a container escape yields full host root.
         if is_root && !config.namespaces.user {
-            if config.service_mode == ServiceMode::Production {
-                info!("Running as root in production mode: enabling user namespace with UID remapping");
+            if config.service_mode.requires_user_namespace_mapping() {
+                info!(
+                    "Running as root in {}: enabling user namespace with UID remapping",
+                    config.service_mode.label()
+                );
                 config.namespaces.user = true;
                 config.user_ns_config =
                     Some(crate::isolation::UserNamespaceConfig::root_remapped());
@@ -306,20 +467,13 @@ impl Container {
                 warn!(
                     "Running as root WITHOUT user namespace isolation. \
                      Container processes will run as real host UID 0. \
-                     Use --user-ns or production mode for UID remapping."
+                     Use --user-ns, strict-agent mode, or production mode for UID remapping."
                 );
             }
         }
 
-        // Log console-socket acceptance (OCI interface; PTY forwarding is a future enhancement)
-        if let Some(ref socket_path) = config.console_socket {
-            warn!(
-                "Console socket {} accepted but terminal forwarding is not yet implemented",
-                socket_path.display()
-            );
-        }
-
-        // Validate production mode invariants before anything else.
+        // Validate service-mode invariants before anything else.
+        config.validate_strict_agent_mode()?;
         config.validate_production_mode()?;
         if config.service_mode == ServiceMode::Production {
             let rootfs_path = config.rootfs_path.as_ref().ok_or_else(|| {
@@ -388,11 +542,12 @@ impl Container {
                         Some(cgroup)
                     }
                     Err(e) => {
-                        if config.service_mode == ServiceMode::Production {
+                        if config.service_mode.requires_cgroup_enforcement() {
                             let _ = cgroup.cleanup();
                             return Err(NucleusError::CgroupError(format!(
-                                "Production mode requires cgroup resource enforcement, but \
+                                "{} requires cgroup resource enforcement, but \
                                  applying limits failed: {}",
+                                config.service_mode.label(),
                                 e
                             )));
                         }
@@ -403,10 +558,11 @@ impl Container {
                 }
             }
             Err(e) => {
-                if config.service_mode == ServiceMode::Production {
+                if config.service_mode.requires_cgroup_enforcement() {
                     return Err(NucleusError::CgroupError(format!(
-                        "Production mode requires cgroup resource enforcement, but \
+                        "{} requires cgroup resource enforcement, but \
                          cgroup creation failed: {}",
+                        config.service_mode.label(),
                         e
                     )));
                 }
@@ -447,6 +603,19 @@ impl Container {
             && (!config.use_gvisor || gvisor_needs_precreated_userns);
         let runtime_base_override =
             Self::prepare_runtime_base_override(&config, is_root, needs_external_userns_mapping)?;
+        Self::prepare_workspace_staging(
+            &mut config,
+            runtime_base_override.as_deref(),
+            is_root,
+            needs_external_userns_mapping,
+        )?;
+
+        let event_sink = self.event_sink.clone();
+        let mut native_pty = if config.terminal && !config.use_gvisor {
+            Some(NativePty::open(config.console_size)?)
+        } else {
+            None
+        };
 
         // Child notifies parent after namespaces are ready.
         let (ready_read, ready_write) = pipe().map_err(|e| {
@@ -489,6 +658,10 @@ impl Container {
                     } else {
                         (None, None)
                     };
+                let mut native_console_master = native_pty.as_mut().and_then(|pty| {
+                    drop(pty.slave.take());
+                    pty.master.take()
+                });
                 info!("Forked child process: {}", child);
 
                 // Use a closure so that on any error we kill the forked child.
@@ -532,6 +705,23 @@ impl Container {
 
                     let target_pid = Self::wait_for_namespace_ready(&ready_read, child)?;
                     target_pid_for_cleanup = Some(target_pid);
+
+                    if !config.use_gvisor {
+                        if let Some(ref socket_path) = config.console_socket {
+                            let master = native_console_master.take().ok_or_else(|| {
+                                NucleusError::ExecError(
+                                    "Terminal mode requested but no native PTY master is available"
+                                        .to_string(),
+                                )
+                            })?;
+                            NativePty::send_master_to_console_socket(socket_path, &master)?;
+                            info!(
+                                "Sent PTY master for container {} to console socket {}",
+                                config.id,
+                                socket_path.display()
+                            );
+                        }
+                    }
 
                     let cgroup_path = cgroup_opt
                         .as_ref()
@@ -602,7 +792,7 @@ impl Container {
                                         egress,
                                         config.user_ns_config.is_some(),
                                     ) {
-                                        if config.service_mode == ServiceMode::Production {
+                                        if config.service_mode.enforces_strict_isolation() {
                                             return Err(NucleusError::NetworkError(format!(
                                                 "Failed to apply egress policy: {}",
                                                 e
@@ -614,7 +804,7 @@ impl Container {
                                 network_driver = Some(net);
                             }
                             Err(e) => {
-                                if config.service_mode == ServiceMode::Production {
+                                if config.service_mode.enforces_strict_isolation() {
                                     return Err(e);
                                 }
                                 warn!("Failed to set up bridge networking: {}", e);
@@ -642,6 +832,8 @@ impl Container {
                         trace_reader,
                         deny_logger,
                         exec_fifo_path: exec_fifo,
+                        native_console_master,
+                        event_sink,
                         _lifecycle_span: lifecycle_span.clone(),
                     })
                 };
@@ -666,9 +858,17 @@ impl Container {
                     } else {
                         (None, None)
                     };
+                let native_console_slave = native_pty.as_mut().and_then(|pty| {
+                    drop(pty.master.take());
+                    pty.slave.take()
+                });
                 // H6: Close inherited FDs > 2 to prevent leaking host sockets/pipes
                 Self::sanitize_fds();
-                let temp_container = Container { config, runsc_path };
+                let temp_container = Container {
+                    config,
+                    runsc_path,
+                    event_sink: None,
+                };
                 match temp_container.setup_and_exec(
                     Some(ready_write),
                     userns_request_write,
@@ -676,6 +876,7 @@ impl Container {
                     Some(parent_setup_read),
                     exec_fifo,
                     runtime_base_override,
+                    native_console_slave,
                 ) {
                     Ok(_) => unreachable!(),
                     Err(e) => {
@@ -729,6 +930,7 @@ impl Container {
         parent_setup_pipe: Option<OwnedFd>,
         exec_fifo: Option<PathBuf>,
         runtime_base_override: Option<PathBuf>,
+        native_console_slave: Option<OwnedFd>,
     ) -> Result<()> {
         let is_rootless = self.config.user_ns_config.is_some();
         let allow_degraded_security = Self::allow_degraded_security(&self.config);
@@ -885,7 +1087,7 @@ impl Container {
 
         // 5. Create device nodes and standard tmpfs mounts under /dev
         let dev_path = container_root.join("dev");
-        create_dev_nodes(&dev_path, false)?;
+        create_dev_nodes(&dev_path, self.config.terminal)?;
 
         // /dev/shm – POSIX shared memory (shm_open). Required by PostgreSQL,
         // Redis, and other programs that use POSIX shared memory segments.
@@ -933,10 +1135,27 @@ impl Container {
             bind_mount_host_paths(&container_root, is_rootless)?;
         }
 
-        // 7b. Mount persistent or ephemeral volumes over the base filesystem.
+        // 7a. Mount the private sandbox home.
+        mount_home_tmpfs(
+            &container_root,
+            &self.config.home,
+            &self.config.process_identity,
+        )?;
+
+        // 7b. Mount explicit provider CLI config paths under the sandbox home.
+        mount_provider_configs(
+            &container_root,
+            &self.config.home,
+            &self.config.provider_configs,
+        )?;
+
+        // 7c. Mount or stage the first-class workspace at /workspace.
+        mount_workspace(&container_root, &self.config.workspace)?;
+
+        // 7d. Mount persistent or ephemeral volumes over the base filesystem.
         mount_volumes(&container_root, &self.config.volumes)?;
 
-        // 7c. Write resolv.conf for bridge networking.
+        // 7e. Write resolv.conf for bridge networking.
         // When rootfs is mounted, /etc is read-only, so we bind-mount a writable
         // resolv.conf over the top (same technique as secrets).
         if let NetworkMode::Bridge(ref bridge_config) = self.config.network {
@@ -955,7 +1174,7 @@ impl Container {
             }
         }
 
-        // 7d. Mount secrets on an in-memory tmpfs in all modes.
+        // 7f. Mount secrets on an in-memory tmpfs in all modes.
         mount_secrets_inmemory(
             &container_root,
             &self.config.secrets,
@@ -1218,9 +1437,29 @@ impl Container {
         } else {
             let mut landlock_mgr = LandlockManager::new();
             landlock_mgr.assert_minimum_abi(self.config.service_mode == ServiceMode::Production)?;
+            landlock_mgr.set_workspace_access(
+                self.config.workspace.is_read_only(),
+                self.config.workspace.allow_execute,
+            );
+            landlock_mgr.add_rw_path(&self.config.home.to_string_lossy());
             // Register volume mount destinations so Landlock permits access to them
+            for provider_config in &self.config.provider_configs {
+                let provider_dest = crate::filesystem::normalize_provider_config_destination(
+                    &self.config.home,
+                    &provider_config.dest,
+                )?;
+                if provider_config.read_only {
+                    landlock_mgr.add_ro_path(&provider_dest.to_string_lossy());
+                } else {
+                    landlock_mgr.add_rw_path(&provider_dest.to_string_lossy());
+                }
+            }
             for vol in &self.config.volumes {
-                landlock_mgr.add_rw_path(&vol.dest.to_string_lossy());
+                if vol.read_only {
+                    landlock_mgr.add_ro_path(&vol.dest.to_string_lossy());
+                } else {
+                    landlock_mgr.add_rw_path(&vol.dest.to_string_lossy());
+                }
             }
             landlock_mgr.apply_container_policy_with_mode(allow_degraded_security)?
         };
@@ -1282,6 +1521,10 @@ impl Container {
             }
         }
 
+        if let Some(slave) = native_console_slave {
+            NativePty::configure_child_terminal(slave)?;
+        }
+
         // 15. In production mode with PID namespace, run as a mini-init (PID 1)
         // that reaps zombies and forwards signals, rather than exec-ing directly.
         if self.config.service_mode == ServiceMode::Production && self.config.namespaces.pid {
@@ -1310,6 +1553,7 @@ impl Container {
             Signal::SIGQUIT,
             Signal::SIGUSR1,
             Signal::SIGUSR2,
+            Signal::SIGWINCH,
         ] {
             set.add(signal);
         }
@@ -1348,6 +1592,7 @@ impl Container {
                     Signal::SIGQUIT,
                     Signal::SIGUSR1,
                     Signal::SIGUSR2,
+                    Signal::SIGWINCH,
                 ] {
                     restore.add(signal);
                 }
@@ -1638,6 +1883,26 @@ impl Container {
 }
 
 impl CreatedContainer {
+    fn emit_control_event(&self, event: ContainerControlEvent) {
+        if let Some(sink) = &self.event_sink {
+            if let Err(e) = sink.emit(&event) {
+                warn!("Failed to emit control event: {}", e);
+            }
+        }
+    }
+
+    fn collect_resource_stats(
+        cgroup_path: Option<&str>,
+    ) -> (Option<ResourceStats>, Option<String>) {
+        match cgroup_path {
+            Some(path) => match ResourceStats::from_cgroup(path) {
+                Ok(stats) => (Some(stats), None),
+                Err(e) => (None, Some(e.to_string())),
+            },
+            None => (None, None),
+        }
+    }
+
     /// Start phase: release the child via the exec FIFO, transition to Running,
     /// then wait for the child to exit with full lifecycle management.
     pub fn start(mut self) -> Result<i32> {
@@ -1663,11 +1928,15 @@ impl CreatedContainer {
         }
 
         // Transition: Created -> Running
-        self.state.status = OciStatus::Running;
-        self.state_mgr.save_state(&self.state)?;
-
         let target_pid = self.state.pid;
         let child = self.child;
+        self.state.status = OciStatus::Running;
+        self.state_mgr.save_state(&self.state)?;
+        self.emit_control_event(ContainerControlEvent::started(
+            config,
+            target_pid,
+            self.state.cgroup_path.clone(),
+        ));
 
         let (sig_stop, sig_handle) =
             Container::setup_signal_forwarding_static(Pid::from_raw(target_pid as i32))?;
@@ -1676,6 +1945,15 @@ impl CreatedContainer {
         let mut sig_guard = SignalThreadGuard {
             stop: Some(sig_stop),
             handle: Some(sig_handle),
+        };
+
+        let mut console_relay = if config.terminal && config.console_socket.is_none() {
+            self.native_console_master
+                .take()
+                .map(NativeConsoleRelay::start)
+                .transpose()?
+        } else {
+            None
         };
 
         // Run readiness probe before declaring service ready
@@ -1746,7 +2024,7 @@ impl CreatedContainer {
         }
 
         let mut child_waited = false;
-        let run_result: Result<i32> = (|| {
+        let mut run_result: Result<i32> = (|| {
             let exit_code = Container::wait_for_child_static(child)?;
 
             // Transition: Running -> Stopped
@@ -1759,6 +2037,9 @@ impl CreatedContainer {
 
         // Explicitly stop threads (guards would do this on drop too, but
         // explicit teardown keeps ordering visible).
+        if let Some(relay) = console_relay.as_mut() {
+            relay.stop();
+        }
         health_guard.stop();
         sig_guard.stop();
 
@@ -1776,9 +2057,32 @@ impl CreatedContainer {
             }
         }
 
+        let cgroup_path_for_summary = self.state.cgroup_path.clone();
+        let (resource_stats, resource_stats_error) =
+            Self::collect_resource_stats(cgroup_path_for_summary.as_deref());
+        let mut cleanup_errors = Vec::new();
+
+        let workspace_synced = match Container::sync_workspace_copy_in_out(config) {
+            Ok(()) => true,
+            Err(e) => {
+                let msg = format!("workspace sync failed: {}", e);
+                warn!("{}", msg);
+                cleanup_errors.push(msg);
+                if run_result.is_ok() {
+                    run_result = Err(e);
+                }
+                false
+            }
+        };
+        if workspace_synced {
+            Container::cleanup_workspace_staging(config);
+        }
+
         if let Some(net) = self.network_driver.take() {
             if let Err(e) = net.cleanup() {
-                warn!("Failed to cleanup container networking: {}", e);
+                let msg = format!("network cleanup failed: {}", e);
+                warn!("{}", msg);
+                cleanup_errors.push(msg);
             }
         }
 
@@ -1797,22 +2101,39 @@ impl CreatedContainer {
 
         if let Some(cgroup) = self.cgroup_opt.take() {
             if let Err(e) = cgroup.cleanup() {
-                warn!("Failed to cleanup cgroup: {}", e);
+                let msg = format!("cgroup cleanup failed: {}", e);
+                warn!("{}", msg);
+                cleanup_errors.push(msg);
             }
         }
 
         if config.use_gvisor {
             if let Err(e) = Container::cleanup_gvisor_artifacts(&config.id) {
-                warn!(
-                    "Failed to cleanup gVisor artifacts for {}: {}",
-                    config.id, e
-                );
+                let msg = format!("gVisor artifact cleanup failed for {}: {}", config.id, e);
+                warn!("{}", msg);
+                cleanup_errors.push(msg);
             }
         }
 
         if let Err(e) = self.state_mgr.delete_state(&config.id) {
-            warn!("Failed to delete state for {}: {}", config.id, e);
+            let msg = format!("state cleanup failed for {}: {}", config.id, e);
+            warn!("{}", msg);
+            cleanup_errors.push(msg);
         }
+
+        let exit_status_event = match &run_result {
+            Ok(exit_code) => ExitStatusEvent::code(*exit_code),
+            Err(e) => ExitStatusEvent::error(e.to_string()),
+        };
+        self.emit_control_event(ContainerControlEvent::summary(
+            config,
+            target_pid,
+            cgroup_path_for_summary,
+            exit_status_event,
+            resource_stats,
+            resource_stats_error,
+            CleanupEvent::from_errors(cleanup_errors),
+        ));
 
         match run_result {
             Ok(exit_code) => {

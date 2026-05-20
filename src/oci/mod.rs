@@ -1,8 +1,8 @@
-use crate::container::OciStatus;
+use crate::container::{ConsoleSize, OciStatus};
 use crate::error::{NucleusError, Result};
 use crate::filesystem::{
     is_immediate_nix_store_object_path, normalize_container_destination,
-    normalize_volume_destination, ROOTFS_STORE_PATHS_FILE,
+    normalize_provider_config_destination, normalize_volume_destination, ROOTFS_STORE_PATHS_FILE,
 };
 use crate::isolation::{IdMapping, NamespaceConfig, UserNamespaceConfig};
 use crate::resources::ResourceLimits;
@@ -740,8 +740,9 @@ impl OciConfig {
                 args: command,
                 env: vec![
                     "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
+                    "HOME=/home/agent".to_string(),
                 ],
-                cwd: "/".to_string(),
+                cwd: "/workspace".to_string(),
                 no_new_privileges: true,
                 capabilities: Some(OciCapabilities {
                     bounding: vec![],
@@ -801,6 +802,20 @@ impl OciConfig {
                         "noexec".to_string(),
                         "mode=1777".to_string(),
                         "size=65536k".to_string(),
+                    ],
+                },
+                OciMount {
+                    destination: "/home/agent".to_string(),
+                    source: "tmpfs".to_string(),
+                    mount_type: "tmpfs".to_string(),
+                    options: vec![
+                        "nosuid".to_string(),
+                        "nodev".to_string(),
+                        "noexec".to_string(),
+                        "mode=0700".to_string(),
+                        "size=262144k".to_string(),
+                        "uid=0".to_string(),
+                        "gid=0".to_string(),
                     ],
                 },
                 OciMount {
@@ -959,12 +974,64 @@ impl OciConfig {
         self
     }
 
+    /// Configure the process as terminal-attached with an initial console size.
+    pub fn with_terminal(mut self, size: ConsoleSize) -> Self {
+        self.process.terminal = true;
+        self.process.console_size = Some(OciConsoleSize {
+            height: size.height as u32,
+            width: size.width as u32,
+        });
+        self
+    }
+
     /// Add environment variables to the OCI process config.
     pub fn with_env(mut self, vars: &[(String, String)]) -> Self {
+        if vars.iter().any(|(key, _)| key == "HOME") {
+            self.process.env.retain(|entry| !entry.starts_with("HOME="));
+        }
         for (key, value) in vars {
             self.process.env.push(format!("{}={}", key, value));
         }
         self
+    }
+
+    /// Add or replace the private sandbox home tmpfs mount.
+    pub fn with_home_tmpfs(
+        mut self,
+        home: &Path,
+        identity: &crate::container::ProcessIdentity,
+    ) -> Result<Self> {
+        let dest = normalize_container_destination(home)?;
+        let dest_str = dest.to_string_lossy().to_string();
+
+        self.process.env.retain(|entry| !entry.starts_with("HOME="));
+        self.process.env.push(format!("HOME={}", dest_str));
+
+        self.mounts
+            .retain(|mount| mount.destination != "/home/agent");
+        self.mounts.push(OciMount {
+            destination: dest_str,
+            source: "tmpfs".to_string(),
+            mount_type: "tmpfs".to_string(),
+            options: vec![
+                "nosuid".to_string(),
+                "nodev".to_string(),
+                "noexec".to_string(),
+                "mode=0700".to_string(),
+                "size=262144k".to_string(),
+                format!("uid={}", identity.uid),
+                format!("gid={}", identity.gid),
+            ],
+        });
+
+        Ok(self)
+    }
+
+    /// Set the OCI process working directory.
+    pub fn with_workdir(mut self, workdir: &Path) -> Result<Self> {
+        let normalized = normalize_container_destination(workdir)?;
+        self.process.cwd = normalized.to_string_lossy().to_string();
+        Ok(self)
     }
 
     /// Add sd_notify socket passthrough.
@@ -1099,6 +1166,91 @@ impl OciConfig {
                 }
             }
         }
+
+        Ok(self)
+    }
+
+    /// Add explicit provider CLI config bind mounts under the sandbox home.
+    pub fn with_provider_config_mounts(
+        mut self,
+        home: &Path,
+        provider_configs: &[crate::container::ProviderConfigMount],
+    ) -> Result<Self> {
+        for provider_config in provider_configs {
+            crate::filesystem::validate_provider_config_source(&provider_config.source)?;
+            let source = fs::canonicalize(&provider_config.source).map_err(|e| {
+                NucleusError::FilesystemError(format!(
+                    "Failed to canonicalize provider config source {:?}: {}",
+                    provider_config.source, e
+                ))
+            })?;
+            let dest = normalize_provider_config_destination(home, &provider_config.dest)?;
+
+            let mut options = vec![
+                "bind".to_string(),
+                "nosuid".to_string(),
+                "nodev".to_string(),
+                "noexec".to_string(),
+            ];
+            if provider_config.read_only {
+                options.push("ro".to_string());
+            }
+
+            self.mounts.push(OciMount {
+                destination: dest.to_string_lossy().to_string(),
+                source: source.to_string_lossy().to_string(),
+                mount_type: "bind".to_string(),
+                options,
+            });
+        }
+
+        Ok(self)
+    }
+
+    /// Add the first-class workspace bind mount.
+    pub fn with_workspace_mount(
+        mut self,
+        workspace: &crate::container::WorkspaceConfig,
+    ) -> Result<Self> {
+        let Some(source) = workspace.effective_host_path() else {
+            return Ok(self);
+        };
+        if workspace.mode == crate::container::WorkspaceMode::CopyInOut {
+            let metadata = fs::symlink_metadata(source).map_err(|e| {
+                NucleusError::FilesystemError(format!(
+                    "Failed to stat workspace staging path {:?}: {}",
+                    source, e
+                ))
+            })?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(NucleusError::FilesystemError(format!(
+                    "Workspace staging path must be a real directory: {:?}",
+                    source
+                )));
+            }
+        } else {
+            crate::filesystem::validate_workspace_host_path(source)?;
+        }
+        let dest = normalize_container_destination(&workspace.container_path)?;
+
+        let mut options = vec![
+            "bind".to_string(),
+            "nosuid".to_string(),
+            "nodev".to_string(),
+        ];
+        if workspace.is_read_only() {
+            options.push("ro".to_string());
+        }
+        if !workspace.allow_execute {
+            options.push("noexec".to_string());
+        }
+
+        self.mounts.push(OciMount {
+            destination: dest.to_string_lossy().to_string(),
+            source: source.to_string_lossy().to_string(),
+            mount_type: "bind".to_string(),
+            options,
+        });
 
         Ok(self)
     }
@@ -1659,6 +1811,21 @@ mod tests {
         assert_eq!(config.root.path, "rootfs");
         assert_eq!(config.process.args, vec!["/bin/sh"]);
         assert_eq!(config.hostname, Some("test".to_string()));
+        assert!(!config.process.terminal);
+        assert!(config.process.console_size.is_none());
+    }
+
+    #[test]
+    fn test_oci_config_with_terminal_sets_console_size() {
+        let config = OciConfig::new(vec!["/bin/sh".to_string()], None).with_terminal(ConsoleSize {
+            width: 120,
+            height: 40,
+        });
+
+        assert!(config.process.terminal);
+        let size = config.process.console_size.unwrap();
+        assert_eq!(size.width, 120);
+        assert_eq!(size.height, 40);
     }
 
     #[test]
@@ -1963,6 +2130,100 @@ mod tests {
                 && mount.mount_type == "tmpfs"
                 && mount.options.contains(&"size=64M".to_string())
         }));
+    }
+
+    #[test]
+    fn test_workspace_mount_defaults_noexec_and_cwd() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workspace = crate::container::WorkspaceConfig::new()
+            .with_host_path(tmp.path().to_path_buf())
+            .with_mode(crate::container::WorkspaceMode::BindRw);
+        let config = OciConfig::new(vec!["/bin/sh".to_string()], None)
+            .with_workspace_mount(&workspace)
+            .unwrap();
+
+        assert_eq!(config.process.cwd, "/workspace");
+        assert!(config.process.env.contains(&"HOME=/home/agent".to_string()));
+        assert!(config.mounts.iter().any(|mount| {
+            mount.destination == "/workspace"
+                && mount.mount_type == "bind"
+                && mount.options.contains(&"noexec".to_string())
+                && !mount.options.contains(&"ro".to_string())
+        }));
+    }
+
+    #[test]
+    fn test_home_tmpfs_defaults_and_process_identity_options() {
+        let identity = crate::container::ProcessIdentity {
+            uid: 1000,
+            gid: 1001,
+            additional_gids: Vec::new(),
+        };
+        let config = OciConfig::new(vec!["/bin/sh".to_string()], None)
+            .with_home_tmpfs(std::path::Path::new("/home/agent"), &identity)
+            .unwrap();
+
+        assert!(config.process.env.contains(&"HOME=/home/agent".to_string()));
+        let mount = config
+            .mounts
+            .iter()
+            .find(|mount| mount.destination == "/home/agent")
+            .unwrap();
+        assert_eq!(mount.mount_type, "tmpfs");
+        assert!(mount.options.contains(&"noexec".to_string()));
+        assert!(mount.options.contains(&"uid=1000".to_string()));
+        assert!(mount.options.contains(&"gid=1001".to_string()));
+    }
+
+    #[test]
+    fn test_workspace_exec_removes_noexec() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workspace = crate::container::WorkspaceConfig::new()
+            .with_host_path(tmp.path().to_path_buf())
+            .with_allow_execute(true);
+        let config = OciConfig::new(vec!["/bin/sh".to_string()], None)
+            .with_workspace_mount(&workspace)
+            .unwrap();
+
+        let mount = config
+            .mounts
+            .iter()
+            .find(|mount| mount.destination == "/workspace")
+            .unwrap();
+        assert!(!mount.options.contains(&"noexec".to_string()));
+    }
+
+    #[test]
+    fn test_provider_config_mounts_are_home_relative_and_noexec() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let provider_dir = tmp.path().join("aws");
+        fs::create_dir(&provider_dir).unwrap();
+
+        let config = OciConfig::new(vec!["/bin/sh".to_string()], None)
+            .with_provider_config_mounts(
+                std::path::Path::new("/home/agent"),
+                &[crate::container::ProviderConfigMount {
+                    source: provider_dir.clone(),
+                    dest: std::path::PathBuf::from(".aws"),
+                    read_only: true,
+                }],
+            )
+            .unwrap();
+
+        let mount = config
+            .mounts
+            .iter()
+            .find(|mount| mount.destination == "/home/agent/.aws")
+            .unwrap();
+        assert_eq!(
+            mount.source,
+            fs::canonicalize(provider_dir)
+                .unwrap()
+                .to_string_lossy()
+                .to_string()
+        );
+        assert!(mount.options.contains(&"ro".to_string()));
+        assert!(mount.options.contains(&"noexec".to_string()));
     }
 
     #[test]

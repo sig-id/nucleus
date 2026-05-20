@@ -131,8 +131,24 @@ Applied after pivot_root, Landlock restricts what the container process can do w
 | `/etc`, `/dev`, `/proc` | Read |
 | `/tmp` | Full (read, write, create, remove) |
 | `/context` | Read-only |
+| `/workspace` | Read/write or read-only according to `--workspace-mode`; no execute unless `--workspace-exec` |
+| configured home (`/home/agent` by default) | Read/write/create/remove; no execute |
 | `/` | Directory traversal only (ReadDir) |
 | Everything else | **Denied** |
+
+Workspace execution is explicit. Native Landlock denies execute on writable
+workspace mounts by default, matching the `noexec` mount option used for
+workspace bind and staging mounts. `--workspace-exec` is an agent-mode escape
+hatch for build/test workflows and grants execute on `/workspace`; production
+mode rejects writable executable workspaces to avoid drop-and-exec attacks.
+OCI/gVisor receives the same mount contract through bundle mount options:
+workspace mounts are `nosuid,nodev,noexec` unless `--workspace-exec` is set.
+
+The sandbox home is a private tmpfs and is writable by the workload, but not
+executable. Provider configuration mounts are explicit exceptions under that
+home. Read-only provider mounts rely on both mount-level `ro` and the default
+no-execute policy; read-write provider mounts are only for tools that need to
+refresh local token caches.
 
 **Custom policy** (via `--landlock-policy <path>.toml`):
 ```toml
@@ -239,7 +255,35 @@ All security-critical actions emit structured JSON events via `tracing::info!(ta
 
 Events include container ID, name, timestamp, and detail string.
 
-### 11. Production Mode Hardening
+### 11. Strict Agent Mode
+
+Strict agent mode (`--service-mode strict-agent`, alias `--service-mode mitos-agent`, or `--strict-agent`) is for ephemeral agent workloads that need production-style fail-closed isolation without production service packaging.
+
+It enforces these startup invariants:
+
+- **Cgroups required**: cgroup creation and configured limit application are fatal on failure.
+- **pivot_root required**: native runtime must switch root with `pivot_root`; `chroot` fallback is rejected.
+- **Seccomp required**: seccomp must be in enforce mode and successfully installed; trace mode is rejected.
+- **Landlock required on native**: native runtime must fully enforce Landlock policy.
+- **User namespace remapping required when needed**: rootless launches and host-root launches must have valid UID/GID maps; mapping failures are fatal.
+- **Network default none**: no network remains the default. Bridge networking must specify DNS explicitly, and native host networking is rejected.
+- **Domain-aware egress**: `--egress-domain` entries are exact DNS names resolved to IPv4 `/32` rules at startup; wildcard domains and packet-time DNS matching are out of scope.
+- **No argv secret env**: provider launchers can pass sensitive environment values through `--env-fd` instead of placing them in process argv.
+
+It intentionally does not require production service inputs:
+
+- No mandatory Nix rootfs or rootfs attestation.
+- No mandatory health checks, readiness probes, or sd_notify.
+- No systemd or NixOS module deployment semantics.
+- No production PID 1 mini-init requirement; strict agents still exec directly.
+
+Strict agents may still choose an immutable runtime surface with
+`--agent-toolchain-rootfs <path>`. That path is an agent-specific rootfs used to
+launch provider CLIs and development tools inside the sandbox without exposing
+host `/bin`, `/usr`, `/lib`, or `/nix` runtime binds. It is not a production
+service requirement, and production mode must use `--rootfs` plus attestation.
+
+### 12. Production Mode Hardening
 
 Production mode (`--service-mode production`) enforces additional invariants:
 
@@ -248,10 +292,10 @@ Production mode (`--service-mode production`) enforces additional invariants:
 - **Mount audit**: Verifies mount flags (MS_RDONLY, MS_NOSUID, MS_NODEV) on security-sensitive paths post-setup; fatal on mismatch
 - **hidepid=2**: `/proc` mounted with `hidepid=2` to hide other processes
 - **Landlock ABI**: Requires V3 minimum (adds truncate protection)
-- **Deny-all egress**: Default egress policy when no `--egress-allow` specified
+- **Deny-all egress**: Default egress policy when no `--egress-allow` or `--egress-domain` is specified
 - **Seccomp trace forbidden**: `--seccomp-mode trace` rejected at config validation
 
-### 12. Security Policy File Architecture
+### 13. Security Policy File Architecture
 
 Security policy is separated from structural configuration (Nix) for auditability and independent change cadence:
 

@@ -164,6 +164,7 @@ mod tests {
                     health_check: None,
                     health_interval: 30,
                     egress_allow: vec![],
+                    egress_domains: vec![],
                     egress_tcp_ports: vec![],
                     port_forwards: vec![],
                     environment: BTreeMap::new(),

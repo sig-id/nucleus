@@ -17,6 +17,14 @@ const TARGET_ABI: ABI = ABI::V5;
 /// production workloads.
 const MINIMUM_PRODUCTION_ABI: ABI = ABI::V3;
 
+#[derive(Debug, Clone, Copy)]
+enum PathAccessMode {
+    ReadOnly,
+    ReadExecute,
+    ReadWrite,
+    ReadWriteExecute,
+}
+
 /// Landlock filesystem access-control manager
 ///
 /// Implements fine-grained, path-based filesystem restrictions as an additional
@@ -29,21 +37,53 @@ const MINIMUM_PRODUCTION_ABI: ABI = ABI::V3;
 pub struct LandlockManager {
     applied: bool,
     /// Additional paths to grant read+write access to (e.g. volume mounts).
-    extra_rw_paths: Vec<String>,
+    extra_paths: Vec<(String, PathAccessMode)>,
+    /// Access policy for the first-class `/workspace` path.
+    workspace_access: PathAccessMode,
 }
 
 impl LandlockManager {
     pub fn new() -> Self {
         Self {
             applied: false,
-            extra_rw_paths: Vec::new(),
+            extra_paths: Vec::new(),
+            workspace_access: PathAccessMode::ReadWrite,
         }
     }
 
     /// Register additional paths that need read+write access.
     /// Used for volume mounts that aren't under the default allowed paths.
     pub fn add_rw_path(&mut self, path: &str) {
-        self.extra_rw_paths.push(path.to_string());
+        self.extra_paths
+            .push((path.to_string(), PathAccessMode::ReadWrite));
+    }
+
+    /// Register additional paths that need read-only access.
+    pub fn add_ro_path(&mut self, path: &str) {
+        self.extra_paths
+            .push((path.to_string(), PathAccessMode::ReadOnly));
+    }
+
+    /// Register additional paths that need read+execute access.
+    pub fn add_read_exec_path(&mut self, path: &str) {
+        self.extra_paths
+            .push((path.to_string(), PathAccessMode::ReadExecute));
+    }
+
+    /// Register additional paths that need read+write+execute access.
+    pub fn add_rw_exec_path(&mut self, path: &str) {
+        self.extra_paths
+            .push((path.to_string(), PathAccessMode::ReadWriteExecute));
+    }
+
+    /// Configure Landlock access for `/workspace`.
+    pub fn set_workspace_access(&mut self, read_only: bool, allow_execute: bool) {
+        self.workspace_access = match (read_only, allow_execute) {
+            (true, false) => PathAccessMode::ReadOnly,
+            (true, true) => PathAccessMode::ReadExecute,
+            (false, false) => PathAccessMode::ReadWrite,
+            (false, true) => PathAccessMode::ReadWriteExecute,
+        };
     }
 
     /// Apply the container Landlock policy.
@@ -57,6 +97,8 @@ impl LandlockManager {
     /// - `/proc`:            read (already mounted read-only)
     /// - `/tmp`:             read + write + create + remove (agent scratch space)
     /// - `/context`:         read-only (pre-populated agent data)
+    /// - `/workspace`:       workspace policy (read/write by default, execute opt-in)
+    /// - configured home:    registered by runtime as read/write, no execute
     ///
     /// Everything else is denied by the ruleset.
     pub fn apply_container_policy(&mut self) -> Result<bool> {
@@ -242,6 +284,7 @@ impl LandlockManager {
         // Executing from /tmp is a common attack pattern (drop-and-exec).
         let mut access_tmp = access_all;
         access_tmp.remove(AccessFs::Execute);
+        let access_rw_exec = access_tmp | AccessFs::Execute;
 
         let mut ruleset = Ruleset::default()
             .handle_access(access_all)
@@ -333,19 +376,55 @@ impl LandlockManager {
                 .map_err(ll_err)?;
         }
 
-        // Volume mounts and other dynamically registered paths: full read+write
-        // (but no execute – same policy as /tmp to prevent drop-and-exec).
-        for path in &self.extra_rw_paths {
+        // /workspace: stable agent workspace. Writable by default, but not
+        // executable unless --workspace-exec explicitly opts into that risk.
+        if let Ok(fd) = PathFd::new("/workspace") {
+            let access = Self::access_for_mode(
+                self.workspace_access,
+                access_read,
+                access_read_exec,
+                access_tmp,
+                access_rw_exec,
+            );
+            ruleset = ruleset
+                .add_rule(PathBeneath::new(fd, access))
+                .map_err(ll_err)?;
+        }
+
+        // Volume mounts and other dynamically registered paths.
+        for (path, mode) in &self.extra_paths {
             if let Ok(fd) = PathFd::new(path) {
-                debug!("Landlock: granting rw access to volume path {:?}", path);
+                debug!("Landlock: granting {:?} access to path {:?}", mode, path);
+                let access = Self::access_for_mode(
+                    *mode,
+                    access_read,
+                    access_read_exec,
+                    access_tmp,
+                    access_rw_exec,
+                );
                 ruleset = ruleset
-                    .add_rule(PathBeneath::new(fd, access_tmp))
+                    .add_rule(PathBeneath::new(fd, access))
                     .map_err(ll_err)?;
             }
         }
 
         let status = ruleset.restrict_self().map_err(ll_err)?;
         Ok(status.ruleset)
+    }
+
+    fn access_for_mode(
+        mode: PathAccessMode,
+        access_read: landlock::BitFlags<AccessFs>,
+        access_read_exec: landlock::BitFlags<AccessFs>,
+        access_read_write: landlock::BitFlags<AccessFs>,
+        access_read_write_exec: landlock::BitFlags<AccessFs>,
+    ) -> landlock::BitFlags<AccessFs> {
+        match mode {
+            PathAccessMode::ReadOnly => access_read,
+            PathAccessMode::ReadExecute => access_read_exec,
+            PathAccessMode::ReadWrite => access_read_write,
+            PathAccessMode::ReadWriteExecute => access_read_write_exec,
+        }
     }
 
     fn build_execute_allowlist_and_restrict(
@@ -481,6 +560,20 @@ mod tests {
         assert!(
             fn_body.contains("\"/run/secrets\"") || fn_body.contains("\"/run\""),
             "Landlock build_and_restrict must include a rule for /run/secrets"
+        );
+    }
+
+    #[test]
+    fn test_policy_covers_workspace_without_default_execute() {
+        let source = include_str!("landlock.rs");
+        let fn_body = extract_fn_body(source, "fn build_and_restrict");
+        assert!(
+            fn_body.contains("\"/workspace\""),
+            "Landlock build_and_restrict must include /workspace"
+        );
+        assert!(
+            source.contains("set_workspace_access"),
+            "LandlockManager must expose explicit workspace access selection"
         );
     }
 

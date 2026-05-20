@@ -244,7 +244,7 @@ impl ContainerAttach {
                 .map_err(|e| NucleusError::AttachError(format!("Invalid PATH env: {}", e)))?,
             CString::new("TERM=xterm")
                 .map_err(|e| NucleusError::AttachError(format!("Invalid TERM env: {}", e)))?,
-            CString::new("HOME=/")
+            CString::new("HOME=/home/agent")
                 .map_err(|e| NucleusError::AttachError(format!("Invalid HOME env: {}", e)))?,
         ])
     }

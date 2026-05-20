@@ -7,6 +7,13 @@ Nucleus uses memory-backed filesystems (tmpfs/ramfs) for container root to achie
 - **Fast startup** - No image extraction
 - **Ephemeral by default** - Data disappears on exit
 - **Context pre-population** - Copy agent context before exec
+- **First-class workspace** - Mount or stage a host workspace at a stable
+  `/workspace` path for coding agents and tools that need a predictable cwd
+- **Private home** - Mount a writable tmpfs home for provider CLIs without
+  exposing the host home directory
+- **Agent toolchain rootfs** - Optionally replace host runtime binds with a
+  reproducible rootfs that contains provider CLIs and development tools needed
+  by agent orchestrators such as Mitos
 
 ## Filesystem Types
 
@@ -48,6 +55,13 @@ Nucleus uses memory-backed filesystems (tmpfs/ramfs) for container root to achie
 │   └── docs/
 │       └── api.md
 │
+├── workspace/          # First-class workspace mount/stage
+│   └── ...             # Host project tree from --workspace
+│
+├── home/
+│   └── agent/          # Private tmpfs home, default HOME
+│       └── ...         # Optional provider config mounts
+│
 ├── bin/                # Minimal binaries
 │   ├── sh            # Statically linked shell (busybox)
 │   ├── ls
@@ -72,6 +86,82 @@ Nucleus uses memory-backed filesystems (tmpfs/ramfs) for container root to achie
     ├── group
     └── hostname
 ```
+
+## Workspace Mount
+
+`--workspace <host-path>` establishes the host project tree as a first-class
+container workspace. The container destination is fixed at `/workspace`; use
+regular `--volume SOURCE:DEST[:ro|rw]` only for additional mounts that are not
+the primary workspace contract.
+
+`--workdir <container-path>` selects the process working directory and defaults
+to `/workspace`. The runtime creates `/workspace` even when no workspace is
+configured so the default cwd is stable.
+
+`--workspace-mode` controls how the host path is exposed:
+
+| Mode | Behavior |
+|------|----------|
+| `bind-rw` | Bind-mount the host path at `/workspace` read-write. |
+| `bind-ro` | Bind-mount the host path at `/workspace` read-only. |
+| `copy-in-out` | Copy the host path into a private staging directory, bind the staging directory at `/workspace`, then sync the staged tree back to the host path after the workload exits. |
+
+Workspace bind mounts are `nosuid,nodev,noexec` by default. `--workspace-exec`
+removes `noexec` from the workspace mount and grants Landlock execute rights for
+`/workspace`; it is intended for agent-mode build and test workflows that need
+to run generated binaries. Without `--workspace-exec`, native Landlock allows
+workspace reads and writes but denies execution from the workspace. Production
+mode rejects writable executable workspaces; production workloads should use an
+immutable rootfs plus explicit, narrow policy files instead.
+
+## Sandbox Home and Provider Config Mounts
+
+The workload gets a private home tmpfs at `/home/agent` by default. `--home`
+selects a different absolute container path. The selected home path is mounted
+as tmpfs with `nosuid,nodev,noexec`, mode `0700`, and ownership matching the
+configured workload uid/gid. Nucleus sets the default `HOME` environment value
+to the selected home path unless an explicit `HOME` variable is provided.
+
+Provider credential and configuration directories must be mounted explicitly:
+
+| Flag | Behavior |
+|------|----------|
+| `--provider-config-ro SOURCE:DEST` | Bind-mount a host provider config path read-only. |
+| `--provider-config-rw SOURCE:DEST` | Bind-mount a host provider config path read-write for token refresh workflows. |
+
+`DEST` may be an absolute path under the selected home, or a path relative to
+the selected home. Provider config mounts are `nosuid,nodev,noexec`; read-only
+mounts also carry `ro`. They intentionally use a narrower source policy than
+generic `--volume` so callers can mount specific host-home credential
+directories such as `$HOME/.aws` without allowing broad `/home` exposure.
+
+## Agent Toolchain Rootfs
+
+Agent and strict-agent workloads may use an **agent toolchain rootfs** instead
+of inheriting host runtime paths. This rootfs is a Nix-built directory tree that
+contains the tools an agent orchestrator expects to launch inside the sandbox:
+provider CLIs such as Claude, Codex, and Gemini; shells; Git; TLS
+certificates; language runtimes; compilers; and package managers.
+
+The contract is:
+
+- `--agent-toolchain-rootfs <path>` is accepted only in agent-style modes
+  (`agent`, `strict-agent`, and the `mitos-agent` alias).
+- The path must be absolute and resolve to an existing directory. Nix store
+  paths are recommended because they are immutable and stable across detached
+  launches.
+- The runtime mounts the toolchain rootfs read-only using the same rootfs bind
+  mechanism as `--rootfs`, then applies context, workspace, volumes, network
+  config, and secrets as normal.
+- The rootfs should provide `/bin/sh` and `/usr/bin/env` compatibility because
+  provider CLIs and package-manager shims commonly rely on those paths.
+- Production services should continue to use `--rootfs` with rootfs attestation
+  instead of `--agent-toolchain-rootfs`.
+
+`nucleus.lib.mkAgentToolchainRootfs` builds this rootfs contract from Nix. It
+includes a broad default development toolchain and accepts provider CLI
+packages so integrations can pin exactly which agent providers are available
+inside the sandbox.
 
 ## Context Population
 

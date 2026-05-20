@@ -1,9 +1,10 @@
 use crate::error::{NucleusError, Result};
+use serde::Serialize;
 use std::fs;
 use std::path::Path;
 
 /// Resource usage statistics for a container
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ResourceStats {
     /// Memory usage in bytes
     pub memory_usage: u64,

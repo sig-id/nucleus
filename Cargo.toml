@@ -50,8 +50,8 @@ path = "src/main.rs"
 thiserror = "2"
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-nix = { version = "0.31", features = ["process", "sched", "mount", "user", "signal", "fs", "hostname"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+nix = { version = "0.31", features = ["process", "sched", "mount", "user", "signal", "fs", "hostname", "term", "socket"] }
 libc = "0.2"
 caps = "0.5"
 seccompiler = "0.5"

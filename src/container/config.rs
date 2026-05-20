@@ -1,5 +1,7 @@
 use crate::filesystem::{
-    normalize_container_destination, normalize_volume_destination, validate_production_rootfs_path,
+    normalize_container_destination, normalize_provider_config_destination,
+    normalize_volume_destination, validate_production_rootfs_path, validate_provider_config_source,
+    validate_workspace_host_path,
 };
 use crate::isolation::{NamespaceConfig, UserNamespaceConfig};
 use crate::network::EgressPolicy;
@@ -8,8 +10,11 @@ use crate::security::GVisorPlatform;
 use std::fs::OpenOptions;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::io::RawFd;
 use std::path::PathBuf;
 use std::time::Duration;
+
+pub const DEFAULT_HOME_PATH: &str = "/home/agent";
 
 fn open_dev_urandom() -> crate::error::Result<std::fs::File> {
     let file = OpenOptions::new()
@@ -64,6 +69,7 @@ pub fn generate_container_id() -> crate::error::Result<String> {
     serde::Serialize,
     serde::Deserialize,
 )]
+#[serde(rename_all = "kebab-case")]
 pub enum TrustLevel {
     /// Native kernel isolation (namespaces + seccomp + Landlock) is acceptable.
     Trusted,
@@ -74,8 +80,8 @@ pub enum TrustLevel {
 
 /// Service mode for the container.
 ///
-/// Determines whether the container runs as an ephemeral agent sandbox
-/// or a long-running production service with stricter requirements.
+/// Determines whether the container runs as an ephemeral agent sandbox,
+/// a fail-closed agent sandbox, or a long-running production service.
 #[derive(
     Debug,
     Clone,
@@ -87,10 +93,16 @@ pub enum TrustLevel {
     serde::Serialize,
     serde::Deserialize,
 )]
+#[serde(rename_all = "kebab-case")]
 pub enum ServiceMode {
     /// Ephemeral agent workload (default). Allows degraded fallbacks.
     #[default]
     Agent,
+    /// Ephemeral agent workload with fail-closed isolation, but without
+    /// production service rootfs, health, sd_notify, or NixOS semantics.
+    #[value(name = "strict-agent", alias = "mitos-agent")]
+    #[serde(alias = "mitos-agent")]
+    StrictAgent,
     /// Long-running production service. Enforces strict security invariants:
     /// - Forbids degraded security, chroot fallback, and native host network mode
     /// - Allows gvisor-host only with explicit gVisor runtime and hostinet opt-in
@@ -100,19 +112,56 @@ pub enum ServiceMode {
     Production,
 }
 
+impl ServiceMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Agent => "Agent mode",
+            Self::StrictAgent => "Strict agent mode",
+            Self::Production => "Production mode",
+        }
+    }
+
+    pub fn enforces_strict_isolation(self) -> bool {
+        matches!(self, Self::StrictAgent | Self::Production)
+    }
+
+    pub fn requires_user_namespace_mapping(self) -> bool {
+        self.enforces_strict_isolation()
+    }
+
+    pub fn requires_cgroup_enforcement(self) -> bool {
+        self.enforces_strict_isolation()
+    }
+
+    pub fn requires_explicit_bridge_dns(self) -> bool {
+        self.enforces_strict_isolation()
+    }
+}
+
 /// CLI-level runtime selection.
 ///
 /// Parsed by clap at argument time – invalid values are caught immediately.
 /// The variant triggers additional logic in `apply_runtime_selection`.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, serde::Serialize, serde::Deserialize,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    clap::ValueEnum,
+    serde::Serialize,
+    serde::Deserialize,
 )]
 pub enum RuntimeSelection {
     /// gVisor sandbox runtime (default). Provides kernel-level isolation.
+    #[default]
     #[value(name = "gvisor")]
+    #[serde(rename = "gvisor")]
     GVisor,
     /// Native kernel isolation (namespaces + seccomp + Landlock).
     #[value(name = "native")]
+    #[serde(rename = "native")]
     Native,
 }
 
@@ -126,22 +175,33 @@ pub enum RuntimeSelection {
 pub enum NetworkModeArg {
     /// No network (default).
     #[value(name = "none")]
+    #[serde(rename = "none")]
     None,
     /// Native host network namespace sharing (dangerous).
     #[value(name = "host")]
+    #[serde(rename = "host")]
     Host,
     /// gVisor hostinet mode; requires --runtime gvisor and --allow-host-network.
     #[value(name = "gvisor-host")]
+    #[serde(rename = "gvisor-host")]
     GVisorHost,
     /// Virtual bridge with veth pair.
     #[value(name = "bridge")]
+    #[serde(rename = "bridge")]
     Bridge,
+}
+
+impl Default for NetworkModeArg {
+    fn default() -> Self {
+        Self::None
+    }
 }
 
 /// Required host kernel lockdown mode, when asserted by the runtime.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, serde::Serialize, serde::Deserialize,
 )]
+#[serde(rename_all = "kebab-case")]
 pub enum KernelLockdownMode {
     /// Integrity mode blocks kernel writes from privileged userspace.
     Integrity,
@@ -203,6 +263,17 @@ pub struct SecretMount {
     pub mode: u32,
 }
 
+/// Provider CLI credential/config bind mount under the sandbox home.
+#[derive(Debug, Clone)]
+pub struct ProviderConfigMount {
+    /// Source path on the host.
+    pub source: PathBuf,
+    /// Destination path inside the container home.
+    pub dest: PathBuf,
+    /// Whether the provider config is mounted read-only.
+    pub read_only: bool,
+}
+
 /// Runtime identity for the workload process inside the container.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessIdentity {
@@ -236,6 +307,65 @@ impl Default for ProcessIdentity {
     }
 }
 
+/// Terminal dimensions for PTY-backed workloads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConsoleSize {
+    /// Width in terminal columns.
+    pub width: u16,
+    /// Height in terminal rows.
+    pub height: u16,
+}
+
+impl ConsoleSize {
+    pub const DEFAULT_WIDTH: u16 = 80;
+    pub const DEFAULT_HEIGHT: u16 = 24;
+
+    /// Detect the caller's terminal size, falling back to COLUMNS/LINES and
+    /// finally 80x24 when no terminal is attached.
+    pub fn detect() -> Self {
+        Self::from_fd(libc::STDIN_FILENO)
+            .or_else(Self::from_env)
+            .unwrap_or_default()
+    }
+
+    fn from_fd(fd: RawFd) -> Option<Self> {
+        let mut winsize = libc::winsize {
+            ws_row: 0,
+            ws_col: 0,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let ret = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut winsize) };
+        if ret == 0 && winsize.ws_col > 0 && winsize.ws_row > 0 {
+            Some(Self {
+                width: winsize.ws_col,
+                height: winsize.ws_row,
+            })
+        } else {
+            None
+        }
+    }
+
+    fn from_env() -> Option<Self> {
+        let width = std::env::var("COLUMNS").ok()?.parse::<u16>().ok()?;
+        let height = std::env::var("LINES").ok()?.parse::<u16>().ok()?;
+        if width > 0 && height > 0 {
+            Some(Self { width, height })
+        } else {
+            None
+        }
+    }
+}
+
+impl Default for ConsoleSize {
+    fn default() -> Self {
+        Self {
+            width: Self::DEFAULT_WIDTH,
+            height: Self::DEFAULT_HEIGHT,
+        }
+    }
+}
+
 /// Source backing for a volume mount.
 #[derive(Debug, Clone)]
 pub enum VolumeSource {
@@ -254,6 +384,102 @@ pub struct VolumeMount {
     pub dest: PathBuf,
     /// Whether the volume is mounted read-only.
     pub read_only: bool,
+}
+
+/// How a host workspace is exposed at `/workspace`.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    clap::ValueEnum,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkspaceMode {
+    /// Bind mount the host workspace read-write.
+    #[default]
+    #[value(name = "bind-rw")]
+    BindRw,
+    /// Bind mount the host workspace read-only.
+    #[value(name = "bind-ro")]
+    BindRo,
+    /// Copy the host workspace into a private stage and sync it back after exit.
+    #[value(name = "copy-in-out")]
+    CopyInOut,
+}
+
+/// First-class workspace mount configuration.
+#[derive(Debug, Clone)]
+pub struct WorkspaceConfig {
+    /// Source path on the host. `None` means no host workspace is mounted, but
+    /// `/workspace` still exists as the default cwd.
+    pub host_path: Option<PathBuf>,
+    /// Destination inside the container. Currently fixed to `/workspace`.
+    pub container_path: PathBuf,
+    /// Exposure mode for `host_path`.
+    pub mode: WorkspaceMode,
+    /// Whether execution from the workspace is allowed.
+    pub allow_execute: bool,
+    /// Private staging directory used for copy-in-out mode.
+    pub staging_path: Option<PathBuf>,
+}
+
+impl WorkspaceConfig {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_host_path(mut self, host_path: PathBuf) -> Self {
+        self.host_path = Some(host_path);
+        self
+    }
+
+    pub fn with_mode(mut self, mode: WorkspaceMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    pub fn with_allow_execute(mut self, allow_execute: bool) -> Self {
+        self.allow_execute = allow_execute;
+        self
+    }
+
+    pub fn with_staging_path(mut self, staging_path: PathBuf) -> Self {
+        self.staging_path = Some(staging_path);
+        self
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        matches!(self.mode, WorkspaceMode::BindRo)
+    }
+
+    pub fn is_writable(&self) -> bool {
+        !self.is_read_only()
+    }
+
+    pub fn effective_host_path(&self) -> Option<&PathBuf> {
+        if self.mode == WorkspaceMode::CopyInOut {
+            self.staging_path.as_ref()
+        } else {
+            self.host_path.as_ref()
+        }
+    }
+}
+
+impl Default for WorkspaceConfig {
+    fn default() -> Self {
+        Self {
+            host_path: None,
+            container_path: PathBuf::from("/workspace"),
+            mode: WorkspaceMode::default(),
+            allow_execute: false,
+            staging_path: None,
+        }
+    }
 }
 
 /// Readiness probe configuration.
@@ -340,6 +566,18 @@ pub struct ContainerConfig {
     /// Volume mounts to attach to the container filesystem.
     pub volumes: Vec<VolumeMount>,
 
+    /// First-class workspace mount/staging configuration.
+    pub workspace: WorkspaceConfig,
+
+    /// Private home directory mounted as tmpfs for provider CLIs.
+    pub home: PathBuf,
+
+    /// Provider CLI credential/config mounts under `home`.
+    pub provider_configs: Vec<ProviderConfigMount>,
+
+    /// Working directory for the workload process.
+    pub workdir: PathBuf,
+
     /// Environment variables to pass to the container process.
     pub environment: Vec<(String, String)>,
 
@@ -406,6 +644,12 @@ pub struct ContainerConfig {
     /// Path to AF_UNIX socket for console pseudo-terminal master (OCI --console-socket).
     pub console_socket: Option<PathBuf>,
 
+    /// Run the workload behind a PTY and make it a terminal-attached process.
+    pub terminal: bool,
+
+    /// Initial PTY window size.
+    pub console_size: ConsoleSize,
+
     /// Override OCI bundle directory path (OCI --bundle).
     pub bundle_dir: Option<PathBuf>,
 
@@ -426,6 +670,7 @@ pub struct ContainerConfig {
     serde::Serialize,
     serde::Deserialize,
 )]
+#[serde(rename_all = "kebab-case")]
 pub enum SeccompMode {
     /// Normal enforcement – deny unlisted syscalls.
     #[default]
@@ -492,6 +737,10 @@ impl ContainerConfig {
             readiness_probe: None,
             secrets: Vec::new(),
             volumes: Vec::new(),
+            workspace: WorkspaceConfig::default(),
+            home: PathBuf::from(DEFAULT_HOME_PATH),
+            provider_configs: Vec::new(),
+            workdir: PathBuf::from("/workspace"),
             environment: Vec::new(),
             process_identity: ProcessIdentity::default(),
             config_hash: None,
@@ -513,6 +762,8 @@ impl ContainerConfig {
             hooks: None,
             pid_file: None,
             console_socket: None,
+            terminal: false,
+            console_size: ConsoleSize::default(),
             bundle_dir: None,
             state_root: None,
         })
@@ -656,6 +907,30 @@ impl ContainerConfig {
     }
 
     #[must_use]
+    pub fn with_workspace(mut self, workspace: WorkspaceConfig) -> Self {
+        self.workspace = workspace;
+        self
+    }
+
+    #[must_use]
+    pub fn with_home(mut self, home: PathBuf) -> Self {
+        self.home = home;
+        self
+    }
+
+    #[must_use]
+    pub fn with_provider_config(mut self, provider_config: ProviderConfigMount) -> Self {
+        self.provider_configs.push(provider_config);
+        self
+    }
+
+    #[must_use]
+    pub fn with_workdir(mut self, workdir: PathBuf) -> Self {
+        self.workdir = workdir;
+        self
+    }
+
+    #[must_use]
     pub fn with_env(mut self, key: String, value: String) -> Self {
         self.environment.push((key, value));
         self
@@ -772,6 +1047,14 @@ impl ContainerConfig {
     #[must_use]
     pub fn with_console_socket(mut self, path: PathBuf) -> Self {
         self.console_socket = Some(path);
+        self.terminal = true;
+        self
+    }
+
+    #[must_use]
+    pub fn with_terminal(mut self, size: ConsoleSize) -> Self {
+        self.terminal = true;
+        self.console_size = size;
         self
     }
 
@@ -786,6 +1069,95 @@ impl ContainerConfig {
         self
     }
 
+    fn validate_fail_closed_isolation(&self) -> crate::error::Result<()> {
+        let mode = self.service_mode.label();
+        if self.allow_degraded_security {
+            return Err(crate::error::NucleusError::ConfigError(format!(
+                "{} forbids --allow-degraded-security",
+                mode
+            )));
+        }
+
+        if self.allow_chroot_fallback {
+            return Err(crate::error::NucleusError::ConfigError(format!(
+                "{} forbids --allow-chroot-fallback",
+                mode
+            )));
+        }
+
+        if matches!(self.network, crate::network::NetworkMode::Host) {
+            return Err(crate::error::NucleusError::ConfigError(format!(
+                "{} forbids native host network mode because it collapses the \
+                 runtime boundary; use --network gvisor-host with --runtime gvisor and \
+                 --allow-host-network when hostinet is required",
+                mode
+            )));
+        }
+
+        if matches!(self.network, crate::network::NetworkMode::GVisorHost) {
+            if !self.use_gvisor {
+                return Err(crate::error::NucleusError::ConfigError(format!(
+                    "{} requires --runtime gvisor for --network gvisor-host",
+                    mode
+                )));
+            }
+            if !self.allow_host_network {
+                return Err(crate::error::NucleusError::ConfigError(format!(
+                    "{} requires --allow-host-network for --network gvisor-host",
+                    mode
+                )));
+            }
+            if self.egress_policy.is_some() {
+                return Err(crate::error::NucleusError::ConfigError(format!(
+                    "{} cannot enforce egress policy with --network gvisor-host",
+                    mode
+                )));
+            }
+        } else if self.allow_host_network {
+            return Err(crate::error::NucleusError::ConfigError(format!(
+                "{} permits --allow-host-network only with --network gvisor-host",
+                mode
+            )));
+        }
+
+        if self.seccomp_mode == SeccompMode::Trace {
+            return Err(crate::error::NucleusError::ConfigError(format!(
+                "{} forbids --seccomp-mode trace",
+                mode
+            )));
+        }
+
+        if !self.seccomp_allow_syscalls.is_empty() {
+            let allow_network = !matches!(self.network, crate::network::NetworkMode::None);
+            crate::security::SeccompManager::validate_extra_syscalls_for_production(
+                allow_network,
+                &self.seccomp_allow_syscalls,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    /// Validate that strict agent mode invariants are satisfied.
+    /// Called before container startup when service_mode == StrictAgent.
+    pub fn validate_strict_agent_mode(&self) -> crate::error::Result<()> {
+        if self.service_mode != ServiceMode::StrictAgent {
+            return Ok(());
+        }
+
+        self.validate_fail_closed_isolation()?;
+
+        if !self.limits.has_cgroup_control() {
+            return Err(crate::error::NucleusError::ConfigError(
+                "Strict agent mode requires at least one cgroup control \
+                 (default --pids limit or explicit --memory/--cpus/--pids/--io-limit)"
+                    .to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
     /// Validate that production mode invariants are satisfied.
     /// Called before container startup when service_mode == Production.
     pub fn validate_production_mode(&self) -> crate::error::Result<()> {
@@ -793,49 +1165,12 @@ impl ContainerConfig {
             return Ok(());
         }
 
-        if self.allow_degraded_security {
-            return Err(crate::error::NucleusError::ConfigError(
-                "Production mode forbids --allow-degraded-security".to_string(),
-            ));
-        }
+        self.validate_fail_closed_isolation()?;
 
-        if self.allow_chroot_fallback {
+        if self.workspace.allow_execute && self.workspace.is_writable() {
             return Err(crate::error::NucleusError::ConfigError(
-                "Production mode forbids --allow-chroot-fallback".to_string(),
-            ));
-        }
-
-        if matches!(self.network, crate::network::NetworkMode::Host) {
-            return Err(crate::error::NucleusError::ConfigError(
-                "Production mode forbids native host network mode because it collapses the \
-                 runtime boundary; use --network gvisor-host with --runtime gvisor and \
-                 --allow-host-network when hostinet is required"
-                    .to_string(),
-            ));
-        }
-
-        if matches!(self.network, crate::network::NetworkMode::GVisorHost) {
-            if !self.use_gvisor {
-                return Err(crate::error::NucleusError::ConfigError(
-                    "Production mode requires --runtime gvisor for --network gvisor-host"
-                        .to_string(),
-                ));
-            }
-            if !self.allow_host_network {
-                return Err(crate::error::NucleusError::ConfigError(
-                    "Production mode requires --allow-host-network for --network gvisor-host"
-                        .to_string(),
-                ));
-            }
-            if self.egress_policy.is_some() {
-                return Err(crate::error::NucleusError::ConfigError(
-                    "Production mode cannot enforce egress policy with --network gvisor-host"
-                        .to_string(),
-                ));
-            }
-        } else if self.allow_host_network {
-            return Err(crate::error::NucleusError::ConfigError(
-                "Production mode permits --allow-host-network only with --network gvisor-host"
+                "Production mode forbids writable executable workspaces; use bind-ro with \
+                 --workspace-exec or remove --workspace-exec"
                     .to_string(),
             ));
         }
@@ -846,20 +1181,6 @@ impl ContainerConfig {
                 "Production mode requires explicit --rootfs path (no host bind mounts)".to_string(),
             ));
         };
-
-        if self.seccomp_mode == SeccompMode::Trace {
-            return Err(crate::error::NucleusError::ConfigError(
-                "Production mode forbids --seccomp-mode trace".to_string(),
-            ));
-        }
-
-        if !self.seccomp_allow_syscalls.is_empty() {
-            let allow_network = !matches!(self.network, crate::network::NetworkMode::None);
-            crate::security::SeccompManager::validate_extra_syscalls_for_production(
-                allow_network,
-                &self.seccomp_allow_syscalls,
-            )?;
-        }
 
         // L6: Policy files must have SHA-256 verification in production
         if self.caps_policy.is_some() && self.caps_policy_sha256.is_none() {
@@ -948,12 +1269,52 @@ impl ContainerConfig {
             ));
         }
 
+        normalize_container_destination(&self.workdir)?;
+        let workspace_path = normalize_container_destination(&self.workspace.container_path)?;
+        if workspace_path != PathBuf::from("/workspace") {
+            return Err(crate::error::NucleusError::ConfigError(
+                "Workspace destination is fixed at /workspace".to_string(),
+            ));
+        }
+        let home_path = normalize_container_destination(&self.home)?;
+        if home_path == workspace_path
+            || home_path.starts_with(&workspace_path)
+            || workspace_path.starts_with(&home_path)
+        {
+            return Err(crate::error::NucleusError::ConfigError(
+                "--home must not overlap /workspace".to_string(),
+            ));
+        }
+        if let Some(host_path) = &self.workspace.host_path {
+            validate_workspace_host_path(host_path)?;
+        }
+        if self.workspace.mode == WorkspaceMode::CopyInOut && self.workspace.host_path.is_none() {
+            return Err(crate::error::NucleusError::ConfigError(
+                "--workspace-mode copy-in-out requires --workspace".to_string(),
+            ));
+        }
+
         for secret in &self.secrets {
             normalize_container_destination(&secret.dest)?;
         }
 
+        for provider_config in &self.provider_configs {
+            validate_provider_config_source(&provider_config.source)?;
+            normalize_provider_config_destination(&home_path, &provider_config.dest)?;
+        }
+
         for volume in &self.volumes {
-            normalize_volume_destination(&volume.dest)?;
+            let volume_dest = normalize_volume_destination(&volume.dest)?;
+            if volume_dest == workspace_path {
+                return Err(crate::error::NucleusError::ConfigError(
+                    "Volume destination /workspace conflicts with --workspace".to_string(),
+                ));
+            }
+            if volume_dest == home_path {
+                return Err(crate::error::NucleusError::ConfigError(
+                    "Volume destination conflicts with --home".to_string(),
+                ));
+            }
             match &volume.source {
                 VolumeSource::Bind { source } => {
                     if !source.is_absolute() {
@@ -1163,6 +1524,8 @@ mod tests {
         assert!(cfg.egress_policy.is_none());
         assert!(cfg.secrets.is_empty());
         assert!(cfg.volumes.is_empty());
+        assert_eq!(cfg.home, PathBuf::from(DEFAULT_HOME_PATH));
+        assert!(cfg.provider_configs.is_empty());
         assert!(!cfg.sd_notify);
         assert!(cfg.required_kernel_lockdown.is_none());
         assert!(!cfg.verify_context_integrity);
@@ -1484,6 +1847,86 @@ mod tests {
     }
 
     #[test]
+    fn test_strict_agent_mode_valid_without_production_rootfs() {
+        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
+            .with_service_mode(ServiceMode::StrictAgent);
+
+        assert!(cfg.validate_strict_agent_mode().is_ok());
+        assert!(cfg.rootfs_path.is_none());
+        assert!(!cfg.verify_rootfs_attestation);
+    }
+
+    #[test]
+    fn test_strict_agent_mode_rejects_degraded_security() {
+        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
+            .with_service_mode(ServiceMode::StrictAgent)
+            .with_allow_degraded_security(true);
+
+        let err = cfg.validate_strict_agent_mode().unwrap_err();
+        assert!(err.to_string().contains("degraded"));
+    }
+
+    #[test]
+    fn test_strict_agent_mode_rejects_chroot_fallback() {
+        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
+            .with_service_mode(ServiceMode::StrictAgent)
+            .with_allow_chroot_fallback(true);
+
+        let err = cfg.validate_strict_agent_mode().unwrap_err();
+        assert!(err.to_string().contains("chroot"));
+    }
+
+    #[test]
+    fn test_strict_agent_mode_rejects_seccomp_trace() {
+        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
+            .with_service_mode(ServiceMode::StrictAgent)
+            .with_seccomp_mode(SeccompMode::Trace);
+
+        let err = cfg.validate_strict_agent_mode().unwrap_err();
+        assert!(err.to_string().contains("trace"));
+    }
+
+    #[test]
+    fn test_strict_agent_mode_rejects_native_host_network() {
+        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
+            .with_gvisor(false)
+            .with_service_mode(ServiceMode::StrictAgent)
+            .with_network(NetworkMode::Host)
+            .with_allow_host_network(true);
+
+        let err = cfg.validate_strict_agent_mode().unwrap_err();
+        assert!(err.to_string().contains("host network"));
+    }
+
+    #[test]
+    fn test_strict_agent_mode_requires_some_cgroup_control() {
+        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
+            .with_service_mode(ServiceMode::StrictAgent)
+            .with_limits(crate::resources::ResourceLimits::unlimited());
+
+        let err = cfg.validate_strict_agent_mode().unwrap_err();
+        assert!(err.to_string().contains("cgroup"));
+    }
+
+    #[test]
+    fn test_strict_agent_mode_allows_explicit_gvisor_host_network() {
+        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
+            .with_gvisor(true)
+            .with_service_mode(ServiceMode::StrictAgent)
+            .with_network(NetworkMode::GVisorHost)
+            .with_allow_host_network(true);
+
+        assert!(cfg.validate_strict_agent_mode().is_ok());
+    }
+
+    #[test]
     fn test_production_mode_requires_cpu_limit() {
         let rootfs = test_rootfs_path();
         let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
@@ -1693,6 +2136,96 @@ mod tests {
     }
 
     #[test]
+    fn test_default_workspace_and_workdir_contract() {
+        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()]).unwrap();
+
+        assert_eq!(cfg.workspace.container_path, PathBuf::from("/workspace"));
+        assert_eq!(cfg.workdir, PathBuf::from("/workspace"));
+        assert_eq!(cfg.home, PathBuf::from(DEFAULT_HOME_PATH));
+        assert_eq!(cfg.workspace.mode, WorkspaceMode::BindRw);
+        assert!(!cfg.workspace.allow_execute);
+    }
+
+    #[test]
+    fn test_home_must_not_overlap_workspace() {
+        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
+            .with_home(PathBuf::from("/workspace/.home"));
+
+        let err = cfg.validate_runtime_support().unwrap_err();
+        assert!(err.to_string().contains("must not overlap /workspace"));
+    }
+
+    #[test]
+    fn test_workspace_source_validates_existing_directory() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
+            .with_workspace(WorkspaceConfig::new().with_host_path(dir.path().to_path_buf()));
+
+        cfg.validate_runtime_support().unwrap();
+    }
+
+    #[test]
+    fn test_copy_in_out_requires_workspace_source() {
+        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
+            .with_workspace(WorkspaceConfig::new().with_mode(WorkspaceMode::CopyInOut));
+
+        let err = cfg.validate_runtime_support().unwrap_err();
+        assert!(err.to_string().contains("requires --workspace"));
+    }
+
+    #[test]
+    fn test_volume_destination_cannot_replace_workspace() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
+            .with_volume(VolumeMount {
+                source: VolumeSource::Bind {
+                    source: dir.path().to_path_buf(),
+                },
+                dest: PathBuf::from("/workspace"),
+                read_only: false,
+            });
+
+        let err = cfg.validate_runtime_support().unwrap_err();
+        assert!(err.to_string().contains("conflicts with --workspace"));
+    }
+
+    #[test]
+    fn test_volume_destination_cannot_replace_home() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
+            .with_volume(VolumeMount {
+                source: VolumeSource::Bind {
+                    source: dir.path().to_path_buf(),
+                },
+                dest: PathBuf::from(DEFAULT_HOME_PATH),
+                read_only: false,
+            });
+
+        let err = cfg.validate_runtime_support().unwrap_err();
+        assert!(err.to_string().contains("conflicts with --home"));
+    }
+
+    #[test]
+    fn test_production_rejects_writable_executable_workspace() {
+        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
+            .with_service_mode(ServiceMode::Production)
+            .with_workspace(
+                WorkspaceConfig::new()
+                    .with_mode(WorkspaceMode::BindRw)
+                    .with_allow_execute(true),
+            );
+
+        let err = cfg.validate_production_mode().unwrap_err();
+        assert!(err.to_string().contains("writable executable workspaces"));
+    }
+
+    #[test]
     fn test_tmpfs_volume_rejects_parent_traversal() {
         let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
             .unwrap()
@@ -1829,6 +2362,30 @@ mod tests {
             TrustLevel::Untrusted,
             "default must be Untrusted"
         );
+    }
+
+    #[test]
+    fn test_console_socket_implies_terminal_mode() {
+        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
+            .with_console_socket(PathBuf::from("/tmp/console.sock"));
+
+        assert!(cfg.terminal);
+        assert_eq!(cfg.console_socket, Some(PathBuf::from("/tmp/console.sock")));
+    }
+
+    #[test]
+    fn test_terminal_size_can_be_configured() {
+        let size = ConsoleSize {
+            width: 132,
+            height: 43,
+        };
+        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
+            .with_terminal(size);
+
+        assert!(cfg.terminal);
+        assert_eq!(cfg.console_size, size);
     }
 
     #[test]

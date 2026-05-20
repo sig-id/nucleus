@@ -1,4 +1,4 @@
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 /// Network mode for container
 #[derive(Debug, Clone)]
@@ -183,6 +183,59 @@ pub fn validate_egress_cidr(s: &str) -> Result<(), String> {
     validate_ipv4_cidr(s)
 }
 
+/// Validate that a string is an exact DNS name for egress domain rules.
+pub fn validate_egress_domain(s: &str) -> Result<(), String> {
+    if s.is_empty() {
+        return Err("Egress domain cannot be empty".to_string());
+    }
+    if s.parse::<Ipv4Addr>().is_ok() || s.parse::<Ipv6Addr>().is_ok() {
+        return Err(format!(
+            "Egress domain '{}' is an IP address; use --egress-allow with a CIDR",
+            s
+        ));
+    }
+
+    let domain = s.strip_suffix('.').unwrap_or(s);
+    if domain.is_empty() {
+        return Err("Egress domain cannot be only '.'".to_string());
+    }
+    if domain.len() > 253 {
+        return Err(format!("Egress domain '{}' is longer than 253 bytes", s));
+    }
+    if !domain.contains('.') {
+        return Err(format!(
+            "Egress domain '{}' must be a fully-qualified name with at least one dot",
+            s
+        ));
+    }
+
+    for label in domain.split('.') {
+        if label.is_empty() {
+            return Err(format!("Egress domain '{}' contains an empty label", s));
+        }
+        if label.len() > 63 {
+            return Err(format!(
+                "Egress domain '{}' contains a label longer than 63 bytes",
+                s
+            ));
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err(format!(
+                "Egress domain '{}' contains a label starting or ending with '-'",
+                s
+            ));
+        }
+        if !label
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            return Err(format!("Egress domain '{}' contains invalid characters", s));
+        }
+    }
+
+    Ok(())
+}
+
 /// Egress policy for audited outbound network access.
 ///
 /// When set, iptables OUTPUT chain rules restrict which destinations the
@@ -192,6 +245,8 @@ pub fn validate_egress_cidr(s: &str) -> Result<(), String> {
 pub struct EgressPolicy {
     /// Allowed destination CIDRs (e.g., "10.0.0.0/8", "192.168.1.0/24").
     pub allowed_cidrs: Vec<String>,
+    /// Allowed exact DNS names. These are resolved to IPv4 /32 rules at startup.
+    pub allowed_domains: Vec<String>,
     /// Allowed destination TCP ports. Empty means all ports on allowed CIDRs.
     pub allowed_tcp_ports: Vec<u16>,
     /// Allowed destination UDP ports.
@@ -207,6 +262,7 @@ impl Default for EgressPolicy {
     fn default() -> Self {
         Self {
             allowed_cidrs: Vec::new(),
+            allowed_domains: Vec::new(),
             allowed_tcp_ports: Vec::new(),
             allowed_udp_ports: Vec::new(),
             log_denied: true,
@@ -227,6 +283,12 @@ impl EgressPolicy {
     /// Allow egress to the given CIDRs on any port.
     pub fn with_allowed_cidrs(mut self, cidrs: Vec<String>) -> Self {
         self.allowed_cidrs = cidrs;
+        self
+    }
+
+    /// Allow egress to the given exact DNS names.
+    pub fn with_allowed_domains(mut self, domains: Vec<String>) -> Self {
+        self.allowed_domains = domains;
         self
     }
 

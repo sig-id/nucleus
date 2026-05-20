@@ -28,7 +28,8 @@ Supported platform: Linux `x86_64` only. 32-bit Linux userlands (`i386`/`x86`) a
                      │   ├─> Filesystem Mount (tmpfs)
                      │   ├─> Context Population (copy or bind)
                      │   ├─> Network Setup (none/host/bridge)
-                     │   └─> Process Execution
+                     │   ├─> Process Execution
+                     │   └─> Control Event Stream (optional JSONL)
                      │
                      ├─> Container Management
                      │   ├─> Unique ID generation
@@ -64,6 +65,7 @@ Supported platform: Linux `x86_64` only. 32-bit Linux userlands (`i386`/`x86`) a
                          ├─> tmpfs/ramfs root
                          ├─> Context pre-population (copy)
                          ├─> Context streaming (bind mount)
+                         ├─> Agent toolchain rootfs (optional)
                          └─> Bind mounts (optional)
 ```
 
@@ -77,10 +79,35 @@ Entry point that orchestrates all isolation mechanisms.
 - Parse CLI arguments
 - Validate configuration
 - Generate unique container ID
+- Open optional machine-readable event stream (`--events-fd` or `--events-jsonl`)
+- Configure an optional raw terminal stream (`--terminal` or `--console-socket`)
 - Set up namespaces via `unshare(2)`
 - Configure cgroups
 - Mount filesystems
 - Execute target process
+
+**Service modes:**
+- **Agent** (`--service-mode agent`, default): ephemeral sandbox behavior, best-effort cgroup and hardening fallbacks available when explicitly allowed.
+- **Strict agent** (`--service-mode strict-agent`): ephemeral agent behavior with fail-closed cgroups, `pivot_root`, seccomp, native Landlock, required UID/GID mapping when needed, and no implicit network access. Agent-style modes may use `--agent-toolchain-rootfs` to provide a pinned provider/toolchain rootfs instead of host runtime binds.
+- **Production** (`--service-mode production`): strict isolation plus service-oriented requirements such as a pre-built Nix rootfs, rootfs attestation, production egress defaults, mount audits, and PID 1 init supervision.
+- Emit lifecycle metadata without mixing it into workload stdout/stderr/PTY bytes
+
+**Console/terminal contract:**
+- `--terminal` requests a pseudoterminal for the workload. `--console-socket`
+  implies `--terminal`.
+- Native execution allocates a PTY before the namespace fork. The container
+  process becomes a session leader, makes the PTY slave its controlling TTY,
+  and duplicates the slave to stdin/stdout/stderr. The runtime sends the PTY
+  master to the caller over the configured AF_UNIX console socket using
+  `SCM_RIGHTS`.
+- gVisor execution writes `process.terminal = true` and `process.consoleSize`
+  into the generated OCI config, then passes `--console-socket` through to
+  `runsc` so runsc owns the PTY setup.
+- The runtime treats console bytes as an opaque stream. Terminal parsing,
+  rendering, and escape-sequence handling belong to the console client.
+- Resize is driven through PTY window-size ioctls. Local SIGWINCH is forwarded
+  for foreground runs, and kernel TTY delivery notifies the foreground process
+  group attached to the slave.
 
 ### 2. Container Management
 
@@ -162,6 +189,8 @@ Memory-backed root filesystem for zero-latency I/O.
 /proc/              # procfs mount
 /sys/               # sysfs mount (optional)
 /dev/               # Minimal /dev (null, zero, urandom)
+/workspace/         # Stable workspace mount/stage, default cwd
+/home/agent/        # Private tmpfs home, default HOME
 ```
 
 ### 6. Security Enforcer
@@ -180,6 +209,8 @@ Defense-in-depth security model.
 - Path-based filesystem access control via Linux LSM (kernel 5.13+)
 - Restricts what operations are allowed on which paths inside the container
 - `/context` read-only, `/tmp` read+write, binaries read+execute
+- `/workspace` follows `--workspace-mode`; execution requires explicit
+  `--workspace-exec` and is rejected for writable production workspaces
 - Irreversible once applied, stackable with seccomp and capabilities
 
 **gVisor (optional):**
@@ -205,7 +236,9 @@ Optional networking with three modes.
 - Assign IP from `10.0.42.0/24` subnet
 - NAT via iptables masquerade
 - Port forwarding via iptables DNAT
-- Requires root (degrades to None in rootless)
+- Enforce optional egress allowlists by CIDR and by exact domain name
+- Domain egress allowlists are resolved to IPv4 `/32` rules at startup; they are not packet-time FQDN matches or wildcard suffix rules
+- Requires root for kernel NAT; rootless/native uses the userspace NAT backend
 
 ### 8. Checkpoint/Restore
 
@@ -219,6 +252,32 @@ CRIU-based container snapshotting.
 **Restore:**
 - `criu restore --images-dir <dir> --shell-job`
 - Requires root (`CAP_SYS_PTRACE`)
+
+### 9. Machine-Readable Event Stream
+
+Operators can request a JSON Lines control-plane stream with `--events-jsonl <path>` or an inherited descriptor with `--events-fd <fd>`. The stream is a parent-side Nucleus output channel, not workload output, and must remain separate from stdout/stderr/PTY bytes produced by the container process. `--events-fd` must be greater than 2 and is rejected for detached launches because `systemd-run` does not preserve arbitrary inherited descriptors.
+
+The stream emits at least:
+- `container_started`: container ID, PID, cgroup path, workspace/context mount, network mode, seccomp mode, Landlock status, capability status, resource limits
+- `container_summary`: all start metadata plus exit status, final resource stats, and whether cleanup succeeded
+
+### 10. Stable Programmatic Launch Config
+
+`nucleus run` is a stable alias for `nucleus create`. Human operators may keep using
+CLI flags, but programmatic launchers such as Mitos must not rely on constructing
+unbounded argv lists for every sandbox field.
+
+The runtime therefore accepts a full launch request through:
+
+- `nucleus run --config <path>` where `<path>` is JSON or TOML.
+- `nucleus run --config-fd <fd>` where `<fd>` is an inherited descriptor greater
+  than 2 containing the same JSON or TOML schema.
+
+The config document owns the launch request. It is not a partial overlay on top
+of CLI flags; callers place the workload `command` array and all sandbox options
+in the document. Field names are the long CLI option names converted to
+`snake_case`, and enum values use the CLI spellings such as `gvisor`,
+`strict-agent`, `bind-rw`, and `gvisor-host`.
 
 ## Execution Flow
 
@@ -265,6 +324,7 @@ CRIU-based container snapshotting.
     └─> execve("/bin/agent", ...)
 
 15. Parent: Wait for child, cleanup cgroups, delete state, cleanup networking
+    └─> Emit final JSONL summary event if requested
 ```
 
 ## Performance Characteristics

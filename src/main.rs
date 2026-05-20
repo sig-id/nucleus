@@ -3,13 +3,19 @@
 use clap::Parser;
 use nucleus::checkpoint::{CheckpointMetadata, CriuRuntime};
 use nucleus::container::{
-    parse_signal, validate_container_name, validate_hostname, Container, ContainerConfig,
-    ContainerLifecycle, ContainerState, ContainerStateManager, ContainerStateParams, HealthCheck,
-    KernelLockdownMode, NetworkModeArg, OciStatus, ProcessIdentity, ReadinessProbe,
-    RuntimeSelection, SeccompMode, SecretMount, ServiceMode, TrustLevel, VolumeMount, VolumeSource,
+    parse_signal, validate_container_name, validate_hostname, ConsoleSize, Container,
+    ContainerConfig, ContainerLifecycle, ContainerState, ContainerStateManager,
+    ContainerStateParams, HealthCheck, KernelLockdownMode, NetworkModeArg, OciStatus,
+    ProcessIdentity, ProviderConfigMount, ReadinessProbe, RuntimeSelection, SeccompMode,
+    SecretMount, ServiceMode, TrustLevel, VolumeMount, VolumeSource, WorkspaceConfig,
+    WorkspaceMode, DEFAULT_HOME_PATH,
 };
 use nucleus::error::{NucleusError, Result};
-use nucleus::filesystem::{normalize_volume_destination, validate_bind_mount_source, ContextMode};
+use nucleus::filesystem::{
+    normalize_container_destination, normalize_provider_config_destination,
+    normalize_volume_destination, validate_agent_toolchain_rootfs_path, validate_bind_mount_source,
+    validate_provider_config_source, validate_workspace_host_path, ContextMode,
+};
 use nucleus::isolation::{ContainerAttach, NamespaceConfig};
 use nucleus::network::{BridgeConfig, EgressPolicy, NatBackend, NetworkMode, PortForward};
 use nucleus::resources::{Cgroup, IoDeviceLimit, ResourceLimits, ResourceStats};
@@ -24,6 +30,14 @@ use tracing::info;
 
 const SAFE_PRIVILEGED_HELPER_PATH: &str =
     "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+const DANGEROUS_ENV_VARS: &[&str] = &[
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "LD_AUDIT",
+    "LD_DEBUG",
+    "LD_PROFILE",
+];
 
 fn validate_privileged_helper(path: &Path, name: &str) -> Result<PathBuf> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -230,6 +244,202 @@ fn collect_secret_specs(mut secrets: Vec<String>, secrets_fd: Option<i32>) -> Re
     Ok(secrets)
 }
 
+fn read_env_specs_from_fd(fd: i32) -> Result<Vec<String>> {
+    if fd <= 2 {
+        return Err(NucleusError::ConfigError(format!(
+            "Invalid inherited env fd {}",
+            fd
+        )));
+    }
+
+    use std::io::Read;
+    use std::os::fd::FromRawFd;
+
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let mut contents = String::new();
+    file.read_to_string(&mut contents).map_err(|e| {
+        NucleusError::ConfigError(format!("Failed to read inherited env fd {}: {}", fd, e))
+    })?;
+
+    let value: serde_json::Value = serde_json::from_str(&contents).map_err(|e| {
+        NucleusError::ConfigError(format!("Failed to parse inherited env fd {}: {}", fd, e))
+    })?;
+
+    match value {
+        serde_json::Value::Array(entries) => entries
+            .into_iter()
+            .map(|entry| match entry {
+                serde_json::Value::String(spec) => Ok(spec),
+                _ => Err(NucleusError::ConfigError(
+                    "--env-fd JSON array entries must be strings".to_string(),
+                )),
+            })
+            .collect(),
+        serde_json::Value::Object(entries) => entries
+            .into_iter()
+            .map(|(key, value)| match value {
+                serde_json::Value::String(value) => Ok(format!("{}={}", key, value)),
+                _ => Err(NucleusError::ConfigError(format!(
+                    "--env-fd JSON object value for '{}' must be a string",
+                    key
+                ))),
+            })
+            .collect(),
+        _ => Err(NucleusError::ConfigError(
+            "--env-fd expects a JSON object or an array of KEY=VALUE strings".to_string(),
+        )),
+    }
+}
+
+fn collect_env_specs(mut env_vars: Vec<String>, env_fd: Option<i32>) -> Result<Vec<String>> {
+    if let Some(fd) = env_fd {
+        env_vars.extend(read_env_specs_from_fd(fd)?);
+    }
+    Ok(env_vars)
+}
+
+fn parse_env_assignment(spec: &str) -> Result<(String, String)> {
+    let Some((key, value)) = spec.split_once('=') else {
+        return Err(NucleusError::ConfigError(
+            "Invalid env var format, expected KEY=VALUE".to_string(),
+        ));
+    };
+    if key.is_empty()
+        || key.contains('\0')
+        || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        || key.as_bytes()[0].is_ascii_digit()
+    {
+        return Err(NucleusError::ConfigError(format!(
+            "Invalid env var key '{}'",
+            key
+        )));
+    }
+    if value.contains('\0') {
+        return Err(NucleusError::ConfigError(format!(
+            "Invalid env var value for '{}': contains NUL",
+            key
+        )));
+    }
+    if DANGEROUS_ENV_VARS.contains(&key) {
+        return Err(NucleusError::ConfigError(format!(
+            "Environment variable '{}' is blocked (dynamic linker injection risk). \
+             This restriction applies in all modes.",
+            key
+        )));
+    }
+    Ok((key.to_string(), value.to_string()))
+}
+
+fn parse_provider_config_mount_spec(
+    spec: &str,
+    home: &Path,
+    read_only: bool,
+) -> Result<ProviderConfigMount> {
+    let parts: Vec<&str> = spec.splitn(2, ':').collect();
+    if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
+        return Err(NucleusError::ConfigError(format!(
+            "Invalid provider config format '{}', expected SOURCE:DEST",
+            spec
+        )));
+    }
+
+    let source = std::fs::canonicalize(parts[0]).map_err(|e| {
+        NucleusError::ConfigError(format!(
+            "Provider config source '{}' cannot be resolved: {}",
+            parts[0], e
+        ))
+    })?;
+    validate_provider_config_source(&source)?;
+    let dest = normalize_provider_config_destination(home, Path::new(parts[1]))?;
+
+    Ok(ProviderConfigMount {
+        source,
+        dest,
+        read_only,
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RunConfigFormat {
+    Json,
+    Toml,
+}
+
+fn run_config_format_from_path(path: &Path) -> Option<RunConfigFormat> {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("json") => Some(RunConfigFormat::Json),
+        Some("toml") => Some(RunConfigFormat::Toml),
+        _ => None,
+    }
+}
+
+fn parse_run_config(
+    contents: &str,
+    source: &str,
+    format_hint: Option<RunConfigFormat>,
+) -> Result<RunConfig> {
+    match format_hint {
+        Some(RunConfigFormat::Json) => serde_json::from_str(contents).map_err(|e| {
+            NucleusError::ConfigError(format!(
+                "Failed to parse launch config {} as JSON: {}",
+                source, e
+            ))
+        }),
+        Some(RunConfigFormat::Toml) => toml::from_str(contents).map_err(|e| {
+            NucleusError::ConfigError(format!(
+                "Failed to parse launch config {} as TOML: {}",
+                source, e
+            ))
+        }),
+        None => match serde_json::from_str(contents) {
+            Ok(config) => Ok(config),
+            Err(json_err) => toml::from_str(contents).map_err(|toml_err| {
+                NucleusError::ConfigError(format!(
+                    "Failed to parse launch config {} as JSON ({}) or TOML ({})",
+                    source, json_err, toml_err
+                ))
+            }),
+        },
+    }
+}
+
+fn read_run_config_from_path(path: &Path) -> Result<RunConfig> {
+    let contents = std::fs::read_to_string(path).map_err(|e| {
+        NucleusError::ConfigError(format!(
+            "Failed to read launch config '{}': {}",
+            path.display(),
+            e
+        ))
+    })?;
+    let source = path.display().to_string();
+    parse_run_config(&contents, &source, run_config_format_from_path(path))
+}
+
+fn read_run_config_from_fd(fd: i32) -> Result<RunConfig> {
+    if fd <= 2 {
+        return Err(NucleusError::ConfigError(format!(
+            "Invalid inherited config fd {}",
+            fd
+        )));
+    }
+
+    use std::io::Read;
+    use std::os::fd::FromRawFd;
+
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let mut contents = String::new();
+    file.read_to_string(&mut contents).map_err(|e| {
+        NucleusError::ConfigError(format!("Failed to read inherited config fd {}: {}", fd, e))
+    })?;
+
+    parse_run_config(&contents, &format!("fd {}", fd), None)
+}
+
 fn resolve_uid_spec(spec: &str) -> Result<(u32, Option<u32>)> {
     if let Ok(uid) = spec.parse::<u32>() {
         return Ok((uid, None));
@@ -355,15 +565,212 @@ struct Cli {
     #[arg(long, global = true, default_value = "text")]
     log_format: String,
 
+    /// Write machine-readable control events to an inherited fd (JSON Lines)
+    #[arg(long, global = true)]
+    events_fd: Option<i32>,
+
+    /// Write machine-readable control events to this JSON Lines file
+    #[arg(long, global = true)]
+    events_jsonl: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Commands,
 }
+
+const RUN_CONFIG_PATH_CONFLICTS: &[&str] = &[
+    "config_fd",
+    "name",
+    "context",
+    "workspace",
+    "workspace_mode",
+    "workspace_exec",
+    "home",
+    "provider_config_ro",
+    "provider_config_rw",
+    "workdir",
+    "memory",
+    "cpus",
+    "hostname",
+    "cpu_weight",
+    "io_limits",
+    "pids",
+    "memlock",
+    "swap",
+    "runtime",
+    "detach",
+    "quiet_id",
+    "preset_id",
+    "detached_config_json",
+    "rootless",
+    "user",
+    "group",
+    "additional_groups",
+    "bundle",
+    "pid_file",
+    "console_socket",
+    "terminal",
+    "network",
+    "allow_host_network",
+    "allow_degraded_security",
+    "allow_chroot_fallback",
+    "trust_level",
+    "proc_rw",
+    "publish",
+    "context_mode",
+    "service_mode",
+    "strict_agent",
+    "rootfs",
+    "agent_toolchain_rootfs",
+    "egress_allow",
+    "egress_domains",
+    "egress_tcp_ports",
+    "egress_udp_ports",
+    "dns",
+    "nat_backend",
+    "health_cmd",
+    "health_interval",
+    "health_retries",
+    "health_start_period",
+    "secrets",
+    "secrets_fd",
+    "systemd_credentials",
+    "volumes",
+    "tmpfs",
+    "env_vars",
+    "env_fd",
+    "sd_notify",
+    "readiness_exec",
+    "readiness_tcp",
+    "readiness_sd_notify",
+    "seccomp_profile",
+    "seccomp_profile_sha256",
+    "seccomp_mode",
+    "seccomp_log",
+    "seccomp_log_denied",
+    "seccomp_allow",
+    "caps_policy",
+    "caps_policy_sha256",
+    "landlock_policy",
+    "landlock_policy_sha256",
+    "verify_context_integrity",
+    "verify_rootfs_attestation",
+    "require_kernel_lockdown",
+    "gvisor_platform",
+    "time_namespace",
+    "disable_cgroup_namespace",
+    "hooks",
+    "topology_config_hash",
+    "command",
+];
+
+const RUN_CONFIG_FD_CONFLICTS: &[&str] = &[
+    "config",
+    "name",
+    "context",
+    "workspace",
+    "workspace_mode",
+    "workspace_exec",
+    "home",
+    "provider_config_ro",
+    "provider_config_rw",
+    "workdir",
+    "memory",
+    "cpus",
+    "hostname",
+    "cpu_weight",
+    "io_limits",
+    "pids",
+    "memlock",
+    "swap",
+    "runtime",
+    "detach",
+    "quiet_id",
+    "preset_id",
+    "detached_config_json",
+    "rootless",
+    "user",
+    "group",
+    "additional_groups",
+    "bundle",
+    "pid_file",
+    "console_socket",
+    "terminal",
+    "network",
+    "allow_host_network",
+    "allow_degraded_security",
+    "allow_chroot_fallback",
+    "trust_level",
+    "proc_rw",
+    "publish",
+    "context_mode",
+    "service_mode",
+    "strict_agent",
+    "rootfs",
+    "agent_toolchain_rootfs",
+    "egress_allow",
+    "egress_domains",
+    "egress_tcp_ports",
+    "egress_udp_ports",
+    "dns",
+    "nat_backend",
+    "health_cmd",
+    "health_interval",
+    "health_retries",
+    "health_start_period",
+    "secrets",
+    "secrets_fd",
+    "systemd_credentials",
+    "volumes",
+    "tmpfs",
+    "env_vars",
+    "env_fd",
+    "sd_notify",
+    "readiness_exec",
+    "readiness_tcp",
+    "readiness_sd_notify",
+    "seccomp_profile",
+    "seccomp_profile_sha256",
+    "seccomp_mode",
+    "seccomp_log",
+    "seccomp_log_denied",
+    "seccomp_allow",
+    "caps_policy",
+    "caps_policy_sha256",
+    "landlock_policy",
+    "landlock_policy_sha256",
+    "verify_context_integrity",
+    "verify_rootfs_attestation",
+    "require_kernel_lockdown",
+    "gvisor_platform",
+    "time_namespace",
+    "disable_cgroup_namespace",
+    "hooks",
+    "topology_config_hash",
+    "command",
+];
 
 #[derive(Parser, Debug)]
 #[allow(clippy::large_enum_variant)]
 enum Commands {
     /// Create and run a container
+    #[command(alias = "run")]
     Create {
+        /// Read a complete launch config from a JSON or TOML file
+        #[arg(
+            long = "config",
+            value_name = "json|toml",
+            conflicts_with_all = RUN_CONFIG_PATH_CONFLICTS
+        )]
+        config: Option<PathBuf>,
+
+        /// Read a complete launch config from an inherited JSON or TOML fd
+        #[arg(
+            long = "config-fd",
+            value_name = "fd",
+            conflicts_with_all = RUN_CONFIG_FD_CONFLICTS
+        )]
+        config_fd: Option<i32>,
+
         /// Container name (optional, auto-generated if not specified)
         #[arg(long)]
         name: Option<String>,
@@ -371,6 +778,26 @@ enum Commands {
         /// Path to context directory to pre-populate in container
         #[arg(long)]
         context: Option<String>,
+
+        /// Host workspace directory mounted at /workspace
+        #[arg(long)]
+        workspace: Option<String>,
+
+        /// Workspace exposure mode: bind-rw, bind-ro, or copy-in-out
+        #[arg(long = "workspace-mode", default_value = "bind-rw")]
+        workspace_mode: WorkspaceMode,
+
+        /// Allow executing files from /workspace
+        #[arg(long = "workspace-exec")]
+        workspace_exec: bool,
+
+        /// Private tmpfs home directory inside the container
+        #[arg(long = "home", default_value = "/home/agent")]
+        home: String,
+
+        /// Working directory inside the container
+        #[arg(long = "workdir", default_value = "/workspace")]
+        workdir: String,
 
         /// Memory limit (e.g., 512M, 1G)
         #[arg(long)]
@@ -453,6 +880,10 @@ enum Commands {
         #[arg(long)]
         console_socket: Option<PathBuf>,
 
+        /// Allocate a PTY and run the workload as a terminal-attached process
+        #[arg(long)]
+        terminal: bool,
+
         /// Network mode: none, host, gvisor-host, or bridge (default: none)
         #[arg(long, default_value = "none")]
         network: NetworkModeArg,
@@ -486,23 +917,35 @@ enum Commands {
         #[arg(long = "context-mode", default_value = "copy")]
         context_mode: ContextMode,
 
-        /// Service mode: agent (default) or production (strict security invariants)
+        /// Service mode: agent (default), strict-agent, or production
         #[arg(long, default_value = "agent")]
         service_mode: ServiceMode,
+
+        /// Alias for --service-mode strict-agent
+        #[arg(long = "strict-agent")]
+        strict_agent: bool,
 
         /// Pre-built rootfs path (Nix store closure). Replaces host bind mounts.
         #[arg(long)]
         rootfs: Option<String>,
 
+        /// Agent/strict-agent rootfs containing provider CLIs and developer tools
+        #[arg(long = "agent-toolchain-rootfs", conflicts_with = "rootfs")]
+        agent_toolchain_rootfs: Option<String>,
+
         /// Allowed egress CIDRs (repeatable). Enables egress policy when set.
         #[arg(long = "egress-allow")]
         egress_allow: Vec<String>,
 
-        /// Allowed egress TCP ports (repeatable, used with --egress-allow)
+        /// Allowed egress domains (repeatable). Resolves to IPv4 rules at startup.
+        #[arg(long = "egress-domain")]
+        egress_domains: Vec<String>,
+
+        /// Allowed egress TCP ports (repeatable, used with --egress-allow/--egress-domain)
         #[arg(long = "egress-tcp-port")]
         egress_tcp_ports: Vec<u16>,
 
-        /// Allowed egress UDP ports (repeatable, used with --egress-allow)
+        /// Allowed egress UDP ports (repeatable, used with --egress-allow/--egress-domain)
         #[arg(long = "egress-udp-port")]
         egress_udp_ports: Vec<u16>,
 
@@ -550,9 +993,21 @@ enum Commands {
         #[arg(long = "tmpfs")]
         tmpfs: Vec<String>,
 
+        /// Mount provider config read-only under --home: SOURCE:DEST (repeatable)
+        #[arg(long = "provider-config-ro")]
+        provider_config_ro: Vec<String>,
+
+        /// Mount provider config read-write under --home: SOURCE:DEST (repeatable)
+        #[arg(long = "provider-config-rw")]
+        provider_config_rw: Vec<String>,
+
         /// Set environment variable: KEY=VALUE (repeatable)
         #[arg(short = 'e', long = "env")]
         env_vars: Vec<String>,
+
+        /// Read environment variables from an inherited JSON fd
+        #[arg(long = "env-fd")]
+        env_fd: Option<i32>,
 
         /// Enable sd_notify integration (pass NOTIFY_SOCKET into container)
         #[arg(long)]
@@ -645,7 +1100,10 @@ enum Commands {
         topology_config_hash: Option<u64>,
 
         /// Command to run in container
-        #[arg(last = true, required_unless_present = "detached_config_json")]
+        #[arg(
+            last = true,
+            required_unless_present_any = ["detached_config_json", "config", "config_fd"]
+        )]
         command: Vec<String>,
     },
 
@@ -815,9 +1273,15 @@ enum ComposeCommands {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct DetachedCreateRequest {
+#[serde(default, deny_unknown_fields)]
+struct RunConfig {
     name: Option<String>,
     context: Option<String>,
+    workspace: Option<String>,
+    workspace_mode: WorkspaceMode,
+    workspace_exec: bool,
+    home: String,
+    workdir: String,
     memory: Option<String>,
     cpus: Option<f64>,
     hostname: Option<String>,
@@ -837,6 +1301,8 @@ struct DetachedCreateRequest {
     bundle: Option<PathBuf>,
     pid_file: Option<PathBuf>,
     console_socket: Option<PathBuf>,
+    #[serde(default)]
+    terminal: bool,
     network: NetworkModeArg,
     allow_host_network: bool,
     allow_degraded_security: bool,
@@ -846,8 +1312,14 @@ struct DetachedCreateRequest {
     publish: Vec<String>,
     context_mode: ContextMode,
     service_mode: ServiceMode,
+    #[serde(default)]
+    strict_agent: bool,
     rootfs: Option<String>,
+    #[serde(default)]
+    agent_toolchain_rootfs: Option<String>,
     egress_allow: Vec<String>,
+    #[serde(default)]
+    egress_domains: Vec<String>,
     egress_tcp_ports: Vec<u16>,
     egress_udp_ports: Vec<u16>,
     dns: Vec<String>,
@@ -862,7 +1334,11 @@ struct DetachedCreateRequest {
     systemd_credentials: Vec<String>,
     volumes: Vec<String>,
     tmpfs: Vec<String>,
+    provider_config_ro: Vec<String>,
+    provider_config_rw: Vec<String>,
     env_vars: Vec<String>,
+    #[serde(default, skip_serializing)]
+    env_fd: Option<i32>,
     sd_notify: bool,
     readiness_exec: Option<String>,
     readiness_tcp: Option<u16>,
@@ -888,12 +1364,137 @@ struct DetachedCreateRequest {
     command: Vec<String>,
 }
 
+impl Default for RunConfig {
+    fn default() -> Self {
+        Self {
+            name: None,
+            context: None,
+            workspace: None,
+            workspace_mode: WorkspaceMode::BindRw,
+            workspace_exec: false,
+            home: DEFAULT_HOME_PATH.to_string(),
+            workdir: "/workspace".to_string(),
+            memory: None,
+            cpus: None,
+            hostname: None,
+            cpu_weight: None,
+            io_limits: Vec::new(),
+            pids: None,
+            memlock: None,
+            swap: false,
+            runtime: RuntimeSelection::GVisor,
+            detach: false,
+            quiet_id: false,
+            preset_id: None,
+            rootless: false,
+            user: None,
+            group: None,
+            additional_groups: Vec::new(),
+            bundle: None,
+            pid_file: None,
+            console_socket: None,
+            terminal: false,
+            network: NetworkModeArg::None,
+            allow_host_network: false,
+            allow_degraded_security: false,
+            allow_chroot_fallback: false,
+            trust_level: TrustLevel::Untrusted,
+            proc_rw: false,
+            publish: Vec::new(),
+            context_mode: ContextMode::Copy,
+            service_mode: ServiceMode::Agent,
+            strict_agent: false,
+            rootfs: None,
+            agent_toolchain_rootfs: None,
+            egress_allow: Vec::new(),
+            egress_domains: Vec::new(),
+            egress_tcp_ports: Vec::new(),
+            egress_udp_ports: Vec::new(),
+            dns: Vec::new(),
+            nat_backend: NatBackend::Auto,
+            health_cmd: None,
+            health_interval: None,
+            health_retries: None,
+            health_start_period: None,
+            secrets: Vec::new(),
+            secrets_fd: None,
+            systemd_credentials: Vec::new(),
+            volumes: Vec::new(),
+            tmpfs: Vec::new(),
+            provider_config_ro: Vec::new(),
+            provider_config_rw: Vec::new(),
+            env_vars: Vec::new(),
+            env_fd: None,
+            sd_notify: false,
+            readiness_exec: None,
+            readiness_tcp: None,
+            readiness_sd_notify: false,
+            seccomp_profile: None,
+            seccomp_profile_sha256: None,
+            seccomp_mode: SeccompMode::Enforce,
+            seccomp_log: None,
+            seccomp_log_denied: false,
+            seccomp_allow: Vec::new(),
+            caps_policy: None,
+            caps_policy_sha256: None,
+            landlock_policy: None,
+            landlock_policy_sha256: None,
+            verify_context_integrity: false,
+            verify_rootfs_attestation: false,
+            require_kernel_lockdown: None,
+            gvisor_platform: GVisorPlatform::Systrap,
+            time_namespace: false,
+            disable_cgroup_namespace: false,
+            hooks: None,
+            topology_config_hash: None,
+            command: Vec::new(),
+        }
+    }
+}
+
 /// Truncate a container ID to 12 chars for display.
 fn truncate_id(id: &str) -> &str {
     if id.len() > 12 {
         &id[..12]
     } else {
         id
+    }
+}
+
+fn resolve_service_mode(service_mode: ServiceMode, strict_agent: bool) -> Result<ServiceMode> {
+    if !strict_agent {
+        return Ok(service_mode);
+    }
+
+    match service_mode {
+        ServiceMode::Agent | ServiceMode::StrictAgent => Ok(ServiceMode::StrictAgent),
+        ServiceMode::Production => Err(NucleusError::ConfigError(
+            "--strict-agent cannot be combined with --service-mode production".to_string(),
+        )),
+    }
+}
+
+fn resolve_rootfs_argument(
+    service_mode: ServiceMode,
+    rootfs: Option<String>,
+    agent_toolchain_rootfs: Option<String>,
+) -> Result<Option<PathBuf>> {
+    match (rootfs, agent_toolchain_rootfs) {
+        (Some(_), Some(_)) => Err(NucleusError::ConfigError(
+            "--rootfs and --agent-toolchain-rootfs are mutually exclusive".to_string(),
+        )),
+        (Some(rootfs), None) => Ok(Some(PathBuf::from(rootfs))),
+        (None, Some(rootfs)) => {
+            if service_mode == ServiceMode::Production {
+                return Err(NucleusError::ConfigError(
+                    "--agent-toolchain-rootfs is only for agent and strict-agent modes; \
+                     production mode must use --rootfs with attestation"
+                        .to_string(),
+                ));
+            }
+            validate_agent_toolchain_rootfs_path(Path::new(&rootfs)).map(Some)
+        }
+        (None, None) => Ok(None),
     }
 }
 
@@ -910,8 +1511,12 @@ fn main() -> ExitCode {
 fn try_main() -> Result<i32> {
     let cli = Cli::parse();
     let state_root = cli.root.clone();
+    let log_path = cli.log.clone();
+    let log_format = cli.log_format.clone();
+    let events_fd = cli.events_fd;
+    let events_jsonl = cli.events_jsonl.clone();
 
-    nucleus::telemetry::init_tracing();
+    nucleus::telemetry::init_tracing(log_path.as_deref(), &log_format)?;
 
     match cli.command {
         Commands::State { container, all } => {
@@ -1195,8 +1800,15 @@ fn try_main() -> Result<i32> {
         }
 
         Commands::Create {
+            config,
+            config_fd,
             name,
             context,
+            workspace,
+            workspace_mode,
+            workspace_exec,
+            home,
+            workdir,
             memory,
             cpus,
             cpu_weight,
@@ -1217,6 +1829,7 @@ fn try_main() -> Result<i32> {
             bundle,
             pid_file,
             console_socket,
+            terminal,
             network,
             allow_host_network,
             allow_degraded_security,
@@ -1226,8 +1839,11 @@ fn try_main() -> Result<i32> {
             publish,
             context_mode,
             service_mode,
+            strict_agent,
             rootfs,
+            agent_toolchain_rootfs,
             egress_allow,
+            egress_domains,
             egress_tcp_ports,
             egress_udp_ports,
             dns,
@@ -1241,7 +1857,10 @@ fn try_main() -> Result<i32> {
             systemd_credentials,
             volumes,
             tmpfs,
+            provider_config_ro,
+            provider_config_rw,
             env_vars,
+            env_fd,
             sd_notify,
             readiness_exec,
             readiness_tcp,
@@ -1266,24 +1885,32 @@ fn try_main() -> Result<i32> {
             topology_config_hash,
             command,
         } => {
-            let create_request = if let Some(serialized) = detached_config_json {
-                let request: DetachedCreateRequest =
-                    serde_json::from_str(&serialized).map_err(|e| {
+            let create_request = match (detached_config_json, config, config_fd) {
+                (Some(serialized), None, None) => {
+                    let request: RunConfig = serde_json::from_str(&serialized).map_err(|e| {
                         NucleusError::ConfigError(format!(
                             "Failed to deserialize detached create request: {}",
                             e
                         ))
                     })?;
-                if request.detach {
-                    return Err(NucleusError::ConfigError(
-                        "Detached create request must clear --detach before re-exec".to_string(),
-                    ));
+                    if request.detach {
+                        return Err(NucleusError::ConfigError(
+                            "Detached create request must clear --detach before re-exec"
+                                .to_string(),
+                        ));
+                    }
+                    request
                 }
-                request
-            } else {
-                DetachedCreateRequest {
+                (None, Some(config_path), None) => read_run_config_from_path(&config_path)?,
+                (None, None, Some(fd)) => read_run_config_from_fd(fd)?,
+                (None, None, None) => RunConfig {
                     name,
                     context,
+                    workspace,
+                    workspace_mode,
+                    workspace_exec,
+                    home,
+                    workdir,
                     memory,
                     cpus,
                     hostname,
@@ -1303,6 +1930,7 @@ fn try_main() -> Result<i32> {
                     bundle,
                     pid_file,
                     console_socket,
+                    terminal,
                     network,
                     allow_host_network,
                     allow_degraded_security,
@@ -1312,8 +1940,11 @@ fn try_main() -> Result<i32> {
                     publish,
                     context_mode,
                     service_mode,
+                    strict_agent,
                     rootfs,
+                    agent_toolchain_rootfs,
                     egress_allow,
+                    egress_domains,
                     egress_tcp_ports,
                     egress_udp_ports,
                     dns,
@@ -1327,7 +1958,10 @@ fn try_main() -> Result<i32> {
                     systemd_credentials,
                     volumes,
                     tmpfs,
+                    provider_config_ro,
+                    provider_config_rw,
                     env_vars,
+                    env_fd,
                     sd_notify,
                     readiness_exec,
                     readiness_tcp,
@@ -1351,6 +1985,12 @@ fn try_main() -> Result<i32> {
                     hooks,
                     topology_config_hash,
                     command,
+                },
+                _ => {
+                    return Err(NucleusError::ConfigError(
+                        "--config, --config-fd, and --detached-config-json are mutually exclusive"
+                            .to_string(),
+                    ));
                 }
             };
 
@@ -1364,6 +2004,18 @@ fn try_main() -> Result<i32> {
                     "--secrets-fd cannot be used with --detach".to_string(),
                 ));
             }
+            if create_request.detach && create_request.env_fd.is_some() {
+                return Err(NucleusError::ConfigError(
+                    "--env-fd cannot be used with --detach".to_string(),
+                ));
+            }
+            if create_request.detach && events_fd.is_some() {
+                return Err(NucleusError::ConfigError(
+                    "--events-fd cannot be used with --detach; use --events-jsonl so the systemd-managed process can open the stream"
+                        .to_string(),
+                ));
+            }
+            let _ = resolve_service_mode(create_request.service_mode, create_request.strict_agent)?;
 
             // --detach: re-exec under systemd-run as a transient service using
             // a serialized parsed request instead of argv string surgery.
@@ -1389,6 +2041,18 @@ fn try_main() -> Result<i32> {
                 if let Some(ref root) = state_root {
                     inner_args.push("--root".to_string());
                     inner_args.push(root.display().to_string());
+                }
+                if let Some(ref log) = log_path {
+                    inner_args.push("--log".to_string());
+                    inner_args.push(log.display().to_string());
+                }
+                if log_format != "text" {
+                    inner_args.push("--log-format".to_string());
+                    inner_args.push(log_format.clone());
+                }
+                if let Some(ref events_path) = events_jsonl {
+                    inner_args.push("--events-jsonl".to_string());
+                    inner_args.push(events_path.display().to_string());
                 }
                 inner_args.push("create".to_string());
                 inner_args.push("--detached-config-json".to_string());
@@ -1430,9 +2094,14 @@ fn try_main() -> Result<i32> {
                 return Ok(0);
             }
 
-            let DetachedCreateRequest {
+            let RunConfig {
                 name,
                 context,
+                workspace,
+                workspace_mode,
+                workspace_exec,
+                home,
+                workdir,
                 memory,
                 cpus,
                 hostname,
@@ -1452,6 +2121,7 @@ fn try_main() -> Result<i32> {
                 bundle,
                 pid_file,
                 console_socket,
+                terminal,
                 network,
                 allow_host_network,
                 allow_degraded_security,
@@ -1461,8 +2131,11 @@ fn try_main() -> Result<i32> {
                 publish,
                 context_mode,
                 service_mode,
+                strict_agent,
                 rootfs,
+                agent_toolchain_rootfs,
                 egress_allow,
+                egress_domains,
                 egress_tcp_ports,
                 egress_udp_ports,
                 dns,
@@ -1476,7 +2149,10 @@ fn try_main() -> Result<i32> {
                 systemd_credentials,
                 volumes,
                 tmpfs,
+                provider_config_ro,
+                provider_config_rw,
                 env_vars,
+                env_fd,
                 sd_notify,
                 readiness_exec,
                 readiness_tcp,
@@ -1505,6 +2181,8 @@ fn try_main() -> Result<i32> {
             if let Some(ref n) = name {
                 validate_container_name(n)?;
             }
+
+            let service_mode = resolve_service_mode(service_mode, strict_agent)?;
 
             // Build resource limits (default includes pids_max=512)
             let mut limits = ResourceLimits::default();
@@ -1554,11 +2232,12 @@ fn try_main() -> Result<i32> {
                 NetworkModeArg::Host => NetworkMode::Host,
                 NetworkModeArg::GVisorHost => NetworkMode::GVisorHost,
                 NetworkModeArg::Bridge => {
-                    // Production mode requires explicit DNS to avoid silent empty resolv.conf
-                    if service_mode == ServiceMode::Production && dns.is_empty() {
-                        return Err(NucleusError::ConfigError(
-                            "Production mode with bridge networking requires explicit --dns servers".to_string()
-                        ));
+                    // Strict modes require explicit DNS to avoid public resolver defaults.
+                    if service_mode.requires_explicit_bridge_dns() && dns.is_empty() {
+                        return Err(NucleusError::ConfigError(format!(
+                            "{} with bridge networking requires explicit --dns servers",
+                            service_mode.label()
+                        )));
                     }
                     let mut bridge_config = if dns.is_empty() {
                         BridgeConfig::default().with_public_dns()
@@ -1619,6 +2298,21 @@ fn try_main() -> Result<i32> {
                 config = config.with_context(canonical_ctx);
             }
 
+            let normalized_workdir = normalize_container_destination(Path::new(&workdir))?;
+            config = config.with_workdir(normalized_workdir);
+
+            let normalized_home = normalize_container_destination(Path::new(&home))?;
+            config = config.with_home(normalized_home.clone());
+
+            let mut workspace_config = WorkspaceConfig::new()
+                .with_mode(workspace_mode)
+                .with_allow_execute(workspace_exec);
+            if let Some(workspace_path) = workspace {
+                let canonical_workspace = validate_workspace_host_path(Path::new(&workspace_path))?;
+                workspace_config = workspace_config.with_host_path(canonical_workspace);
+            }
+            config = config.with_workspace(workspace_config);
+
             if let Some(host) = hostname {
                 validate_hostname(&host)?;
                 config = config.with_hostname(Some(host));
@@ -1648,6 +2342,9 @@ fn try_main() -> Result<i32> {
                 };
                 config = config.with_console_socket(canonical);
             }
+            if terminal || config.console_socket.is_some() {
+                config = config.with_terminal(ConsoleSize::detect());
+            }
 
             if rootless {
                 info!("Enabling rootless mode");
@@ -1665,8 +2362,10 @@ fn try_main() -> Result<i32> {
             }
 
             // Rootfs path
-            if let Some(rootfs_dir) = rootfs {
-                config = config.with_rootfs_path(PathBuf::from(rootfs_dir));
+            if let Some(rootfs_dir) =
+                resolve_rootfs_argument(service_mode, rootfs, agent_toolchain_rootfs)?
+            {
+                config = config.with_rootfs_path(rootfs_dir);
             }
 
             // Seccomp profile and mode
@@ -1729,18 +2428,21 @@ fn try_main() -> Result<i32> {
             }
 
             // Egress policy: in production mode, set deny-all by default for
-            // network namespaces where Nucleus can enforce it. gvisor-host is
-            // explicit hostinet and cannot be constrained by namespace-local
-            // iptables rules.
+            // network namespaces where Nucleus can enforce it. Domain entries
+            // resolve to IPv4 rules before the namespace-local iptables policy
+            // is installed. gvisor-host is explicit hostinet and cannot be
+            // constrained by namespace-local iptables rules.
             let gvisor_host_network = matches!(config.network, NetworkMode::GVisorHost);
-            if !egress_allow.is_empty() {
+            if !egress_allow.is_empty() || !egress_domains.is_empty() {
                 if gvisor_host_network {
                     return Err(NucleusError::ConfigError(
-                        "--egress-allow cannot be enforced with --network gvisor-host".to_string(),
+                        "--egress-allow/--egress-domain cannot be enforced with --network gvisor-host"
+                            .to_string(),
                     ));
                 }
                 let policy = EgressPolicy::default()
                     .with_allowed_cidrs(egress_allow)
+                    .with_allowed_domains(egress_domains)
                     .with_allowed_tcp_ports(egress_tcp_ports)
                     .with_allowed_udp_ports(egress_udp_ports);
                 config = config.with_egress_policy(policy);
@@ -1900,30 +2602,26 @@ fn try_main() -> Result<i32> {
                 });
             }
 
+            for spec in &provider_config_ro {
+                config = config.with_provider_config(parse_provider_config_mount_spec(
+                    spec,
+                    &normalized_home,
+                    true,
+                )?);
+            }
+            for spec in &provider_config_rw {
+                config = config.with_provider_config(parse_provider_config_mount_spec(
+                    spec,
+                    &normalized_home,
+                    false,
+                )?);
+            }
+
             // Environment variables
-            const DANGEROUS_ENV_VARS: &[&str] = &[
-                "LD_PRELOAD",
-                "LD_LIBRARY_PATH",
-                "LD_AUDIT",
-                "LD_DEBUG",
-                "LD_PROFILE",
-            ];
+            let env_vars = collect_env_specs(env_vars, env_fd)?;
             for spec in &env_vars {
-                if let Some((key, value)) = spec.split_once('=') {
-                    if DANGEROUS_ENV_VARS.contains(&key) {
-                        return Err(NucleusError::ConfigError(format!(
-                            "Environment variable '{}' is blocked (dynamic linker injection risk). \
-                             This restriction applies in all modes.",
-                            key
-                        )));
-                    }
-                    config = config.with_env(key.to_string(), value.to_string());
-                } else {
-                    return Err(NucleusError::ConfigError(format!(
-                        "Invalid env var format '{}', expected KEY=VALUE",
-                        spec
-                    )));
-                }
+                let (key, value) = parse_env_assignment(spec)?;
+                config = config.with_env(key, value);
             }
 
             // OCI lifecycle hooks
@@ -1979,7 +2677,9 @@ fn try_main() -> Result<i32> {
                 println!("{}", config.id);
             }
 
-            let container = Container::new(config);
+            let event_sink =
+                nucleus::telemetry::EventSink::from_cli(events_fd, events_jsonl.as_deref())?;
+            let container = Container::new(config).with_event_sink(event_sink);
             let exit_code = container.run()?;
 
             Ok(exit_code)
@@ -2203,9 +2903,14 @@ mod tests {
 
     #[test]
     fn test_detached_create_request_roundtrips_command_tokens() {
-        let request = DetachedCreateRequest {
+        let request = RunConfig {
             name: Some("svc".to_string()),
             context: Some("/tmp/context".to_string()),
+            workspace: Some("/tmp/workspace".to_string()),
+            workspace_mode: WorkspaceMode::CopyInOut,
+            workspace_exec: true,
+            home: DEFAULT_HOME_PATH.to_string(),
+            workdir: "/workspace".to_string(),
             memory: Some("512M".to_string()),
             cpus: Some(1.5),
             hostname: Some("svc".to_string()),
@@ -2225,6 +2930,7 @@ mod tests {
             bundle: Some(PathBuf::from("/tmp/bundle")),
             pid_file: Some(PathBuf::from("/tmp/pid")),
             console_socket: Some(PathBuf::from("/tmp/console.sock")),
+            terminal: true,
             network: NetworkModeArg::Bridge,
             allow_host_network: false,
             allow_degraded_security: true,
@@ -2234,8 +2940,11 @@ mod tests {
             publish: vec!["127.0.0.1:8080:80/tcp".to_string()],
             context_mode: ContextMode::BindMount,
             service_mode: ServiceMode::Production,
+            strict_agent: false,
             rootfs: Some("/nix/store/rootfs".to_string()),
+            agent_toolchain_rootfs: None,
             egress_allow: vec!["10.0.0.0/8".to_string()],
+            egress_domains: vec!["api.example.com".to_string()],
             egress_tcp_ports: vec![443],
             egress_udp_ports: vec![53],
             dns: vec!["8.8.8.8".to_string()],
@@ -2249,7 +2958,10 @@ mod tests {
             systemd_credentials: vec!["db-password:/run/secrets/db".to_string()],
             volumes: vec!["/tmp/data:/data:ro".to_string()],
             tmpfs: vec!["/cache:64M:rw".to_string()],
+            provider_config_ro: vec!["/tmp/provider:/home/agent/.provider".to_string()],
+            provider_config_rw: Vec::new(),
             env_vars: vec!["A=B".to_string()],
+            env_fd: None,
             sd_notify: true,
             readiness_exec: Some("test -f /tmp/ready".to_string()),
             readiness_tcp: None,
@@ -2282,17 +2994,23 @@ mod tests {
         };
 
         let encoded = serde_json::to_string(&request).unwrap();
-        let decoded: DetachedCreateRequest = serde_json::from_str(&encoded).unwrap();
+        let decoded: RunConfig = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded.command, request.command);
         assert_eq!(decoded.publish, request.publish);
+        assert_eq!(decoded.egress_domains, request.egress_domains);
         assert_eq!(decoded.seccomp_allow, request.seccomp_allow);
     }
 
     #[test]
     fn test_create_hidden_detached_config_skips_command_requirement() {
-        let encoded = serde_json::to_string(&DetachedCreateRequest {
+        let encoded = serde_json::to_string(&RunConfig {
             name: None,
             context: None,
+            workspace: None,
+            workspace_mode: WorkspaceMode::BindRw,
+            workspace_exec: false,
+            home: DEFAULT_HOME_PATH.to_string(),
+            workdir: "/workspace".to_string(),
             memory: None,
             cpus: None,
             hostname: None,
@@ -2312,6 +3030,7 @@ mod tests {
             bundle: None,
             pid_file: None,
             console_socket: None,
+            terminal: false,
             network: NetworkModeArg::None,
             allow_host_network: false,
             allow_degraded_security: false,
@@ -2321,8 +3040,11 @@ mod tests {
             publish: Vec::new(),
             context_mode: ContextMode::Copy,
             service_mode: ServiceMode::Agent,
+            strict_agent: false,
             rootfs: None,
+            agent_toolchain_rootfs: None,
             egress_allow: Vec::new(),
+            egress_domains: Vec::new(),
             egress_tcp_ports: Vec::new(),
             egress_udp_ports: Vec::new(),
             dns: Vec::new(),
@@ -2336,7 +3058,10 @@ mod tests {
             systemd_credentials: Vec::new(),
             volumes: Vec::new(),
             tmpfs: Vec::new(),
+            provider_config_ro: Vec::new(),
+            provider_config_rw: Vec::new(),
             env_vars: Vec::new(),
+            env_fd: None,
             sd_notify: false,
             readiness_exec: None,
             readiness_tcp: None,
@@ -2377,6 +3102,264 @@ mod tests {
             }
             _ => panic!("expected create command"),
         }
+    }
+
+    #[test]
+    fn test_run_alias_accepts_launch_config_without_command() {
+        let cli =
+            Cli::try_parse_from(["nucleus", "run", "--config", "agent.nucleus.toml"]).unwrap();
+
+        match cli.command {
+            Commands::Create {
+                config, command, ..
+            } => {
+                assert_eq!(config, Some(PathBuf::from("agent.nucleus.toml")));
+                assert!(command.is_empty());
+            }
+            _ => panic!("expected create command"),
+        }
+    }
+
+    #[test]
+    fn test_run_config_rejects_cli_option_overlay() {
+        let err = Cli::try_parse_from([
+            "nucleus",
+            "run",
+            "--config",
+            "agent.nucleus.toml",
+            "--memory",
+            "1G",
+        ])
+        .unwrap_err();
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn test_run_config_defaults_from_minimal_json() {
+        let config = parse_run_config(
+            r#"{"command":["/bin/true"]}"#,
+            "test",
+            Some(RunConfigFormat::Json),
+        )
+        .unwrap();
+
+        assert_eq!(config.command, vec!["/bin/true"]);
+        assert_eq!(config.runtime, RuntimeSelection::GVisor);
+        assert_eq!(config.network, NetworkModeArg::None);
+        assert_eq!(config.service_mode, ServiceMode::Agent);
+        assert_eq!(config.workspace_mode, WorkspaceMode::BindRw);
+        assert!(matches!(config.context_mode, ContextMode::Copy));
+        assert_eq!(config.workdir, "/workspace");
+        assert_eq!(config.home, DEFAULT_HOME_PATH);
+    }
+
+    #[test]
+    fn test_run_config_toml_uses_cli_enum_spellings() {
+        let config = parse_run_config(
+            r#"
+command = ["/bin/true"]
+workspace_mode = "copy-in-out"
+runtime = "native"
+network = "gvisor-host"
+service_mode = "mitos-agent"
+context_mode = "bind"
+gvisor_platform = "ptrace"
+trust_level = "trusted"
+seccomp_mode = "trace"
+seccomp_log = "/tmp/seccomp.ndjson"
+"#,
+            "test",
+            Some(RunConfigFormat::Toml),
+        )
+        .unwrap();
+
+        assert_eq!(config.workspace_mode, WorkspaceMode::CopyInOut);
+        assert_eq!(config.runtime, RuntimeSelection::Native);
+        assert_eq!(config.network, NetworkModeArg::GVisorHost);
+        assert_eq!(config.service_mode, ServiceMode::StrictAgent);
+        assert!(matches!(config.context_mode, ContextMode::BindMount));
+        assert_eq!(config.gvisor_platform, GVisorPlatform::Ptrace);
+        assert_eq!(config.trust_level, TrustLevel::Trusted);
+        assert_eq!(config.seccomp_mode, SeccompMode::Trace);
+    }
+
+    #[test]
+    fn test_run_config_rejects_unknown_fields() {
+        let err = parse_run_config(
+            r#"
+command = ["/bin/true"]
+surprise = true
+"#,
+            "test",
+            Some(RunConfigFormat::Toml),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn test_read_run_config_from_fd_reads_toml() {
+        use std::io::{Seek, Write};
+        use std::os::fd::IntoRawFd;
+
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(
+            br#"
+command = ["/bin/true"]
+service_mode = "strict-agent"
+"#,
+        )
+        .unwrap();
+        file.rewind().unwrap();
+
+        let fd = file.into_raw_fd();
+        let config = read_run_config_from_fd(fd).unwrap();
+        assert_eq!(config.command, vec!["/bin/true"]);
+        assert_eq!(config.service_mode, ServiceMode::StrictAgent);
+    }
+
+    #[test]
+    fn test_strict_agent_flag_resolves_to_strict_agent_mode() {
+        assert_eq!(
+            resolve_service_mode(ServiceMode::Agent, true).unwrap(),
+            ServiceMode::StrictAgent
+        );
+        assert_eq!(
+            resolve_service_mode(ServiceMode::StrictAgent, true).unwrap(),
+            ServiceMode::StrictAgent
+        );
+        assert!(resolve_service_mode(ServiceMode::Production, true).is_err());
+    }
+
+    #[test]
+    fn test_service_mode_strict_agent_and_mitos_agent_parse() {
+        let strict = Cli::try_parse_from([
+            "nucleus",
+            "create",
+            "--service-mode",
+            "strict-agent",
+            "--",
+            "/bin/true",
+        ])
+        .unwrap();
+        let alias = Cli::try_parse_from([
+            "nucleus",
+            "create",
+            "--service-mode",
+            "mitos-agent",
+            "--",
+            "/bin/true",
+        ])
+        .unwrap();
+        let flag = Cli::try_parse_from(["nucleus", "create", "--strict-agent", "--", "/bin/true"])
+            .unwrap();
+
+        match strict.command {
+            Commands::Create { service_mode, .. } => {
+                assert_eq!(service_mode, ServiceMode::StrictAgent);
+            }
+            _ => panic!("expected create command"),
+        }
+        match alias.command {
+            Commands::Create { service_mode, .. } => {
+                assert_eq!(service_mode, ServiceMode::StrictAgent);
+            }
+            _ => panic!("expected create command"),
+        }
+        match flag.command {
+            Commands::Create { strict_agent, .. } => {
+                assert!(strict_agent);
+            }
+            _ => panic!("expected create command"),
+        }
+    }
+
+    #[test]
+    fn test_agent_toolchain_rootfs_flag_parses() {
+        let cli = Cli::try_parse_from([
+            "nucleus",
+            "run",
+            "--service-mode",
+            "mitos-agent",
+            "--agent-toolchain-rootfs",
+            "/nix/store/example-agent-toolchain-rootfs",
+            "--",
+            "/bin/true",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Create {
+                service_mode,
+                agent_toolchain_rootfs,
+                ..
+            } => {
+                assert_eq!(service_mode, ServiceMode::StrictAgent);
+                assert_eq!(
+                    agent_toolchain_rootfs,
+                    Some("/nix/store/example-agent-toolchain-rootfs".to_string())
+                );
+            }
+            _ => panic!("expected create command"),
+        }
+    }
+
+    #[test]
+    fn test_agent_toolchain_rootfs_conflicts_with_rootfs_flag() {
+        let err = Cli::try_parse_from([
+            "nucleus",
+            "run",
+            "--rootfs",
+            "/nix/store/service-rootfs",
+            "--agent-toolchain-rootfs",
+            "/nix/store/agent-rootfs",
+            "--",
+            "/bin/true",
+        ])
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("cannot be used with"),
+            "expected clap conflict, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_rootfs_argument_accepts_agent_toolchain_rootfs_in_strict_agent_mode() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let rootfs = temp.path().join("agent-rootfs");
+        std::fs::create_dir(&rootfs).unwrap();
+
+        let resolved = resolve_rootfs_argument(
+            ServiceMode::StrictAgent,
+            None,
+            Some(rootfs.display().to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(resolved, Some(std::fs::canonicalize(rootfs).unwrap()));
+    }
+
+    #[test]
+    fn test_resolve_rootfs_argument_rejects_agent_toolchain_rootfs_in_production_mode() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let rootfs = temp.path().join("agent-rootfs");
+        std::fs::create_dir(&rootfs).unwrap();
+
+        let err = resolve_rootfs_argument(
+            ServiceMode::Production,
+            None,
+            Some(rootfs.display().to_string()),
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("production mode must use --rootfs"),
+            "expected production mode rejection, got: {err}"
+        );
     }
 
     #[test]
@@ -2469,6 +3452,64 @@ mod tests {
         let fd = file.into_raw_fd();
         let decoded = read_secret_specs_from_fd(fd).unwrap();
         assert_eq!(decoded, specs);
+    }
+
+    #[test]
+    fn test_read_env_specs_from_fd_reads_json_object() {
+        use std::io::{Seek, Write};
+        use std::os::fd::IntoRawFd;
+
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(br#"{"OPENAI_API_KEY":"secret","DEBUG":"1"}"#)
+            .unwrap();
+        file.rewind().unwrap();
+
+        let fd = file.into_raw_fd();
+        let decoded = read_env_specs_from_fd(fd).unwrap();
+        assert!(decoded.contains(&"OPENAI_API_KEY=secret".to_string()));
+        assert!(decoded.contains(&"DEBUG=1".to_string()));
+    }
+
+    #[test]
+    fn test_parse_env_assignment_rejects_dangerous_names_without_value_echo() {
+        let err = parse_env_assignment("LD_PRELOAD=/tmp/inject.so").unwrap_err();
+        assert!(err.to_string().contains("LD_PRELOAD"));
+        assert!(!err.to_string().contains("/tmp/inject.so"));
+    }
+
+    #[test]
+    fn test_home_provider_config_and_env_fd_parse() {
+        let cli = Cli::try_parse_from([
+            "nucleus",
+            "create",
+            "--home",
+            "/home/agent",
+            "--provider-config-ro",
+            "/tmp/aws:.aws",
+            "--provider-config-rw",
+            "/tmp/gh:.config/gh",
+            "--env-fd",
+            "3",
+            "--",
+            "/bin/true",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Create {
+                home,
+                provider_config_ro,
+                provider_config_rw,
+                env_fd,
+                ..
+            } => {
+                assert_eq!(home, "/home/agent");
+                assert_eq!(provider_config_ro, vec!["/tmp/aws:.aws"]);
+                assert_eq!(provider_config_rw, vec!["/tmp/gh:.config/gh"]);
+                assert_eq!(env_fd, Some(3));
+            }
+            _ => panic!("expected create command"),
+        }
     }
 
     #[test]

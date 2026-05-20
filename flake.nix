@@ -54,6 +54,16 @@
           rm -f "$out/etc/resolv.conf"
           : > "$out/etc/resolv.conf"
 
+          if [ -x "$out/bin/bash" ] && [ ! -e "$out/bin/sh" ]; then
+            ln -s bash "$out/bin/sh"
+          fi
+          if [ -x "$out/bin/env" ]; then
+            mkdir -p "$out/usr/bin"
+            if [ ! -e "$out/usr/bin/env" ]; then
+              ln -s ../../bin/env "$out/usr/bin/env"
+            fi
+          fi
+
           mkdir -p "$out/nix/store"
           store_paths="$out/.nucleus-rootfs-store-paths"
           : > "$store_paths"
@@ -76,6 +86,53 @@
                 printf '%s\t%s\n' "$digest" "$rel"
               done > "$manifest"
         '';
+
+      # Helper: build a reusable rootfs for ephemeral provider agents.
+      # This is intentionally broader than mkRootfs's minimal default: Mitos
+      # and similar launchers need shells, git, TLS, provider CLIs, compilers,
+      # language runtimes, and package managers available inside the sandbox.
+      lib.mkAgentToolchainRootfs =
+        { pkgs
+        , providerPackages ? [ ]
+        , extraPackages ? [ ]
+        , name ? "nucleus-agent-toolchain-rootfs"
+        }:
+        self.lib.mkRootfs {
+          inherit pkgs name;
+          packages = (with pkgs; [
+            bashInteractive
+            coreutils
+            findutils
+            gnugrep
+            gnused
+            gawk
+            diffutils
+            patch
+            gnutar
+            gzip
+            bzip2
+            xz
+            zstd
+            zip
+            unzip
+            which
+            file
+            git
+            openssh
+            curl
+            cacert
+            jq
+            ripgrep
+            nodejs
+            python3
+            rustc
+            cargo
+            go
+            gcc
+            gnumake
+            pkg-config
+          ]) ++ providerPackages ++ extraPackages;
+        };
     } //
     flake-utils.lib.eachDefaultSystem (system:
       let
@@ -229,6 +286,9 @@
 
         packages = lib.optionalAttrs cargoLockExists {
           default = my-crate;
+          agent-toolchain-rootfs = self.lib.mkAgentToolchainRootfs {
+            inherit pkgs;
+          };
         };
 
         apps = lib.optionalAttrs cargoLockExists {

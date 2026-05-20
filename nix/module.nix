@@ -87,8 +87,20 @@ let
         default = [ ];
         example = [ "10.0.0.0/8" "192.168.1.0/24" ];
         description = ''
-          Allowed egress CIDRs. Empty means deny-all outbound.
-          Production mode always enforces an egress policy (deny-all when empty).
+          Allowed egress CIDRs. Combined with egressDomains.
+          Production mode always enforces an egress policy (deny-all when both
+          egressAllow and egressDomains are empty).
+        '';
+      };
+
+      egressDomains = mkOption {
+        type = types.listOf types.str;
+        default = [ ];
+        example = [ "api.example.com" ];
+        description = ''
+          Allowed exact egress domains. Nucleus resolves each domain to IPv4
+          /32 rules at container startup; wildcard and suffix matching are not
+          supported.
         '';
       };
 
@@ -414,6 +426,7 @@ let
         ++ lib.optionals (containerCfg.network == "bridge") [ "--nat-backend" (e containerCfg.natBackend) ]
         ++ (lib.concatMap (d: [ "--dns" (e d) ]) containerCfg.dns)
         ++ (lib.concatMap (c: [ "--egress-allow" (e c) ]) containerCfg.egressAllow)
+        ++ (lib.concatMap (d: [ "--egress-domain" (e d) ]) containerCfg.egressDomains)
         ++ (lib.concatMap (p: [ "--egress-tcp-port" (e (toString p)) ]) containerCfg.egressTcpPorts)
         ++ (lib.concatMap (p: [ "--egress-udp-port" (e (toString p)) ]) containerCfg.egressUdpPorts)
         ++ (lib.concatMap (p: [ "-p" (e p) ]) containerCfg.portForwards)

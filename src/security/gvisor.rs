@@ -44,6 +44,7 @@ pub enum GVisorNetworkMode {
     serde::Serialize,
     serde::Deserialize,
 )]
+#[serde(rename_all = "kebab-case")]
 pub enum GVisorPlatform {
     /// systrap backend, the current default and most broadly compatible option.
     #[default]
@@ -65,7 +66,7 @@ impl GVisorPlatform {
 }
 
 /// Options for running an OCI bundle with gVisor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GVisorOciRunOptions {
     /// gVisor networking mode passed to runsc.
     pub network_mode: GVisorNetworkMode,
@@ -88,6 +89,8 @@ pub struct GVisorOciRunOptions {
     pub require_supervisor_exec_policy: bool,
     /// gVisor Sentry platform backend.
     pub platform: GVisorPlatform,
+    /// Optional OCI console socket that receives the terminal PTY master.
+    pub console_socket: Option<PathBuf>,
 }
 
 impl Default for GVisorOciRunOptions {
@@ -99,12 +102,13 @@ impl Default for GVisorOciRunOptions {
             stage_runsc_binary: false,
             require_supervisor_exec_policy: false,
             platform: GVisorPlatform::default(),
+            console_socket: None,
         }
     }
 }
 
 impl GVisorOciRunOptions {
-    fn network_flag(self) -> &'static str {
+    fn network_flag(&self) -> &'static str {
         match self.network_mode {
             GVisorNetworkMode::None => "none",
             GVisorNetworkMode::Sandbox => "sandbox",
@@ -361,7 +365,7 @@ impl GVisorRuntime {
             container_id,
             bundle,
             &runsc_root,
-            options,
+            &options,
             debug_dir.as_deref(),
         );
         args[0] = program_path.to_string_lossy().to_string();
@@ -435,6 +439,7 @@ impl GVisorRuntime {
                 stage_runsc_binary,
                 require_supervisor_exec_policy,
                 platform,
+                console_socket: None,
             },
         )
     }
@@ -1035,7 +1040,7 @@ impl GVisorRuntime {
         container_id: &str,
         bundle: &OciBundle,
         runsc_root: &Path,
-        options: GVisorOciRunOptions,
+        options: &GVisorOciRunOptions,
         debug_dir: Option<&Path>,
     ) -> Vec<String> {
         let mut args = vec![
@@ -1078,6 +1083,16 @@ impl GVisorRuntime {
             "--platform".to_string(),
             options.platform.as_flag().to_string(),
             "run".to_string(),
+        ]);
+
+        if let Some(console_socket) = &options.console_socket {
+            args.extend([
+                "--console-socket".to_string(),
+                console_socket.to_string_lossy().to_string(),
+            ]);
+        }
+
+        args.extend([
             "--bundle".to_string(),
             bundle.bundle_path().to_string_lossy().to_string(),
             container_id.to_string(),
@@ -1297,13 +1312,14 @@ mod tests {
             "container-id",
             &bundle,
             tmp.path(),
-            GVisorOciRunOptions {
+            &GVisorOciRunOptions {
                 network_mode: GVisorNetworkMode::Host,
                 ignore_cgroups: true,
                 runsc_rootless: true,
                 stage_runsc_binary: false,
                 require_supervisor_exec_policy: false,
                 platform: GVisorPlatform::Systrap,
+                console_socket: None,
             },
             None,
         );
@@ -1349,19 +1365,58 @@ mod tests {
             "container-id",
             &bundle,
             tmp.path(),
-            GVisorOciRunOptions {
+            &GVisorOciRunOptions {
                 network_mode: GVisorNetworkMode::Host,
                 ignore_cgroups: true,
                 runsc_rootless: false,
                 stage_runsc_binary: false,
                 require_supervisor_exec_policy: false,
                 platform: GVisorPlatform::Systrap,
+                console_socket: None,
             },
             None,
         );
 
         assert!(!args.iter().any(|arg| arg == "--rootless"));
         assert!(args.iter().any(|arg| arg == "--ignore-cgroups"));
+    }
+
+    #[test]
+    fn test_runsc_args_pass_console_socket_after_run_subcommand() {
+        let rt = GVisorRuntime::with_path("/nix/store/fake-runsc/bin/runsc".to_string());
+        let tmp = tempfile::tempdir().unwrap();
+        let console_socket = tmp.path().join("console.sock");
+        let bundle = OciBundle::new(
+            tmp.path().join("bundle"),
+            OciConfig::new(vec!["/bin/true".to_string()], None),
+        );
+
+        let args = rt.build_oci_run_args(
+            "container-id",
+            &bundle,
+            tmp.path(),
+            &GVisorOciRunOptions {
+                network_mode: GVisorNetworkMode::Host,
+                ignore_cgroups: true,
+                runsc_rootless: false,
+                stage_runsc_binary: false,
+                require_supervisor_exec_policy: false,
+                platform: GVisorPlatform::Systrap,
+                console_socket: Some(console_socket.clone()),
+            },
+            None,
+        );
+
+        let run_index = args.iter().position(|arg| arg == "run").unwrap();
+        let socket_index = args
+            .iter()
+            .position(|arg| arg == "--console-socket")
+            .unwrap();
+        assert!(socket_index > run_index);
+        assert_eq!(
+            args.get(socket_index + 1),
+            Some(&console_socket.to_string_lossy().to_string())
+        );
     }
 
     #[test]
@@ -1378,13 +1433,14 @@ mod tests {
             "container-id",
             &bundle,
             tmp.path(),
-            GVisorOciRunOptions {
+            &GVisorOciRunOptions {
                 network_mode: GVisorNetworkMode::Host,
                 ignore_cgroups: true,
                 runsc_rootless: true,
                 stage_runsc_binary: false,
                 require_supervisor_exec_policy: false,
                 platform: GVisorPlatform::Ptrace,
+                console_socket: None,
             },
             Some(&debug_dir),
         );

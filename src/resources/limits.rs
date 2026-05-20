@@ -92,7 +92,7 @@ impl IoDeviceLimit {
 }
 
 /// Resource limits configuration
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ResourceLimits {
     /// Memory limit in bytes (None = unlimited)
     pub memory_bytes: Option<u64>,
@@ -272,6 +272,17 @@ impl ResourceLimits {
         }
 
         Ok(())
+    }
+
+    /// Return true when at least one cgroup v2 control will be configured.
+    pub fn has_cgroup_control(&self) -> bool {
+        self.memory_bytes.is_some()
+            || self.memory_high.is_some()
+            || self.memory_swap_max.is_some()
+            || self.cpu_quota_us.is_some()
+            || self.cpu_weight.is_some()
+            || self.pids_max.is_some()
+            || !self.io_limits.is_empty()
     }
 }
 
@@ -453,6 +464,8 @@ mod tests {
         assert!(limits.cpu_weight.is_none());
         assert!(limits.pids_max.is_none());
         assert!(limits.io_limits.is_empty());
+        assert!(!limits.has_cgroup_control());
+        assert!(ResourceLimits::default().has_cgroup_control());
     }
 
     #[test]

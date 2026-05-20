@@ -4,12 +4,15 @@ use std::path::Path;
 use tracing::info;
 
 /// Context population mode
-#[derive(Debug, Clone, clap::ValueEnum, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, clap::ValueEnum, serde::Serialize, serde::Deserialize)]
 pub enum ContextMode {
     /// Traditional copy (default, backward compatible)
+    #[default]
+    #[serde(rename = "copy")]
     Copy,
     /// Bind mount for zero-copy, instant access
     #[value(name = "bind")]
+    #[serde(rename = "bind", alias = "bind-mount")]
     BindMount,
 }
 

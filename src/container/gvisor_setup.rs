@@ -48,6 +48,9 @@ impl Container {
 
         let mut oci_config =
             OciConfig::new(self.config.command.clone(), self.config.hostname.clone());
+        if self.config.terminal {
+            oci_config = oci_config.with_terminal(self.config.console_size);
+        }
         if precreated_userns {
             // In rootless bridge mode Nucleus creates the mapped user namespace
             // before execing runsc so the prepared netns can be inherited.
@@ -69,6 +72,7 @@ impl Container {
 
         oci_config = oci_config.with_resources(&self.config.limits);
         oci_config = oci_config.with_namespace_config(&self.config.namespaces);
+        oci_config = oci_config.with_workdir(&self.config.workdir)?;
         if precreated_userns {
             // Nucleus already created and mapped the user namespace before
             // execing runsc. Do not leave an OCI user namespace request in the
@@ -77,6 +81,8 @@ impl Container {
             oci_config = oci_config.without_user_namespace();
         }
         oci_config = oci_config.with_process_identity(&self.config.process_identity);
+        oci_config =
+            oci_config.with_home_tmpfs(&self.config.home, &self.config.process_identity)?;
         if matches!(
             self.config.network,
             NetworkMode::Bridge(_) | NetworkMode::GVisorHost
@@ -122,6 +128,13 @@ impl Container {
             oci_config = oci_config.with_rootfs_binds(&rootfs_path)?;
         } else {
             oci_config = oci_config.with_host_runtime_binds();
+        }
+
+        oci_config = oci_config.with_workspace_mount(&self.config.workspace)?;
+
+        if !self.config.provider_configs.is_empty() {
+            oci_config = oci_config
+                .with_provider_config_mounts(&self.config.home, &self.config.provider_configs)?;
         }
 
         if !self.config.volumes.is_empty() {
@@ -195,7 +208,7 @@ impl Container {
         }
 
         let dev_path = rootfs.join("dev");
-        create_dev_nodes(&dev_path, false)?;
+        create_dev_nodes(&dev_path, self.config.terminal)?;
 
         // Write resolv.conf for bridge networking into the OCI rootfs
         if let NetworkMode::Bridge(ref bridge_config) = self.config.network {
@@ -244,6 +257,7 @@ impl Container {
                 stage_runsc_binary,
                 require_supervisor_exec_policy,
                 platform,
+                console_socket: self.config.console_socket.clone(),
             },
         )?;
 

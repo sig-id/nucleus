@@ -190,6 +190,55 @@ pub fn validate_production_rootfs_path(rootfs_path: &Path) -> Result<PathBuf> {
     validate_rootfs_path_under_store(rootfs_path, Path::new("/nix/store"))
 }
 
+/// Validate an agent toolchain rootfs path and return the canonical path to use.
+///
+/// Agent toolchain rootfs paths are not restricted to `/nix/store` because
+/// local development and tests may build them elsewhere, but they must be
+/// absolute, traversal-free, and resolve to an existing directory.
+pub fn validate_agent_toolchain_rootfs_path(rootfs_path: &Path) -> Result<PathBuf> {
+    if !rootfs_path.is_absolute() {
+        return Err(NucleusError::ConfigError(format!(
+            "Agent toolchain rootfs path must be absolute: {}",
+            rootfs_path.display()
+        )));
+    }
+
+    for component in rootfs_path.components() {
+        match component {
+            Component::ParentDir => {
+                return Err(NucleusError::ConfigError(format!(
+                    "Agent toolchain rootfs path must not contain parent traversal: {}",
+                    rootfs_path.display()
+                )));
+            }
+            Component::Prefix(_) => {
+                return Err(NucleusError::ConfigError(format!(
+                    "Unsupported agent toolchain rootfs path prefix: {}",
+                    rootfs_path.display()
+                )));
+            }
+            Component::RootDir | Component::CurDir | Component::Normal(_) => {}
+        }
+    }
+
+    let canonical = std::fs::canonicalize(rootfs_path).map_err(|e| {
+        NucleusError::ConfigError(format!(
+            "Failed to canonicalize agent toolchain rootfs path '{}': {}",
+            rootfs_path.display(),
+            e
+        ))
+    })?;
+
+    if !canonical.is_dir() {
+        return Err(NucleusError::ConfigError(format!(
+            "Agent toolchain rootfs path must resolve to a directory: {}",
+            canonical.display()
+        )));
+    }
+
+    Ok(canonical)
+}
+
 pub(crate) fn read_regular_file_nofollow(path: &Path) -> Result<Vec<u8>> {
     let mut file = OpenOptions::new()
         .read(true)
@@ -338,6 +387,9 @@ pub fn create_minimal_fs(root: &Path) -> Result<()> {
         "nix/store",
         "run",
         "context",
+        "workspace",
+        "home",
+        "home/agent",
     ];
 
     for dir in dirs {
@@ -679,6 +731,17 @@ const DENIED_BIND_MOUNT_SOURCE_PREFIXES: &[&str] = &[
     "/boot", "/dev", "/etc", "/home", "/proc", "/root", "/run", "/sys", "/var/log", "/var/run",
 ];
 
+/// Sensitive host paths still denied for explicit provider config mounts.
+///
+/// Provider config mounts intentionally allow specific host-home credential
+/// directories (for example `$HOME/.aws`) that generic volumes reject, but they
+/// must not become a broad host filesystem escape hatch.
+const DENIED_PROVIDER_CONFIG_SOURCE_EXACT: &[&str] = &["/", "/home", "/root"];
+
+const DENIED_PROVIDER_CONFIG_SOURCE_PREFIXES: &[&str] = &[
+    "/boot", "/dev", "/etc", "/proc", "/run", "/sys", "/var/log", "/var/run",
+];
+
 /// Container destinations where user-supplied volumes must not be mounted.
 ///
 /// These paths carry trusted runtime/rootfs state. Allowing a volume over them
@@ -756,6 +819,37 @@ fn reject_denied_bind_mount_source(source: &Path) -> Result<()> {
     Ok(())
 }
 
+fn reject_denied_provider_config_source(source: &Path) -> Result<()> {
+    for denied in DENIED_PROVIDER_CONFIG_SOURCE_EXACT {
+        if source == Path::new(denied) {
+            return Err(NucleusError::ConfigError(format!(
+                "Provider config source '{}' is too broad; mount a specific provider config file or directory",
+                source.display()
+            )));
+        }
+    }
+
+    if source.parent() == Some(Path::new("/home")) {
+        return Err(NucleusError::ConfigError(format!(
+            "Provider config source '{}' is a whole host home directory; mount a specific provider config subdirectory",
+            source.display()
+        )));
+    }
+
+    for denied in DENIED_PROVIDER_CONFIG_SOURCE_PREFIXES {
+        let denied_path = Path::new(denied);
+        if source == denied_path || source.starts_with(denied_path) {
+            return Err(NucleusError::ConfigError(format!(
+                "Provider config source '{}' is under sensitive host path '{}' and cannot be mounted into containers",
+                source.display(),
+                denied
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 /// Validate bind-mount source policy without requiring the source to exist.
 ///
 /// Topology persistent volumes use this before creating missing host paths, so
@@ -779,6 +873,32 @@ pub fn validate_bind_mount_source(source: &Path) -> Result<()> {
     reject_denied_bind_mount_source(&canonical)
 }
 
+/// Validate that an explicit provider config mount source exists and is narrow.
+pub fn validate_provider_config_source(source: &Path) -> Result<()> {
+    normalize_bind_mount_source_for_policy(source)?;
+
+    let canonical = std::fs::canonicalize(source).map_err(|e| {
+        NucleusError::ConfigError(format!(
+            "Failed to resolve provider config source {:?}: {}",
+            source, e
+        ))
+    })?;
+    let metadata = std::fs::metadata(&canonical).map_err(|e| {
+        NucleusError::ConfigError(format!(
+            "Failed to stat provider config source {:?}: {}",
+            canonical, e
+        ))
+    })?;
+    if !metadata.is_file() && !metadata.is_dir() {
+        return Err(NucleusError::ConfigError(format!(
+            "Provider config source '{}' must be a regular file or directory",
+            canonical.display()
+        )));
+    }
+
+    reject_denied_provider_config_source(&canonical)
+}
+
 fn reject_reserved_volume_destination(dest: &Path) -> Result<()> {
     for reserved in RESERVED_VOLUME_DESTINATION_PREFIXES {
         let reserved_path = Path::new(reserved);
@@ -798,6 +918,55 @@ pub fn normalize_volume_destination(dest: &Path) -> Result<PathBuf> {
     let normalized = normalize_container_destination(dest)?;
     reject_reserved_volume_destination(&normalized)?;
     Ok(normalized)
+}
+
+/// Normalize a provider config destination under the configured container home.
+///
+/// Absolute destinations must already be under `home`. Relative destinations
+/// are resolved against `home`. The selected destination may not be the home
+/// root itself; provider config mounts must target a file or subdirectory.
+pub fn normalize_provider_config_destination(home: &Path, dest: &Path) -> Result<PathBuf> {
+    let home = normalize_container_destination(home)?;
+    let candidate = if dest.is_absolute() {
+        normalize_container_destination(dest)?
+    } else {
+        let mut relative = PathBuf::new();
+        for component in dest.components() {
+            match component {
+                Component::CurDir => {}
+                Component::Normal(part) => relative.push(part),
+                Component::ParentDir => {
+                    return Err(NucleusError::ConfigError(format!(
+                        "Provider config destination must not contain parent traversal: {:?}",
+                        dest
+                    )));
+                }
+                Component::RootDir | Component::Prefix(_) => {
+                    return Err(NucleusError::ConfigError(format!(
+                        "Unsupported provider config destination: {:?}",
+                        dest
+                    )));
+                }
+            }
+        }
+        if relative.as_os_str().is_empty() {
+            return Err(NucleusError::ConfigError(format!(
+                "Provider config destination must not be empty: {:?}",
+                dest
+            )));
+        }
+        normalize_container_destination(&home.join(relative))?
+    };
+
+    if candidate == home || !candidate.starts_with(&home) {
+        return Err(NucleusError::ConfigError(format!(
+            "Provider config destination '{}' must be under configured home '{}'",
+            candidate.display(),
+            home.display()
+        )));
+    }
+
+    Ok(candidate)
 }
 
 /// Resolve a validated user-supplied volume destination under a host-side root directory.
@@ -972,6 +1141,238 @@ pub fn mount_volumes(root: &Path, volumes: &[crate::container::VolumeMount]) -> 
             }
         }
     }
+
+    Ok(())
+}
+
+/// Mount the private sandbox home tmpfs.
+pub fn mount_home_tmpfs(
+    root: &Path,
+    home: &Path,
+    identity: &crate::container::ProcessIdentity,
+) -> Result<()> {
+    let dest = resolve_container_destination(root, home)?;
+    std::fs::create_dir_all(&dest).map_err(|e| {
+        NucleusError::FilesystemError(format!(
+            "Failed to create sandbox home mount dir {:?}: {}",
+            dest, e
+        ))
+    })?;
+
+    let mount_data = format!(
+        "size=256M,mode=0700,uid={},gid={}",
+        identity.uid, identity.gid
+    );
+    mount(
+        Some("tmpfs"),
+        &dest,
+        Some("tmpfs"),
+        MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
+        Some(mount_data.as_str()),
+    )
+    .map_err(|e| {
+        NucleusError::FilesystemError(format!(
+            "Failed to mount sandbox home tmpfs at {:?}: {}",
+            dest, e
+        ))
+    })?;
+
+    info!("Mounted sandbox home tmpfs at {:?}", home);
+    Ok(())
+}
+
+/// Mount explicit provider CLI config paths under the sandbox home.
+pub fn mount_provider_configs(
+    root: &Path,
+    home: &Path,
+    provider_configs: &[crate::container::ProviderConfigMount],
+) -> Result<()> {
+    if provider_configs.is_empty() {
+        return Ok(());
+    }
+
+    info!(
+        "Mounting {} provider config path(s) into sandbox home",
+        provider_configs.len()
+    );
+
+    for provider_config in provider_configs {
+        validate_provider_config_source(&provider_config.source)?;
+        let canonical_source = std::fs::canonicalize(&provider_config.source).map_err(|e| {
+            NucleusError::FilesystemError(format!(
+                "Failed to canonicalize provider config source {:?}: {}",
+                provider_config.source, e
+            ))
+        })?;
+        let metadata = std::fs::metadata(&canonical_source).map_err(|e| {
+            NucleusError::FilesystemError(format!(
+                "Failed to stat provider config source {:?}: {}",
+                canonical_source, e
+            ))
+        })?;
+        let container_dest = normalize_provider_config_destination(home, &provider_config.dest)?;
+        let dest = resolve_container_destination(root, &container_dest)?;
+
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                NucleusError::FilesystemError(format!(
+                    "Failed to create provider config parent {:?}: {}",
+                    parent, e
+                ))
+            })?;
+        }
+
+        if metadata.is_file() {
+            std::fs::write(&dest, "").map_err(|e| {
+                NucleusError::FilesystemError(format!(
+                    "Failed to create provider config mount point {:?}: {}",
+                    dest, e
+                ))
+            })?;
+        } else {
+            std::fs::create_dir_all(&dest).map_err(|e| {
+                NucleusError::FilesystemError(format!(
+                    "Failed to create provider config mount dir {:?}: {}",
+                    dest, e
+                ))
+            })?;
+        }
+
+        let recursive = metadata.is_dir();
+        let initial_flags = if recursive {
+            MsFlags::MS_BIND | MsFlags::MS_REC
+        } else {
+            MsFlags::MS_BIND
+        };
+        mount(
+            Some(canonical_source.as_path()),
+            &dest,
+            None::<&str>,
+            initial_flags,
+            None::<&str>,
+        )
+        .map_err(|e| {
+            NucleusError::FilesystemError(format!(
+                "Failed to bind mount provider config {:?} -> {:?}: {}",
+                canonical_source, dest, e
+            ))
+        })?;
+
+        let mut remount_flags = MsFlags::MS_REMOUNT
+            | MsFlags::MS_BIND
+            | MsFlags::MS_NOSUID
+            | MsFlags::MS_NODEV
+            | MsFlags::MS_NOEXEC;
+        if recursive {
+            remount_flags |= MsFlags::MS_REC;
+        }
+        if provider_config.read_only {
+            remount_flags |= MsFlags::MS_RDONLY;
+        }
+
+        mount(
+            None::<&str>,
+            &dest,
+            None::<&str>,
+            remount_flags,
+            None::<&str>,
+        )
+        .map_err(|e| {
+            NucleusError::FilesystemError(format!(
+                "Failed to remount provider config {:?} with final flags: {}",
+                dest, e
+            ))
+        })?;
+
+        info!(
+            "Mounted provider config {:?} -> {:?} ({})",
+            canonical_source,
+            container_dest,
+            if provider_config.read_only {
+                "ro"
+            } else {
+                "rw"
+            }
+        );
+    }
+
+    Ok(())
+}
+
+/// Mount the first-class workspace into the container root.
+pub fn mount_workspace(root: &Path, workspace: &crate::container::WorkspaceConfig) -> Result<()> {
+    let Some(source) = workspace.effective_host_path() else {
+        return Ok(());
+    };
+
+    if workspace.mode == crate::container::WorkspaceMode::CopyInOut {
+        let metadata = std::fs::symlink_metadata(source).map_err(|e| {
+            NucleusError::FilesystemError(format!(
+                "Failed to stat workspace staging path {:?}: {}",
+                source, e
+            ))
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(NucleusError::FilesystemError(format!(
+                "Workspace staging path must be a real directory: {:?}",
+                source
+            )));
+        }
+    } else {
+        crate::filesystem::validate_workspace_host_path(source)?;
+    }
+    let dest = resolve_container_destination(root, &workspace.container_path)?;
+    std::fs::create_dir_all(&dest).map_err(|e| {
+        NucleusError::FilesystemError(format!(
+            "Failed to create workspace mount point {:?}: {}",
+            dest, e
+        ))
+    })?;
+
+    mount(
+        Some(source.as_path()),
+        &dest,
+        None::<&str>,
+        MsFlags::MS_BIND | MsFlags::MS_REC,
+        None::<&str>,
+    )
+    .map_err(|e| {
+        NucleusError::FilesystemError(format!(
+            "Failed to bind mount workspace {:?} -> {:?}: {}",
+            source, dest, e
+        ))
+    })?;
+
+    let mut remount_flags = MsFlags::MS_REMOUNT
+        | MsFlags::MS_BIND
+        | MsFlags::MS_REC
+        | MsFlags::MS_NOSUID
+        | MsFlags::MS_NODEV;
+    if workspace.is_read_only() {
+        remount_flags |= MsFlags::MS_RDONLY;
+    }
+    if !workspace.allow_execute {
+        remount_flags |= MsFlags::MS_NOEXEC;
+    }
+
+    mount(
+        None::<&str>,
+        &dest,
+        None::<&str>,
+        remount_flags,
+        None::<&str>,
+    )
+    .map_err(|e| {
+        NucleusError::FilesystemError(format!(
+            "Failed to remount workspace {:?} with final flags: {}",
+            dest, e
+        ))
+    })?;
+
+    info!(
+        "Mounted workspace {:?} -> {:?} (mode={:?}, exec={})",
+        source, workspace.container_path, workspace.mode, workspace.allow_execute
+    );
 
     Ok(())
 }
@@ -1720,6 +2121,24 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_provider_config_source_allows_regular_paths() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let safe_path = temp.path().join("config.json");
+        std::fs::write(&safe_path, "{}").unwrap();
+
+        validate_provider_config_source(&safe_path).unwrap();
+    }
+
+    #[test]
+    fn test_validate_provider_config_source_rejects_sensitive_paths() {
+        let err = validate_provider_config_source(Path::new("/etc/passwd")).unwrap_err();
+        assert!(
+            err.to_string().contains("sensitive host path"),
+            "expected sensitive-path rejection, got: {err}"
+        );
+    }
+
+    #[test]
     fn test_validate_bind_mount_source_normalizes_parent_components_before_filtering() {
         let temp = tempfile::TempDir::new().unwrap();
         let safe_path = temp.path().join("data");
@@ -1771,6 +2190,39 @@ mod tests {
     }
 
     #[test]
+    fn test_provider_config_destination_relative_to_home() {
+        assert_eq!(
+            normalize_provider_config_destination(
+                Path::new("/home/agent"),
+                Path::new(".config/provider")
+            )
+            .unwrap(),
+            PathBuf::from("/home/agent/.config/provider")
+        );
+    }
+
+    #[test]
+    fn test_provider_config_destination_rejects_escape() {
+        let err =
+            normalize_provider_config_destination(Path::new("/home/agent"), Path::new("../.ssh"))
+                .unwrap_err();
+        assert!(
+            err.to_string().contains("parent traversal"),
+            "expected traversal rejection, got: {err}"
+        );
+
+        let err = normalize_provider_config_destination(
+            Path::new("/home/agent"),
+            Path::new("/workspace/.aws"),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("must be under configured home"),
+            "expected home-boundary rejection, got: {err}"
+        );
+    }
+
+    #[test]
     fn test_production_rootfs_path_rejects_parent_traversal() {
         let temp = tempfile::TempDir::new().unwrap();
         let store = temp.path().join("store");
@@ -1815,6 +2267,53 @@ mod tests {
             validate_rootfs_path_under_store(&store.join("rootfs-link"), &store).unwrap();
 
         assert_eq!(canonical, std::fs::canonicalize(rootfs).unwrap());
+    }
+
+    #[test]
+    fn test_agent_toolchain_rootfs_path_allows_non_store_directory() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let rootfs = temp.path().join("agent-rootfs");
+        std::fs::create_dir(&rootfs).unwrap();
+
+        let canonical = validate_agent_toolchain_rootfs_path(&rootfs).unwrap();
+
+        assert_eq!(canonical, std::fs::canonicalize(rootfs).unwrap());
+    }
+
+    #[test]
+    fn test_agent_toolchain_rootfs_path_rejects_relative_path() {
+        let err = validate_agent_toolchain_rootfs_path(Path::new("agent-rootfs")).unwrap_err();
+
+        assert!(
+            err.to_string().contains("must be absolute"),
+            "expected absolute path rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_agent_toolchain_rootfs_path_rejects_parent_traversal() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let err =
+            validate_agent_toolchain_rootfs_path(&temp.path().join("../agent-rootfs")).unwrap_err();
+
+        assert!(
+            err.to_string().contains("parent traversal"),
+            "expected parent traversal rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_agent_toolchain_rootfs_path_rejects_file() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let rootfs = temp.path().join("agent-rootfs");
+        std::fs::write(&rootfs, "not a directory").unwrap();
+
+        let err = validate_agent_toolchain_rootfs_path(&rootfs).unwrap_err();
+
+        assert!(
+            err.to_string().contains("must resolve to a directory"),
+            "expected directory rejection, got: {err}"
+        );
     }
 
     #[test]

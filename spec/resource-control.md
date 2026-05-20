@@ -4,6 +4,11 @@
 
 Nucleus uses Linux cgroup v2 for resource isolation and limiting. Each container runs in its own cgroup with enforced memory, CPU, I/O, and process limits.
 
+Service mode behavior:
+- Agent mode treats cgroup setup as best-effort and may continue without limits when cgroup creation fails.
+- Strict agent mode requires cgroup creation and successful application of configured limits, but does not require explicit memory or CPU limits beyond the default PID limit.
+- Production mode requires cgroup creation, successful limit application, and explicit memory and CPU limits.
+
 ## cgroup v2 Hierarchy
 
 ```

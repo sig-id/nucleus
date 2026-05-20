@@ -234,6 +234,7 @@ mod tests {
     fn test_egress_deny_all_defaults() {
         let policy = EgressPolicy::deny_all();
         assert!(policy.allowed_cidrs.is_empty());
+        assert!(policy.allowed_domains.is_empty());
         assert!(policy.allowed_tcp_ports.is_empty());
         assert!(policy.allowed_udp_ports.is_empty());
         assert!(policy.log_denied);
@@ -244,6 +245,7 @@ mod tests {
     fn test_egress_default_allows_dns_for_allowlists() {
         let policy = EgressPolicy::default();
         assert!(policy.allowed_cidrs.is_empty());
+        assert!(policy.allowed_domains.is_empty());
         assert!(policy.allowed_tcp_ports.is_empty());
         assert!(policy.allowed_udp_ports.is_empty());
         assert!(policy.log_denied);
@@ -254,10 +256,12 @@ mod tests {
     fn test_egress_policy_builder() {
         let policy = EgressPolicy::default()
             .with_allowed_cidrs(vec!["10.0.0.0/8".to_string()])
+            .with_allowed_domains(vec!["api.example.com".to_string()])
             .with_allowed_tcp_ports(vec![443, 80])
             .with_allowed_udp_ports(vec![53]);
 
         assert_eq!(policy.allowed_cidrs, vec!["10.0.0.0/8"]);
+        assert_eq!(policy.allowed_domains, vec!["api.example.com"]);
         assert_eq!(policy.allowed_tcp_ports, vec![443, 80]);
         assert_eq!(policy.allowed_udp_ports, vec![53]);
     }
@@ -274,6 +278,23 @@ mod tests {
     fn test_validate_egress_cidr_invalid() {
         assert!(nucleus::network::validate_egress_cidr("not-cidr").is_err());
         assert!(nucleus::network::validate_egress_cidr("10.0.0.0").is_err());
+    }
+
+    #[test]
+    fn test_validate_egress_domain_valid() {
+        assert!(nucleus::network::validate_egress_domain("api.example.com").is_ok());
+        assert!(nucleus::network::validate_egress_domain("api.example.com.").is_ok());
+        assert!(nucleus::network::validate_egress_domain("xn--bcher-kva.example").is_ok());
+    }
+
+    #[test]
+    fn test_validate_egress_domain_invalid() {
+        assert!(nucleus::network::validate_egress_domain("").is_err());
+        assert!(nucleus::network::validate_egress_domain("localhost").is_err());
+        assert!(nucleus::network::validate_egress_domain("*.example.com").is_err());
+        assert!(nucleus::network::validate_egress_domain("-api.example.com").is_err());
+        assert!(nucleus::network::validate_egress_domain("api.example.com:443").is_err());
+        assert!(nucleus::network::validate_egress_domain("192.0.2.1").is_err());
     }
 
     // --- NetworkMode with ContainerConfig ---

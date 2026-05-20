@@ -7,9 +7,10 @@
 
 Nucleus is a minimalist container runtime for Linux. It provides isolated execution environments using Linux kernel primitives without the overhead of traditional container runtimes. For production services, it is designed around a fully declarative model: Nix builds the root filesystem, the NixOS module declares the service, and Nucleus mounts a pinned, reproducible closure at runtime.
 
-Nucleus supports two operating modes:
+Nucleus supports three operating modes:
 
 - **Agent mode** (default) – ephemeral, fast-startup sandboxes for AI agent workloads
+- **Strict agent mode** – fail-closed isolation for ephemeral agent workloads without requiring production rootfs, health checks, sd_notify, or NixOS service semantics
 - **Production mode** – strict isolation for long-running, network-bound NixOS services with declarative configuration, reproducible Nix-built root filesystems, egress policy enforcement, health checks, and systemd integration
 
 Production deployments are built to be:
@@ -72,7 +73,7 @@ benchmark noise rather than a guaranteed speedup.
 - **External security policies** – Per-service seccomp profiles (JSON), capability policies (TOML), and Landlock rules (TOML) with SHA-256 pinning
 - **Seccomp profile generation** – Trace mode records syscalls, then `nucleus seccomp generate` creates a minimal allowlist profile
 - **Multi-container topologies** – Compose-equivalent TOML format with dependency DAG, reconciliation, and NixOS systemd integration
-- **Integrity & audit controls** – Structured audit log, context hashing, rootfs attestation, seccomp deny logging, mount flag verification, and kernel lockdown assertions
+- **Integrity & audit controls** – Structured audit log, machine-readable lifecycle event streams, context hashing, rootfs attestation, seccomp deny logging, mount flag verification, and kernel lockdown assertions
 - **Structured telemetry** – Optional OpenTelemetry export for container lifecycle tracing
 - **Linux-native** – Runs on standard Linux and NixOS
 
@@ -158,9 +159,149 @@ nucleus run --context ./ctx/ --verify-context-integrity --seccomp-log-denied -- 
 # Environment variables
 nucleus run -e DEBUG=1 -- ./agent
 
+# Sensitive environment variables without argv exposure
+printf '{"OPENAI_API_KEY":"..."}' | nucleus run --env-fd 3 3<&0 -- ./agent
+
 # Pass sensitive values via --secret (mounted in-memory at /run/secrets)
 nucleus run --secret /path/to/api-key:/run/secrets/api_key -- ./agent
+
+# Run a coding agent against a stable /workspace cwd
+nucleus run \
+  --workspace "$PWD" \
+  --workspace-mode bind-rw \
+  --workspace-exec \
+  -- ./agent
+
+# Mount provider CLI config under the private home directory
+nucleus run \
+  --provider-config-ro "$HOME/.aws:.aws" \
+  --provider-config-rw "$HOME/.config/gh:.config/gh" \
+  -- ./agent
+
+# Run an agent with a pinned provider/toolchain rootfs instead of host runtime binds
+nucleus run \
+  --service-mode mitos-agent \
+  --agent-toolchain-rootfs /nix/store/...-nucleus-agent-toolchain-rootfs \
+  --workspace "$PWD" \
+  --workspace-exec \
+  -- codex
 ```
+
+### Programmatic Launch Config
+
+`nucleus run` accepts the same command as `nucleus create`. Programmatic callers
+that need a stable launch contract can provide the whole request as JSON or TOML
+instead of constructing a long argv list:
+
+```bash
+nucleus run --config ./agent.nucleus.toml
+nucleus run --config ./agent.nucleus.json
+nucleus run --config-fd 3 3<./agent.nucleus.json
+```
+
+Config mode owns the launch request: put the workload command and all sandbox
+options in the config document rather than mixing them with per-option CLI flags.
+The schema uses the long CLI option names converted to `snake_case`:
+
+```toml
+name = "mitos-agent"
+workspace = "/home/dev/project"
+workspace_mode = "bind-rw"
+workspace_exec = true
+workdir = "/workspace"
+runtime = "gvisor"
+service_mode = "strict-agent"
+agent_toolchain_rootfs = "/nix/store/...-nucleus-agent-toolchain-rootfs"
+memory = "1G"
+cpus = 2.0
+pids = 512
+command = ["./agent", "--stdio"]
+
+env_vars = ["RUST_LOG=info"]
+seccomp_log_denied = true
+```
+
+### Workspace
+
+`--workspace <host-path>` mounts the host project tree at `/workspace`. The
+process cwd defaults to `/workspace` via `--workdir /workspace`.
+
+`--workspace-mode` accepts:
+
+| Mode | Behavior |
+|---|---|
+| `bind-rw` | Bind mount the host path read-write at `/workspace` (default). |
+| `bind-ro` | Bind mount the host path read-only at `/workspace`. |
+| `copy-in-out` | Copy the host path into a private staging directory, run against that staged tree, then sync changes back after exit. |
+
+Workspace mounts are `nosuid,nodev,noexec` by default and native Landlock denies
+execution from `/workspace`. Use `--workspace-exec` for agent-mode workflows
+that build and run test binaries from the workspace. Production mode rejects
+writable executable workspaces; use an immutable `--rootfs` and explicit policy
+files for production services.
+
+### Sandbox Home and Provider Config
+
+Nucleus creates a private tmpfs home at `/home/agent` by default and sets the
+workload `HOME` to that path. The home tmpfs is mounted `nosuid,nodev,noexec`
+with mode `0700` and is owned by the configured workload uid/gid. Use
+`--home <container-path>` to choose a different private home path; the path must
+be absolute and must not overlap `/workspace`.
+
+Provider CLIs that require config under `$HOME` should use explicit provider
+config mounts instead of broad host bind mounts:
+
+```bash
+nucleus run \
+  --home /home/agent \
+  --provider-config-ro "$HOME/.aws:.aws" \
+  --provider-config-ro "$HOME/.config/gcloud:.config/gcloud" \
+  --provider-config-rw "$HOME/.config/gh:.config/gh" \
+  -- ./agent
+```
+
+`--provider-config-ro SOURCE:DEST` and `--provider-config-rw SOURCE:DEST` are
+repeatable. `DEST` may be absolute under the configured home, or relative to the
+home directory. Read-only mounts are preferred for cloud credentials; read-write
+mounts are intended only for tools that must refresh local tokens.
+
+### Agent Toolchain Rootfs
+
+Mitos-style provider launchers can avoid depending on mutable host `/bin`,
+`/usr`, `/lib`, or `/nix` binds by passing a pinned agent toolchain rootfs:
+
+```bash
+nucleus run \
+  --service-mode strict-agent \
+  --agent-toolchain-rootfs /nix/store/...-nucleus-agent-toolchain-rootfs \
+  --workspace "$PWD" \
+  --workspace-exec \
+  -- claude
+```
+
+The dedicated flag is for `agent`, `strict-agent`, and `mitos-agent` modes. It
+uses the same read-only rootfs mount path as `--rootfs`, but is rejected in
+production mode so production services keep using `--rootfs` with attestation.
+
+Build a rootfs with the Nix helper:
+
+```nix
+nucleus.lib.mkAgentToolchainRootfs {
+  inherit pkgs;
+  providerPackages = [
+    # Derivations that provide claude/codex/gemini executables.
+  ];
+  extraPackages = [
+    pkgs.rustc
+    pkgs.cargo
+  ];
+}
+```
+
+The repository also exposes `packages.${system}.agent-toolchain-rootfs` as a
+default shell/Git/compiler/package-manager rootfs. Integrations that need exact
+provider CLIs should call `mkAgentToolchainRootfs` with pinned provider package
+derivations and pass the resulting store path to `--agent-toolchain-rootfs`.
 
 ### Detached Mode
 
@@ -214,7 +355,9 @@ nucleus run \
   --verify-rootfs-attestation \
   --require-kernel-lockdown integrity \
   --network bridge --dns 10.0.0.1 \
-  --egress-allow 10.0.0.0/8 --egress-tcp-port 443 --egress-tcp-port 8443 \
+  --egress-allow 10.0.0.0/8 \
+  --egress-domain api.example.com \
+  --egress-tcp-port 443 --egress-tcp-port 8443 \
   --health-cmd "curl -sf http://localhost:8080/health" \
   --health-interval 30 --health-retries 3 \
   --secret /run/secrets/tls-cert:/etc/tls/cert.pem \
@@ -234,6 +377,31 @@ nucleus run \
   --network bridge --dns 10.0.0.1 \
   --rootfs /nix/store/...-proxy-rootfs \
   -- /bin/proxy
+```
+
+### Strict Agent Mode
+
+Strict agent mode (`--service-mode strict-agent`, `--service-mode mitos-agent`, or `--strict-agent`) keeps agent-style execution while making isolation setup fail closed:
+- Forbids `--allow-degraded-security`, `--allow-chroot-fallback`, and native `--network host`
+- Permits `--allow-host-network` only with `--network gvisor-host --runtime gvisor`
+- Requires successful cgroup creation and successful application of configured limits
+- Requires `pivot_root` in native mode; no `chroot` fallback
+- Requires seccomp enforcement; `--seccomp-mode trace` is rejected
+- Requires Landlock enforcement for native runtime
+- Requires user namespace UID/GID mapping when running as host root or rootless
+- Keeps network mode `none` by default; bridge mode requires explicit `--dns`
+
+Strict agent mode does **not** require a production Nix rootfs, rootfs attestation, health checks, readiness probes, sd_notify, systemd transient services, or NixOS module deployment.
+
+```bash
+# Run an ephemeral agent with fail-closed native isolation
+nucleus run \
+  --service-mode strict-agent \
+  --runtime native \
+  --trust-level trusted \
+  --memory 1G --cpus 2 \
+  --context ./ctx \
+  -- ./agent
 ```
 
 ### Security Policy Files
@@ -367,6 +535,7 @@ networks = ["internal"]
 nat_backend = "userspace"
 port_forwards = ["8443:8443"]
 egress_allow = ["10.42.0.0/24"]
+egress_domains = ["api.example.com"]
 
 [[services.web.depends_on]]
 service = "postgres"
@@ -500,6 +669,7 @@ in
 
       # Egress policy – audited outbound access
       egressAllow = [ "10.0.0.0/8" ];
+      egressDomains = [ "api.example.com" ];
       egressTcpPorts = [ 443 8443 ];
 
       # Health checking
@@ -604,49 +774,56 @@ This produces a Nix store path containing `/bin`, `/lib`, `/etc`, etc. from the 
 
 `mkRootfs` also emits a `.nucleus-rootfs-sha256` manifest at the root of the closure. Use `--verify-rootfs-attestation` or `verifyRootfsAttestation = true;` to require that manifest to match the mounted rootfs at startup.
 
+For ephemeral provider agents, use `nucleus.lib.mkAgentToolchainRootfs`
+instead. It layers a broad agent development toolchain on top of `mkRootfs`,
+keeps `/bin/sh` and `/usr/bin/env` compatibility paths available, and accepts
+provider CLI packages through `providerPackages`.
+
 ## Security Notes
 
-**Do not pass secrets via `-e` / `--env`.** Environment variables are visible in `/proc/<pid>/environ` to any process that can read it (mitigated by `hidepid=2` in production mode, but not in agent mode). Use `--secret` instead – secrets are mounted on an in-memory tmpfs at `/run/secrets` with volatile source buffer zeroing.
+**Do not pass secrets via `-e` / `--env`.** Environment variables are visible in `/proc/<pid>/environ` to any process that can read it (mitigated by `hidepid=2` in production mode, but not in agent mode). Use `--secret` instead when a file works. If a provider CLI requires sensitive environment variables, use `--env-fd FD`; the fd carries a JSON object such as `{"OPENAI_API_KEY":"..."}` or a JSON array of `KEY=VALUE` strings so the values are not exposed through Nucleus argv.
 
 **Privilege dropping is explicit.** Nucleus must start with elevated privileges to create namespaces, mount filesystems, and configure cgroups/networking. Use `--user` / `--group` (or the NixOS module's `user` / `group` options) so the workload itself does not continue running as root after setup. In production mode, staged secrets under `/run/secrets` are re-owned to that workload identity.
 
-**Agent mode is not hardened.** By design, agent mode applies several security mechanisms on a best-effort basis: seccomp and Landlock failures are warn-and-continue (with `--allow-degraded-security`), chroot fallback is available (with `--allow-chroot-fallback`), bridge DNS defaults to public resolvers (`8.8.8.8`), and cgroup creation failures are non-fatal. Operators requiring strict isolation should use production mode, which makes all of these fatal.
+**Agent mode is not hardened.** By design, agent mode applies several security mechanisms on a best-effort basis: seccomp and Landlock failures are warn-and-continue (with `--allow-degraded-security`), chroot fallback is available (with `--allow-chroot-fallback`), bridge DNS defaults to public resolvers (`8.8.8.8`), and cgroup creation failures are non-fatal. Operators requiring strict isolation for ephemeral workloads should use `--service-mode strict-agent`; operators deploying long-running NixOS services should use production mode.
 
-## Production Mode vs Agent Mode
+## Service Modes
 
-| Feature | Agent Mode | Production Mode |
-|---|---|---|
-| Service mode | `--service-mode agent` (default) | `--service-mode production` |
-| Degraded security | Allowed with flag | Forbidden |
-| Chroot fallback | Allowed with flag | Forbidden |
-| Host networking | Allowed with flag | Native `host` forbidden; `gvisor-host` allowed with gVisor + explicit opt-in |
-| Cgroup limits | Best-effort | Required (fatal on failure) |
-| Bridge DNS | Defaults to 8.8.8.8/8.8.4.4 | Must be configured explicitly |
-| Rootfs | Host bind mounts (/bin, /usr, /lib, /nix) | Pre-built Nix closure (`--rootfs`) |
-| Egress policy | Optional | Deny-all default where enforceable; unavailable with `gvisor-host` |
-| Memory limit | Optional | Required |
-| PID 1 init | Direct exec | Mini-init with zombie reaping + signal forwarding |
-| Workload uid/gid | Root by default | Configurable post-setup drop via `--user` / `--group` |
-| Secrets | Bind mount | In-memory tmpfs with volatile zeroing |
-| /proc | Mounted normally | `hidepid=2` (hides other processes) |
-| Mount audit | Skipped | Post-setup flag verification (fatal) |
-| Seccomp trace mode | Allowed | Forbidden |
-| Landlock ABI | Best-effort | V3 minimum required |
-| Health checks | Optional | Optional |
-| sd_notify | Optional | Optional |
-| Security policies | Optional | Optional (recommended) |
+| Feature | Agent Mode | Strict Agent Mode | Production Mode |
+|---|---|---|---|
+| Service mode | `--service-mode agent` (default) | `--service-mode strict-agent` (alias: `--service-mode mitos-agent`) | `--service-mode production` |
+| Degraded security | Allowed with flag | Forbidden | Forbidden |
+| Chroot fallback | Allowed with flag | Forbidden | Forbidden |
+| Host networking | Allowed with flag | Native `host` forbidden; `gvisor-host` allowed with gVisor + explicit opt-in | Native `host` forbidden; `gvisor-host` allowed with gVisor + explicit opt-in |
+| Cgroup limits | Best-effort | Required (fatal on create/apply failure) | Required (fatal on create/apply failure) |
+| Bridge DNS | Defaults to 8.8.8.8/8.8.4.4 | Must be configured explicitly | Must be configured explicitly |
+| Rootfs | Host bind mounts unless `--rootfs` or `--agent-toolchain-rootfs` is supplied | Host bind mounts unless `--rootfs` or `--agent-toolchain-rootfs` is supplied | Pre-built Nix closure (`--rootfs`) |
+| Workspace | Optional `/workspace`; bind/copy-in-out for agents | Optional `/workspace`; bind/copy-in-out for agents | Optional, non-executable unless read-only or policy-specific |
+| Egress policy | Optional | Optional | Deny-all default where enforceable; unavailable with `gvisor-host` |
+| Memory limit | Optional | Optional | Required |
+| PID 1 init | Direct exec | Direct exec | Mini-init with zombie reaping + signal forwarding |
+| Workload uid/gid | Root by default | User namespace remapping required when running as host root | Configurable post-setup drop via `--user` / `--group` |
+| Secrets | In-memory tmpfs | In-memory tmpfs | In-memory tmpfs with volatile zeroing |
+| /proc | Mounted normally | Mounted normally | `hidepid=2` (hides other processes) |
+| Mount audit | Skipped | Skipped | Post-setup flag verification (fatal) |
+| Seccomp trace mode | Allowed | Forbidden | Forbidden |
+| Landlock ABI | Best-effort | Full enforcement required on native | V3 minimum required |
+| Health checks | Optional | Optional | Optional |
+| sd_notify | Optional | Optional | Optional |
+| Security policies | Optional | Optional | Optional (recommended) |
 
 ## Egress Policy
 
-When production bridge mode runs without `--egress-allow`, Nucleus installs a strict deny-all OUTPUT policy, including DNS.
-When `--egress-allow` is specified, Nucleus applies iptables OUTPUT chain rules inside the container's network namespace:
+When production bridge mode runs without `--egress-allow` or `--egress-domain`, Nucleus installs a strict deny-all OUTPUT policy, including DNS.
+When `--egress-allow` or `--egress-domain` is specified, Nucleus applies iptables OUTPUT chain rules inside the container's network namespace:
 
 1. Allow loopback traffic
 2. Allow established/related connections
 3. Allow DNS to configured resolvers
-4. Allow traffic to permitted CIDRs (optionally restricted to specific ports)
-5. Log denied packets (rate-limited, `nucleus-egress-denied:` prefix)
-6. Drop everything else
+4. Resolve permitted domains to IPv4 `/32` rules at startup
+5. Allow traffic to permitted CIDRs and resolved domain addresses (optionally restricted to specific ports)
+6. Log denied packets (rate-limited, `nucleus-egress-denied:` prefix)
+7. Drop everything else
 
 ```bash
 # Allow outbound to internal network on HTTPS only
@@ -654,10 +831,17 @@ nucleus run --network bridge --dns 10.0.0.1 \
   --egress-allow 10.0.0.0/8 --egress-tcp-port 443 \
   -- ./my-service
 
+# Allow outbound to a provider API domain on HTTPS only
+nucleus run --network bridge --dns 10.0.0.1 \
+  --egress-domain api.example.com --egress-tcp-port 443 \
+  -- ./provider-client
+
 # Production deny-all egress, including DNS
 nucleus run --service-mode production --network bridge --dns 10.0.0.1 \
   -- ./isolated-service
 ```
+
+Domain egress entries are exact DNS names, not wildcard or suffix rules. Nucleus resolves each domain with the supervisor host resolver before installing the namespace-local iptables policy, keeps only IPv4 answers, and fails startup if a domain has no IPv4 address. Long-running services that depend on provider IP rotation should restart after DNS changes, use provider-published CIDR ranges, or route traffic through a stable internal proxy and allow that proxy CIDR instead.
 
 ## Native Bridge Backends
 
@@ -683,6 +867,24 @@ When using gVisor (`--runtime gvisor`), the network mode is selected explicitly:
 
 The `gvisor-host` mode is intentionally separate from native `host` networking. Native `host` remains a direct host namespace mode. `gvisor-host` keeps the gVisor runtime boundary, but weakens network isolation by letting runsc hostinet use the host network stack. Because there is no Nucleus-owned network namespace in this mode, Nucleus egress policy is unavailable with `gvisor-host`.
 
+## Terminal And Console Sockets
+
+`--terminal` runs the workload behind a pseudoterminal. Supplying
+`--console-socket <path>` implies terminal mode and follows the OCI console
+socket convention: the runtime connects to the AF_UNIX socket and sends the PTY
+master file descriptor with `SCM_RIGHTS`.
+
+Native containers allocate the PTY directly. The workload process becomes a
+session leader, the PTY slave becomes its controlling TTY, and stdin/stdout/stderr
+all point at that slave. gVisor containers set `process.terminal = true` and
+`process.consoleSize` in the generated OCI config, then pass `--console-socket`
+through to `runsc`.
+
+Console bytes are not decoded or rewritten by Nucleus. Clients such as
+mitos/libghostty are expected to parse and render the raw stream. Window resizing
+uses PTY window-size ioctls; foreground SIGWINCH is also forwarded to the
+container process.
+
 ## OCI Support
 
 Nucleus is not a generic external OCI runtime. For gVisor execution it generates an OCI bundle layout and `config.json` that follow the OCI runtime-spec fields Nucleus uses in practice.
@@ -696,6 +898,12 @@ Nucleus is not a generic external OCI runtime. For gVisor execution it generates
 That OCI path is the contract used with `runsc`. The native runtime uses Nucleus's direct Linux setup path rather than exposing a separate OCI CLI surface.
 
 Lifecycle hooks execute host-side commands with supervisor privileges. They are not accepted in topology service definitions; use only explicit administrative `nucleus create --hooks` configuration for hooks.
+
+## Machine-Readable Events
+
+Use `--events-jsonl <path>` to write control-plane lifecycle events as JSON Lines, or `--events-fd <fd>` to write them to an inherited file descriptor. The stream is separate from workload stdout/stderr and PTY bytes; operators can consume it without parsing user process output. `--events-fd` rejects stdio descriptors and is not available with `--detach`; use `--events-jsonl` for detached containers.
+
+Events include a container start record and a final summary record. The records carry the container ID, PID, cgroup path, workspace/context mount, network mode, seccomp mode, Landlock status, capability status, resource limits, exit status, resource stats, and whether cleanup succeeded.
 
 ## Additional Hardening Flags
 

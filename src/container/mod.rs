@@ -1,4 +1,5 @@
 mod config;
+mod console;
 mod exec;
 mod guards;
 mod gvisor_setup;

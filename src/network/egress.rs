@@ -1,6 +1,42 @@
 use super::{netns, BridgeNetwork, EgressPolicy};
 use crate::error::{NucleusError, Result};
+use std::net::{IpAddr, ToSocketAddrs};
 use tracing::{debug, info};
+
+fn resolve_domain_cidrs(domains: &[String]) -> Result<Vec<String>> {
+    let mut cidrs = Vec::new();
+
+    for domain in domains {
+        crate::network::config::validate_egress_domain(domain)
+            .map_err(|e| NucleusError::NetworkError(format!("Invalid egress domain: {}", e)))?;
+
+        let mut resolved_any_ipv4 = false;
+        let addrs = (domain.as_str(), 0).to_socket_addrs().map_err(|e| {
+            NucleusError::NetworkError(format!(
+                "Failed to resolve egress domain '{}': {}",
+                domain, e
+            ))
+        })?;
+
+        for addr in addrs {
+            if let IpAddr::V4(ip) = addr.ip() {
+                resolved_any_ipv4 = true;
+                cidrs.push(format!("{}/32", ip));
+            }
+        }
+
+        if !resolved_any_ipv4 {
+            return Err(NucleusError::NetworkError(format!(
+                "Egress domain '{}' resolved no IPv4 addresses",
+                domain
+            )));
+        }
+    }
+
+    cidrs.sort();
+    cidrs.dedup();
+    Ok(cidrs)
+}
 
 pub(crate) fn apply_egress_policy(
     pid: u32,
@@ -12,6 +48,11 @@ pub(crate) fn apply_egress_policy(
         crate::network::config::validate_egress_cidr(cidr)
             .map_err(|e| NucleusError::NetworkError(format!("Invalid egress CIDR: {}", e)))?;
     }
+    let resolved_domain_cidrs = resolve_domain_cidrs(&policy.allowed_domains)?;
+    let allowed_cidrs = policy
+        .allowed_cidrs
+        .iter()
+        .chain(resolved_domain_cidrs.iter());
 
     let ipt = BridgeNetwork::resolve_bin("iptables")?;
     let exec = |args: &[&str]| {
@@ -47,7 +88,7 @@ pub(crate) fn apply_egress_policy(
         }
     }
 
-    for cidr in &policy.allowed_cidrs {
+    for cidr in allowed_cidrs {
         if policy.allowed_tcp_ports.is_empty() && policy.allowed_udp_ports.is_empty() {
             exec(&["-A", "OUTPUT", "-d", cidr, "-j", "ACCEPT"])?;
         } else {
@@ -84,8 +125,9 @@ pub(crate) fn apply_egress_policy(
     exec(&["-P", "OUTPUT", "DROP"])?;
 
     info!(
-        "Egress policy applied: {} allowed CIDRs",
-        policy.allowed_cidrs.len()
+        "Egress policy applied: {} allowed CIDRs, {} allowed domains",
+        policy.allowed_cidrs.len(),
+        policy.allowed_domains.len()
     );
     debug!("Egress policy details: {:?}", policy);
 

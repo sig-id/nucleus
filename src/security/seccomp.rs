@@ -381,6 +381,7 @@ impl SeccompManager {
             0x5403, // TCSETSW
             0x5404, // TCSETSF
             0x540B, // TCFLSH
+            0x540E, // TIOCSCTTY
             0x540F, // TIOCGPGRP
             0x5410, // TIOCSPGRP
             0x5413, // TIOCGWINSZ
