@@ -129,6 +129,39 @@ impl Container {
         }
     }
 
+    /// Close all file descriptors > 2 in the current process.
+    ///
+    /// The production PID 1 supervisor does not exec, so FD_CLOEXEC does not
+    /// protect inherited host/runtime descriptors in that process.
+    pub(crate) fn close_nonstdio_fds() {
+        // SAFETY: close_range with flags 0 closes descriptors immediately.
+        let ret = unsafe { libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32) };
+        if ret == 0 {
+            return;
+        }
+
+        if let Ok(entries) = std::fs::read_dir("/proc/self/fd") {
+            let fds: Vec<i32> = entries
+                .flatten()
+                .filter_map(|entry| entry.file_name().into_string().ok())
+                .filter_map(|s| s.parse::<i32>().ok())
+                .filter(|&fd| fd > 2)
+                .collect();
+            for fd in fds {
+                unsafe { libc::close(fd) };
+            }
+            return;
+        }
+
+        let max_fd = match unsafe { libc::sysconf(libc::_SC_OPEN_MAX) } {
+            n if n > 3 && n <= i32::MAX as libc::c_long => n as i32,
+            _ => 1024,
+        };
+        for fd in 3..max_fd {
+            unsafe { libc::close(fd) };
+        }
+    }
+
     pub(crate) fn assert_single_threaded_for_fork(context: &str) -> Result<()> {
         let thread_count = std::fs::read_to_string("/proc/self/status")
             .ok()
@@ -862,7 +895,7 @@ impl Container {
                     drop(pty.master.take());
                     pty.slave.take()
                 });
-                // H6: Close inherited FDs > 2 to prevent leaking host sockets/pipes
+                // H6: Mark inherited FDs > 2 close-on-exec before setup.
                 Self::sanitize_fds();
                 let temp_container = Container {
                     config,
@@ -2906,6 +2939,34 @@ mod tests {
         assert!(
             fn_body.contains("self.exec_command()?"),
             "workload child must still route through exec_command for identity application"
+        );
+    }
+
+    #[test]
+    fn test_run_as_init_parent_closes_nonstdio_fds() {
+        let runtime_source = include_str!("runtime.rs");
+        let close_body = extract_fn_body(runtime_source, "fn close_nonstdio_fds");
+        assert!(
+            close_body.contains("libc::SYS_close_range, 3u32, u32::MAX, 0u32")
+                && close_body.contains("libc::close(fd)"),
+            "close_nonstdio_fds must immediately close descriptors, not only mark them CLOEXEC"
+        );
+        assert!(
+            !close_body.contains("CLOSE_RANGE_CLOEXEC")
+                && !close_body.contains("FD_CLOEXEC")
+                && !close_body.contains("F_SETFD"),
+            "PID 1 supervisor cleanup must not rely on close-on-exec"
+        );
+
+        let exec_source = include_str!("exec.rs");
+        let init_body = extract_fn_body(exec_source, "fn run_as_init");
+        let parent = init_body.find("ForkResult::Parent").unwrap();
+        let close = init_body.find("Self::close_nonstdio_fds()").unwrap();
+        let signal_setup = init_body.find("let mut sigset = SigSet::empty()").unwrap();
+        let child = init_body.find("ForkResult::Child").unwrap();
+        assert!(
+            parent < close && close < signal_setup && close < child,
+            "run_as_init must close inherited FDs in the non-execing PID 1 parent before supervisor work"
         );
     }
 

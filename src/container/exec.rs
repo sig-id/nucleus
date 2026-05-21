@@ -194,6 +194,10 @@ impl Container {
         match unsafe { fork() }? {
             ForkResult::Parent { child } => {
                 // PID 1: mini-init – reap zombies and forward signals
+                //
+                // This supervisor never execs, so CLOEXEC inherited from the
+                // setup path is not enough to protect host/runtime descriptors.
+                Self::close_nonstdio_fds();
 
                 // Set up signal forwarding to the workload child
                 let mut sigset = SigSet::empty();
