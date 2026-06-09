@@ -3,7 +3,7 @@
 [![Crates.io](https://img.shields.io/crates/v/nucleus-container.svg)](https://crates.io/crates/nucleus-container)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
-**Extremely lightweight, declarative container runtime for agents and production services**
+**Extremely lightweight, security-hardened, declarative container runtime for agents and production services**
 
 Nucleus is a minimalist container runtime for Linux. It provides isolated execution environments using Linux kernel primitives without the overhead of traditional container runtimes. For production services, it is designed around a fully declarative model: Nix builds the root filesystem, the NixOS module declares the service, and Nucleus mounts a pinned, reproducible closure at runtime.
 
@@ -76,6 +76,34 @@ benchmark noise rather than a guaranteed speedup.
 - **Integrity & audit controls** – Structured audit log, machine-readable lifecycle event streams, context hashing, rootfs attestation, seccomp deny logging, mount flag verification, and kernel lockdown assertions
 - **Structured telemetry** – Optional OpenTelemetry export for container lifecycle tracing
 - **Linux-native** – Runs on standard Linux and NixOS
+
+## Relationship to Docker
+
+Nucleus is **not** a drop-in Docker replacement, nor a strict subset of Docker.
+The feature sets overlap, but each tool does things the other does not. Nucleus is
+a hardened sandbox runtime (closer in spirit to `runc`/`gVisor`) that also does
+lightweight, declarative single-host orchestration. It drops the image-and-distribution
+half of Docker in exchange for deeper isolation, policy, and reproducibility.
+
+| Capability | Docker | Nucleus |
+|---|---|---|
+| Root filesystem | Layered image (union mount) | tmpfs directory (agent) or Nix closure (production) |
+| Images / Dockerfile / registry | Yes | No — no images, layers, `pull`/`push`, or OCI *image* spec |
+| Persistent storage | Named volumes + storage drivers | Ephemeral tmpfs; persistence only via explicit `--volume` binds |
+| Architecture | `dockerd` daemon + socket API | Single binary, direct fork/exec; detached = systemd transient unit |
+| Networking | CNI plugins, overlay networks | `none` / `host` / `bridge` only |
+| Orchestration | Compose, Swarm | `nucleus compose` (single-host TOML DAG over systemd) |
+| Default egress | Allow-all outbound | Deny-by-default; allow per CIDR/domain via namespace iptables |
+| Filesystem ACLs | AppArmor/SELinux profiles | Landlock LSM, per-service, irreversible |
+| gVisor | Optional add-on runtime | First-class integrated runtime with explicit network modes |
+| Security policies | Bundled defaults | Externalized seccomp/caps/Landlock, SHA-256 pinned + trace-generated |
+| Reproducibility | Image digests | Nix closures, rootfs attestation, first-class NixOS module |
+| Verification | — | TLA+ specs + model-based tests across subsystems |
+| Default hardening | ~300 syscalls, some caps kept | All caps dropped, small seccomp allowlist, up to 8 namespaces |
+
+If your mental model is "run my image instead of `docker run`," it will not fit:
+there are no images, no registry, and no persistent state. If it is "run untrusted
+or ephemeral workloads with stronger, auditable isolation," that is the target.
 
 ## Architecture
 
