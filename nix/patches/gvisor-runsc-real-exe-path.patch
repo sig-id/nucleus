@@ -54,13 +54,25 @@ index ce5a97326..2fdf35f0d 100644
  	cmd.SysProcAttr = &unix.SysProcAttr{
  		Cloneflags: unix.CLONE_NEWUSER | unix.CLONE_NEWNS,
 diff --git a/runsc/sandbox/sandbox.go b/runsc/sandbox/sandbox.go
-index 0124180ec..ba6f2cd31 100644
+index 0124180ec..8148c6e1f 100644
 --- a/runsc/sandbox/sandbox.go
 +++ b/runsc/sandbox/sandbox.go
-@@ -916,0 +917,3 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args Args, startSync
+@@ -929,6 +929,9 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args Args, startSync
+ 	if !conf.TestOnlyAllowRunAsCurrentUserWithoutChroot {
+ 		// Setting cmd.Env = nil causes cmd to inherit the current process's env.
+ 		cmd.Env = []string{}
 +		if value := os.Getenv("NUCLEUS_RUNSC_REEXEC_VIA_PROC_SELF_EXE"); value != "" {
 +			cmd.Env = append(cmd.Env, "NUCLEUS_RUNSC_REEXEC_VIA_PROC_SELF_EXE="+value)
 +		}
-@@ -1987,0 +1988,2 @@ func ConfigureCmdForRootless(cmd *exec.Cmd, donations *donation.Agency) (*os.Fil
+ 	}
+ 	if config.CgoEnabled {
+ 		// Platforms that use stub processes are not compatible with
+@@ -2150,6 +2153,8 @@ func ConfigureCmdForRootless(cmd *exec.Cmd, donations *donation.Agency) (*os.Fil
+ 		unix.CAP_DAC_READ_SEARCH,
+ 		unix.CAP_FOWNER,
+ 		unix.CAP_FSETID,
 +		// Needed by the ptrace platform when runsc starts rootless with host networking.
 +		unix.CAP_SYS_PTRACE,
+ 		unix.CAP_SYS_CHROOT,
+ 		// Needed for setuid(2)/setgid(2).
+ 		unix.CAP_SETUID,
