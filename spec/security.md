@@ -268,6 +268,7 @@ It enforces these startup invariants:
 - **User namespace remapping required when needed**: rootless launches and host-root launches must have valid UID/GID maps; mapping failures are fatal.
 - **Network default none**: no network remains the default. Bridge networking must specify DNS explicitly, and native host networking is rejected.
 - **Domain-aware egress**: `--egress-domain` entries are exact DNS names resolved to IPv4 `/32` rules at startup; wildcard domains and packet-time DNS matching are out of scope.
+- **Credential broker egress**: `--credential-broker IPv4:PORT` is mutually exclusive with direct egress allowlists. It denies sandbox DNS and allows only TCP to the host-side broker endpoint; the broker keeps bearer credentials outside the sandbox and enforces upstream method/path/destination limits.
 - **No argv secret env**: provider launchers can pass sensitive environment values through `--env-fd` instead of placing them in process argv.
 
 It intentionally does not require production service inputs:

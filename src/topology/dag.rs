@@ -166,6 +166,8 @@ mod tests {
                     egress_allow: vec![],
                     egress_domains: vec![],
                     egress_tcp_ports: vec![],
+                    credential_broker: None,
+                    credential_broker_no_proxy_env: false,
                     port_forwards: vec![],
                     environment: BTreeMap::new(),
                     user: None,

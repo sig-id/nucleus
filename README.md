@@ -811,6 +811,8 @@ provider CLI packages through `providerPackages`.
 
 **Do not pass secrets via `-e` / `--env`.** Environment variables are visible in `/proc/<pid>/environ` to any process that can read it (mitigated by `hidepid=2` in production mode, but not in agent mode). Use `--secret` instead when a file works. If a provider CLI requires sensitive environment variables, use `--env-fd FD`; the fd carries a JSON object such as `{"OPENAI_API_KEY":"..."}` or a JSON array of `KEY=VALUE` strings so the values are not exposed through Nucleus argv.
 
+**Prefer credential brokers for bearer-token APIs.** If untrusted code can drive a provider CLI, do not place the bearer token in the sandbox environment. Run a host-side broker that holds the credential, injects it into approved upstream requests, rate-limits and audits usage, and start Nucleus with `--credential-broker IP:PORT` so the sandbox can only reach that broker endpoint.
+
 **Privilege dropping is explicit.** Nucleus must start with elevated privileges to create namespaces, mount filesystems, and configure cgroups/networking. Use `--user` / `--group` (or the NixOS module's `user` / `group` options) so the workload itself does not continue running as root after setup. In production mode, staged secrets under `/run/secrets` are re-owned to that workload identity.
 
 **Agent mode is not hardened.** By design, agent mode applies several security mechanisms on a best-effort basis: seccomp and Landlock failures are warn-and-continue (with `--allow-degraded-security`), chroot fallback is available (with `--allow-chroot-fallback`), bridge DNS defaults to public resolvers (`8.8.8.8`), and cgroup creation failures are non-fatal. Operators requiring strict isolation for ephemeral workloads should use `--service-mode strict-agent`; operators deploying long-running NixOS services should use production mode.
@@ -870,6 +872,25 @@ nucleus run --service-mode production --network bridge --dns 10.0.0.1 \
 ```
 
 Domain egress entries are exact DNS names, not wildcard or suffix rules. Nucleus resolves each domain with the supervisor host resolver before installing the namespace-local iptables policy, keeps only IPv4 answers, and fails startup if a domain has no IPv4 address. Long-running services that depend on provider IP rotation should restart after DNS changes, use provider-published CIDR ranges, or route traffic through a stable internal proxy and allow that proxy CIDR instead.
+
+### Credential Broker Egress
+
+`--credential-broker IP:PORT` is the first-class Nucleus path for bearer-token API clients that must run inside an untrusted sandbox. The actual broker process is host-side and outside Nucleus: it owns the real secret, authenticates outbound requests, enforces upstream method/path/destination limits, and writes the audit log. Nucleus enforces the sandbox side by installing a deny-by-default policy that allows only TCP to the broker `/32` and disables DNS from the sandbox.
+
+```bash
+# Broker listens on the host side of the bridge, for example 10.0.42.1:8080.
+# Nucleus injects HTTP_PROXY/HTTPS_PROXY values pointing at that endpoint.
+nucleus run --network bridge --credential-broker 10.0.42.1:8080 \
+  -- ./provider-client
+
+# If the provider uses a base URL setting instead of proxy variables:
+nucleus run --network bridge --credential-broker 10.0.42.1:8080 \
+  --credential-broker-no-proxy-env \
+  -e PROVIDER_BASE_URL=http://10.0.42.1:8080 \
+  -- ./provider-client
+```
+
+Broker mode is mutually exclusive with `--egress-allow`, `--egress-domain`, `--egress-tcp-port`, and `--egress-udp-port`; adding direct routes would defeat the broker boundary. The broker endpoint must be an IPv4 bridge address, not `127.0.0.1`, because loopback is local to the container namespace.
 
 ## Native Bridge Backends
 

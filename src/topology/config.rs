@@ -112,6 +112,14 @@ pub struct ServiceDef {
     #[serde(default)]
     pub egress_tcp_ports: Vec<u16>,
 
+    /// Host-side credential broker endpoint in IPv4:PORT form.
+    #[serde(default)]
+    pub credential_broker: Option<String>,
+
+    /// Disable automatic HTTP_PROXY/HTTPS_PROXY injection for credential broker mode.
+    #[serde(default)]
+    pub credential_broker_no_proxy_env: bool,
+
     /// Port forwards (format: "HOST:CONTAINER" or "HOST_IP:HOST:CONTAINER")
     #[serde(default)]
     pub port_forwards: Vec<String>,
@@ -405,6 +413,35 @@ impl TopologyConfig {
                 })?;
             }
 
+            if let Some(endpoint) = &svc.credential_broker {
+                crate::network::CredentialBrokerConfig::parse_endpoint(endpoint).map_err(|e| {
+                    crate::error::NucleusError::ConfigError(format!(
+                        "Service '{}' has invalid credential_broker '{}': {}",
+                        name, endpoint, e
+                    ))
+                })?;
+                if svc.networks.is_empty() {
+                    return Err(crate::error::NucleusError::ConfigError(format!(
+                        "Service '{}' uses credential_broker but has no bridge network",
+                        name
+                    )));
+                }
+                if !svc.egress_allow.is_empty()
+                    || !svc.egress_domains.is_empty()
+                    || !svc.egress_tcp_ports.is_empty()
+                {
+                    return Err(crate::error::NucleusError::ConfigError(format!(
+                        "Service '{}' cannot combine credential_broker with raw egress allowlists",
+                        name
+                    )));
+                }
+            } else if svc.credential_broker_no_proxy_env {
+                return Err(crate::error::NucleusError::ConfigError(format!(
+                    "Service '{}' sets credential_broker_no_proxy_env without credential_broker",
+                    name
+                )));
+            }
+
             // Validate volume mounts reference existing volume defs
             for vol_mount in &svc.volumes {
                 let parsed = parse_service_volume_mount(vol_mount)?;
@@ -535,6 +572,47 @@ egress_domains = ["*.example.com"]
         let config = TopologyConfig::from_toml(toml).unwrap();
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("egress_domains"));
+    }
+
+    #[test]
+    fn test_validate_accepts_credential_broker_service() {
+        let toml = r#"
+name = "brokered"
+
+[networks.internal]
+driver = "bridge"
+
+[services.web]
+rootfs = "/nix/store/web"
+command = ["/bin/web"]
+memory = "256M"
+networks = ["internal"]
+credential_broker = "10.0.42.1:8080"
+credential_broker_no_proxy_env = true
+"#;
+        let config = TopologyConfig::from_toml(toml).unwrap();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_rejects_credential_broker_with_raw_egress() {
+        let toml = r#"
+name = "bad"
+
+[networks.internal]
+driver = "bridge"
+
+[services.web]
+rootfs = "/nix/store/web"
+command = ["/bin/web"]
+memory = "256M"
+networks = ["internal"]
+credential_broker = "10.0.42.1:8080"
+egress_domains = ["api.example.com"]
+"#;
+        let config = TopologyConfig::from_toml(toml).unwrap();
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("credential_broker"));
     }
 
     #[test]

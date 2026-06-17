@@ -116,6 +116,27 @@ let
         description = "Allowed egress UDP destination ports.";
       };
 
+      credentialBroker = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        example = "10.0.42.1:8080";
+        description = ''
+          Host-side credential broker endpoint in IPv4:PORT form. When set,
+          Nucleus installs broker-only egress and rejects direct upstream
+          egress allowlists.
+        '';
+      };
+
+      credentialBrokerNoProxyEnv = mkOption {
+        type = types.bool;
+        default = false;
+        description = ''
+          Disable automatic HTTP_PROXY/HTTPS_PROXY injection for
+          credentialBroker. Use this when the workload is pointed at the
+          broker through provider-specific base URL variables instead.
+        '';
+      };
+
       portForwards = mkOption {
         type = types.listOf types.str;
         default = [ ];
@@ -429,6 +450,8 @@ let
         ++ (lib.concatMap (d: [ "--egress-domain" (e d) ]) containerCfg.egressDomains)
         ++ (lib.concatMap (p: [ "--egress-tcp-port" (e (toString p)) ]) containerCfg.egressTcpPorts)
         ++ (lib.concatMap (p: [ "--egress-udp-port" (e (toString p)) ]) containerCfg.egressUdpPorts)
+        ++ lib.optionals (containerCfg.credentialBroker != null) [ "--credential-broker" (e containerCfg.credentialBroker) ]
+        ++ optional containerCfg.credentialBrokerNoProxyEnv "--credential-broker-no-proxy-env"
         ++ (lib.concatMap (p: [ "-p" (e p) ]) containerCfg.portForwards)
         ++ (lib.concatMap (s: [ "--secret" (e "${toString s.source}:${s.dest}") ]) containerCfg.secrets)
         ++ (lib.concatMap (c: [ "--systemd-credential" (e "${c.name}:${c.dest}") ]) containerCfg.credentials)

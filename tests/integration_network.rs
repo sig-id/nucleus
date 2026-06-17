@@ -8,7 +8,8 @@ mod tests {
     use nucleus::error::NucleusError;
     use nucleus::isolation::NamespaceConfig;
     use nucleus::network::{
-        BridgeConfig, EgressPolicy, NatBackend, NetworkMode, PortForward, Protocol,
+        BridgeConfig, CredentialBrokerConfig, EgressPolicy, NatBackend, NetworkMode, PortForward,
+        Protocol,
     };
 
     // --- BridgeConfig validation ---
@@ -264,6 +265,31 @@ mod tests {
         assert_eq!(policy.allowed_domains, vec!["api.example.com"]);
         assert_eq!(policy.allowed_tcp_ports, vec![443, 80]);
         assert_eq!(policy.allowed_udp_ports, vec![53]);
+    }
+
+    #[test]
+    fn test_credential_broker_endpoint_validation() {
+        let broker = CredentialBrokerConfig::parse_endpoint("10.0.42.1:8080").unwrap();
+        assert_eq!(broker.broker_cidr(), "10.0.42.1/32");
+        assert_eq!(broker.proxy_url(), "http://10.0.42.1:8080");
+
+        assert!(CredentialBrokerConfig::parse_endpoint("api.example.com:8080").is_err());
+        assert!(CredentialBrokerConfig::parse_endpoint("127.0.0.1:8080").is_err());
+        assert!(CredentialBrokerConfig::parse_endpoint("0.0.0.0:8080").is_err());
+        assert!(CredentialBrokerConfig::parse_endpoint("10.0.42.1:0").is_err());
+    }
+
+    #[test]
+    fn test_credential_broker_policy_denies_dns_and_allows_only_broker() {
+        let broker = CredentialBrokerConfig::parse_endpoint("10.0.42.1:8080").unwrap();
+        let policy = broker.egress_policy();
+
+        assert_eq!(policy.allowed_cidrs, vec!["10.0.42.1/32"]);
+        assert!(policy.allowed_domains.is_empty());
+        assert_eq!(policy.allowed_tcp_ports, vec![8080]);
+        assert!(policy.allowed_udp_ports.is_empty());
+        assert!(!policy.allow_dns);
+        assert!(policy.is_credential_broker_only(&broker));
     }
 
     // --- CIDR validation ---

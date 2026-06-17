@@ -239,6 +239,11 @@ Optional networking with three modes.
 - Enforce optional egress allowlists by CIDR and by exact domain name
 - Domain egress allowlists are resolved to IPv4 `/32` rules at startup; they are not packet-time FQDN matches or wildcard suffix rules
 - Requires root for kernel NAT; rootless/native uses the userspace NAT backend
+- Credential broker mode (`--credential-broker IPv4:PORT`) installs broker-only
+  egress: DNS is denied and the only new outbound route is TCP to the
+  host-side broker `/32`. The broker process itself is outside the sandbox and
+  is responsible for credential injection, upstream allowlists, rate limits,
+  and audit logs.
 
 ### 8. Checkpoint/Restore
 

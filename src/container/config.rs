@@ -4,7 +4,7 @@ use crate::filesystem::{
     validate_workspace_host_path,
 };
 use crate::isolation::{NamespaceConfig, UserNamespaceConfig};
-use crate::network::EgressPolicy;
+use crate::network::{CredentialBrokerConfig, EgressPolicy};
 use crate::resources::ResourceLimits;
 use crate::security::GVisorPlatform;
 use std::fs::OpenOptions;
@@ -554,6 +554,10 @@ pub struct ContainerConfig {
     /// Egress policy for audited outbound network access.
     pub egress_policy: Option<EgressPolicy>,
 
+    /// Host-side credential broker that is the sandbox's only allowed
+    /// authenticated egress path.
+    pub credential_broker: Option<CredentialBrokerConfig>,
+
     /// Health check configuration for long-running services.
     pub health_check: Option<HealthCheck>,
 
@@ -733,6 +737,7 @@ impl ContainerConfig {
             service_mode: ServiceMode::default(),
             rootfs_path: None,
             egress_policy: None,
+            credential_broker: None,
             health_check: None,
             readiness_probe: None,
             secrets: Vec::new(),
@@ -879,6 +884,12 @@ impl ContainerConfig {
     #[must_use]
     pub fn with_egress_policy(mut self, policy: EgressPolicy) -> Self {
         self.egress_policy = Some(policy);
+        self
+    }
+
+    #[must_use]
+    pub fn with_credential_broker(mut self, broker: CredentialBrokerConfig) -> Self {
+        self.credential_broker = Some(broker);
         self
     }
 
@@ -1067,6 +1078,39 @@ impl ContainerConfig {
     pub fn with_state_root(mut self, root: PathBuf) -> Self {
         self.state_root = Some(root);
         self
+    }
+
+    fn validate_credential_broker(&self) -> crate::error::Result<()> {
+        let Some(broker) = &self.credential_broker else {
+            return Ok(());
+        };
+
+        broker
+            .validate()
+            .map_err(crate::error::NucleusError::ConfigError)?;
+
+        if !matches!(self.network, crate::network::NetworkMode::Bridge(_)) {
+            return Err(crate::error::NucleusError::ConfigError(
+                "Credential broker egress requires --network bridge so Nucleus can force the \
+                 sandbox through the host-side broker endpoint"
+                    .to_string(),
+            ));
+        }
+
+        let Some(policy) = &self.egress_policy else {
+            return Err(crate::error::NucleusError::ConfigError(
+                "Credential broker egress requires a broker-only egress policy".to_string(),
+            ));
+        };
+
+        if !policy.is_credential_broker_only(broker) {
+            return Err(crate::error::NucleusError::ConfigError(
+                "Credential broker egress must allow only the broker IP/port and must deny DNS"
+                    .to_string(),
+            ));
+        }
+
+        Ok(())
     }
 
     fn validate_fail_closed_isolation(&self) -> crate::error::Result<()> {
@@ -1335,6 +1379,8 @@ impl ContainerConfig {
             }
         }
 
+        self.validate_credential_broker()?;
+
         if !self.use_gvisor {
             return Ok(());
         }
@@ -1522,6 +1568,7 @@ mod tests {
         assert_eq!(cfg.service_mode, ServiceMode::Agent);
         assert!(cfg.rootfs_path.is_none());
         assert!(cfg.egress_policy.is_none());
+        assert!(cfg.credential_broker.is_none());
         assert!(cfg.secrets.is_empty());
         assert!(cfg.volumes.is_empty());
         assert_eq!(cfg.home, PathBuf::from(DEFAULT_HOME_PATH));
@@ -1532,6 +1579,54 @@ mod tests {
         assert!(!cfg.verify_rootfs_attestation);
         assert!(!cfg.seccomp_log_denied);
         assert_eq!(cfg.gvisor_platform, GVisorPlatform::Systrap);
+    }
+
+    #[test]
+    fn test_credential_broker_validates_broker_only_bridge_egress() {
+        let broker =
+            crate::network::CredentialBrokerConfig::parse_endpoint("10.0.42.1:8080").unwrap();
+        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
+            .with_network(NetworkMode::Bridge(crate::network::BridgeConfig::default()))
+            .with_credential_broker(broker.clone())
+            .with_egress_policy(broker.egress_policy());
+
+        assert!(cfg.validate_runtime_support().is_ok());
+    }
+
+    #[test]
+    fn test_credential_broker_rejects_non_bridge_network() {
+        let broker =
+            crate::network::CredentialBrokerConfig::parse_endpoint("10.0.42.1:8080").unwrap();
+        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
+            .with_network(NetworkMode::None)
+            .with_credential_broker(broker.clone())
+            .with_egress_policy(broker.egress_policy());
+
+        let err = cfg.validate_runtime_support().unwrap_err();
+        assert!(err.to_string().contains("requires --network bridge"));
+    }
+
+    #[test]
+    fn test_credential_broker_rejects_extra_egress_routes() {
+        let broker =
+            crate::network::CredentialBrokerConfig::parse_endpoint("10.0.42.1:8080").unwrap();
+        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
+            .with_network(NetworkMode::Bridge(crate::network::BridgeConfig::default()))
+            .with_credential_broker(broker)
+            .with_egress_policy(
+                crate::network::EgressPolicy::default()
+                    .with_allowed_cidrs(vec![
+                        "10.0.42.1/32".to_string(),
+                        "203.0.113.0/24".to_string(),
+                    ])
+                    .with_allowed_tcp_ports(vec![8080]),
+            );
+
+        let err = cfg.validate_runtime_support().unwrap_err();
+        assert!(err.to_string().contains("allow only the broker"));
     }
 
     #[test]

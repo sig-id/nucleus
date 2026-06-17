@@ -509,6 +509,14 @@ fn build_service_run_command(
         args.push(port.to_string());
     }
 
+    if let Some(endpoint) = &svc.credential_broker {
+        args.push("--credential-broker".to_string());
+        args.push(endpoint.clone());
+        if svc.credential_broker_no_proxy_env {
+            args.push("--credential-broker-no-proxy-env".to_string());
+        }
+    }
+
     for pf in &svc.port_forwards {
         args.push("-p".to_string());
         args.push(pf.clone());
@@ -907,7 +915,8 @@ name = "test"
 rootfs = "/nix/store/web"
 command = ["/bin/web"]
 memory = "256M"
-egress_domains = ["api.example.com"]
+credential_broker = "10.0.42.1:8080"
+credential_broker_no_proxy_env = true
 "#;
         let config = TopologyConfig::from_toml(toml).unwrap();
         let svc = config.services.get("web").unwrap();
@@ -920,7 +929,10 @@ egress_domains = ["api.example.com"]
             .any(|pair| { pair[0] == "--topology-config-hash" && pair[1] == "42" }));
         assert!(args
             .windows(2)
-            .any(|pair| { pair[0] == "--egress-domain" && pair[1] == "api.example.com" }));
+            .any(|pair| { pair[0] == "--credential-broker" && pair[1] == "10.0.42.1:8080" }));
+        assert!(args
+            .iter()
+            .any(|arg| { arg == "--credential-broker-no-proxy-env" }));
         assert!(args.iter().any(|arg| arg == "--quiet-id"));
     }
 

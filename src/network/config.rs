@@ -1,4 +1,5 @@
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4};
+use std::str::FromStr;
 
 /// Network mode for container
 #[derive(Debug, Clone)]
@@ -300,6 +301,117 @@ impl EgressPolicy {
     pub fn with_allowed_udp_ports(mut self, ports: Vec<u16>) -> Self {
         self.allowed_udp_ports = ports;
         self
+    }
+
+    /// Create a deny-by-default policy that only permits TCP egress to the
+    /// configured host-side credential broker.
+    pub fn credential_broker_only(broker: &CredentialBrokerConfig) -> Self {
+        Self::deny_all()
+            .with_allowed_cidrs(vec![broker.broker_cidr()])
+            .with_allowed_tcp_ports(vec![broker.broker_port])
+    }
+
+    /// Return true when this policy permits no direct outbound route except
+    /// the configured credential broker endpoint.
+    pub fn is_credential_broker_only(&self, broker: &CredentialBrokerConfig) -> bool {
+        self.allowed_cidrs == vec![broker.broker_cidr()]
+            && self.allowed_domains.is_empty()
+            && self.allowed_tcp_ports == vec![broker.broker_port]
+            && self.allowed_udp_ports.is_empty()
+            && !self.allow_dns
+    }
+}
+
+/// Host-side credential broker endpoint for broker-only egress.
+///
+/// The broker process runs outside the sandbox and holds the real credential.
+/// Nucleus only allows the sandbox to reach this endpoint; the broker is
+/// responsible for injecting credentials, constraining upstream destinations,
+/// rate limiting, and auditing authenticated requests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CredentialBrokerConfig {
+    /// Host-side bridge IP reachable from the container namespace.
+    pub broker_ip: Ipv4Addr,
+    /// TCP port where the host-side broker listens.
+    pub broker_port: u16,
+    /// Whether Nucleus should inject standard proxy environment variables
+    /// pointing at the broker. Disable this when using a provider-specific
+    /// base URL environment variable instead.
+    pub inject_proxy_env: bool,
+}
+
+impl CredentialBrokerConfig {
+    /// Create a credential broker config from a host-side bridge IP and port.
+    pub fn new(broker_ip: Ipv4Addr, broker_port: u16) -> Self {
+        Self {
+            broker_ip,
+            broker_port,
+            inject_proxy_env: true,
+        }
+    }
+
+    /// Parse an endpoint in `IPv4:PORT` form.
+    pub fn parse_endpoint(endpoint: &str) -> Result<Self, String> {
+        let socket = SocketAddrV4::from_str(endpoint).map_err(|_| {
+            format!(
+                "Invalid credential broker endpoint '{}', expected IPv4:PORT",
+                endpoint
+            )
+        })?;
+        let config = Self::new(*socket.ip(), socket.port());
+        config.validate()?;
+        Ok(config)
+    }
+
+    pub fn with_proxy_env(mut self, inject_proxy_env: bool) -> Self {
+        self.inject_proxy_env = inject_proxy_env;
+        self
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.broker_port == 0 {
+            return Err("Credential broker port must be non-zero".to_string());
+        }
+        if self.broker_ip.is_unspecified() {
+            return Err("Credential broker IP must not be 0.0.0.0".to_string());
+        }
+        if self.broker_ip.is_loopback() {
+            return Err(
+                "Credential broker IP must be reachable on the bridge, not container loopback"
+                    .to_string(),
+            );
+        }
+        if self.broker_ip.is_multicast() || self.broker_ip == Ipv4Addr::BROADCAST {
+            return Err("Credential broker IP must be a unicast IPv4 address".to_string());
+        }
+        Ok(())
+    }
+
+    pub fn broker_cidr(&self) -> String {
+        format!("{}/32", self.broker_ip)
+    }
+
+    pub fn proxy_url(&self) -> String {
+        format!("http://{}:{}", self.broker_ip, self.broker_port)
+    }
+
+    /// Standard proxy variables for HTTP API CLIs that honor proxy settings.
+    ///
+    /// These values are not secrets; they only point at the broker endpoint.
+    pub fn proxy_environment(&self) -> Vec<(String, String)> {
+        if !self.inject_proxy_env {
+            return Vec::new();
+        }
+
+        let url = self.proxy_url();
+        ["HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"]
+            .into_iter()
+            .map(|key| (key.to_string(), url.clone()))
+            .collect()
+    }
+
+    pub fn egress_policy(&self) -> EgressPolicy {
+        EgressPolicy::credential_broker_only(self)
     }
 }
 

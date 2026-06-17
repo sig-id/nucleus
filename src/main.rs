@@ -17,7 +17,9 @@ use nucleus::filesystem::{
     validate_provider_config_source, validate_workspace_host_path, ContextMode,
 };
 use nucleus::isolation::{ContainerAttach, NamespaceConfig};
-use nucleus::network::{BridgeConfig, EgressPolicy, NatBackend, NetworkMode, PortForward};
+use nucleus::network::{
+    BridgeConfig, CredentialBrokerConfig, EgressPolicy, NatBackend, NetworkMode, PortForward,
+};
 use nucleus::resources::{Cgroup, IoDeviceLimit, ResourceLimits, ResourceStats};
 use nucleus::security::GVisorPlatform;
 use nucleus::topology::{
@@ -625,6 +627,8 @@ const RUN_CONFIG_PATH_CONFLICTS: &[&str] = &[
     "egress_domains",
     "egress_tcp_ports",
     "egress_udp_ports",
+    "credential_broker",
+    "credential_broker_no_proxy_env",
     "dns",
     "nat_backend",
     "health_cmd",
@@ -711,6 +715,8 @@ const RUN_CONFIG_FD_CONFLICTS: &[&str] = &[
     "egress_domains",
     "egress_tcp_ports",
     "egress_udp_ports",
+    "credential_broker",
+    "credential_broker_no_proxy_env",
     "dns",
     "nat_backend",
     "health_cmd",
@@ -948,6 +954,14 @@ enum Commands {
         /// Allowed egress UDP ports (repeatable, used with --egress-allow/--egress-domain)
         #[arg(long = "egress-udp-port")]
         egress_udp_ports: Vec<u16>,
+
+        /// Host-side credential broker endpoint (IPv4:PORT). Enables broker-only egress.
+        #[arg(long = "credential-broker", value_name = "IP:PORT")]
+        credential_broker: Option<String>,
+
+        /// Do not inject HTTP_PROXY/HTTPS_PROXY variables for --credential-broker.
+        #[arg(long = "credential-broker-no-proxy-env")]
+        credential_broker_no_proxy_env: bool,
 
         /// DNS servers (repeatable). Required for bridge mode in production.
         #[arg(long)]
@@ -1322,6 +1336,8 @@ struct RunConfig {
     egress_domains: Vec<String>,
     egress_tcp_ports: Vec<u16>,
     egress_udp_ports: Vec<u16>,
+    credential_broker: Option<String>,
+    credential_broker_no_proxy_env: bool,
     dns: Vec<String>,
     nat_backend: NatBackend,
     health_cmd: Option<String>,
@@ -1410,6 +1426,8 @@ impl Default for RunConfig {
             egress_domains: Vec::new(),
             egress_tcp_ports: Vec::new(),
             egress_udp_ports: Vec::new(),
+            credential_broker: None,
+            credential_broker_no_proxy_env: false,
             dns: Vec::new(),
             nat_backend: NatBackend::Auto,
             health_cmd: None,
@@ -1846,6 +1864,8 @@ fn try_main() -> Result<i32> {
             egress_domains,
             egress_tcp_ports,
             egress_udp_ports,
+            credential_broker,
+            credential_broker_no_proxy_env,
             dns,
             nat_backend,
             health_cmd,
@@ -1947,6 +1967,8 @@ fn try_main() -> Result<i32> {
                     egress_domains,
                     egress_tcp_ports,
                     egress_udp_ports,
+                    credential_broker,
+                    credential_broker_no_proxy_env,
                     dns,
                     nat_backend,
                     health_cmd,
@@ -2138,6 +2160,8 @@ fn try_main() -> Result<i32> {
                 egress_domains,
                 egress_tcp_ports,
                 egress_udp_ports,
+                credential_broker,
+                credential_broker_no_proxy_env,
                 dns,
                 nat_backend,
                 health_cmd,
@@ -2433,7 +2457,36 @@ fn try_main() -> Result<i32> {
             // is installed. gvisor-host is explicit hostinet and cannot be
             // constrained by namespace-local iptables rules.
             let gvisor_host_network = matches!(config.network, NetworkMode::GVisorHost);
-            if !egress_allow.is_empty() || !egress_domains.is_empty() {
+            if let Some(endpoint) = credential_broker {
+                if gvisor_host_network {
+                    return Err(NucleusError::ConfigError(
+                        "--credential-broker cannot be enforced with --network gvisor-host"
+                            .to_string(),
+                    ));
+                }
+                if !egress_allow.is_empty()
+                    || !egress_domains.is_empty()
+                    || !egress_tcp_ports.is_empty()
+                    || !egress_udp_ports.is_empty()
+                {
+                    return Err(NucleusError::ConfigError(
+                        "--credential-broker is mutually exclusive with raw egress allowlists"
+                            .to_string(),
+                    ));
+                }
+
+                let broker = CredentialBrokerConfig::parse_endpoint(&endpoint)
+                    .map_err(NucleusError::ConfigError)?
+                    .with_proxy_env(!credential_broker_no_proxy_env);
+                let policy = broker.egress_policy();
+                config = config
+                    .with_credential_broker(broker)
+                    .with_egress_policy(policy);
+            } else if credential_broker_no_proxy_env {
+                return Err(NucleusError::ConfigError(
+                    "--credential-broker-no-proxy-env requires --credential-broker".to_string(),
+                ));
+            } else if !egress_allow.is_empty() || !egress_domains.is_empty() {
                 if gvisor_host_network {
                     return Err(NucleusError::ConfigError(
                         "--egress-allow/--egress-domain cannot be enforced with --network gvisor-host"
@@ -2622,6 +2675,17 @@ fn try_main() -> Result<i32> {
             for spec in &env_vars {
                 let (key, value) = parse_env_assignment(spec)?;
                 config = config.with_env(key, value);
+            }
+            if let Some(broker) = config.credential_broker.clone() {
+                for (key, value) in broker.proxy_environment() {
+                    if !config
+                        .environment
+                        .iter()
+                        .any(|(existing_key, _)| existing_key == &key)
+                    {
+                        config = config.with_env(key, value);
+                    }
+                }
             }
 
             // OCI lifecycle hooks
@@ -2947,6 +3011,8 @@ mod tests {
             egress_domains: vec!["api.example.com".to_string()],
             egress_tcp_ports: vec![443],
             egress_udp_ports: vec![53],
+            credential_broker: Some("10.0.42.1:8080".to_string()),
+            credential_broker_no_proxy_env: true,
             dns: vec!["8.8.8.8".to_string()],
             nat_backend: NatBackend::Kernel,
             health_cmd: Some("curl -f http://127.0.0.1/health".to_string()),
@@ -2998,6 +3064,11 @@ mod tests {
         assert_eq!(decoded.command, request.command);
         assert_eq!(decoded.publish, request.publish);
         assert_eq!(decoded.egress_domains, request.egress_domains);
+        assert_eq!(decoded.credential_broker, request.credential_broker);
+        assert_eq!(
+            decoded.credential_broker_no_proxy_env,
+            request.credential_broker_no_proxy_env
+        );
         assert_eq!(decoded.seccomp_allow, request.seccomp_allow);
     }
 
@@ -3047,6 +3118,8 @@ mod tests {
             egress_domains: Vec::new(),
             egress_tcp_ports: Vec::new(),
             egress_udp_ports: Vec::new(),
+            credential_broker: None,
+            credential_broker_no_proxy_env: false,
             dns: Vec::new(),
             nat_backend: NatBackend::Auto,
             health_cmd: None,
