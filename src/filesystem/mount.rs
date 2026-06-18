@@ -541,6 +541,90 @@ pub fn bind_mount_rootfs(root: &Path, rootfs_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Mount a pre-built rootfs through overlayfs with a persistent writable upperdir.
+///
+/// The lowerdir is the Nix-built rootfs. Individual `/nix/store/<hash>-name`
+/// paths are re-bound read-only after the overlay mount, preserving the same
+/// store-object validation as `bind_mount_rootfs`.
+pub fn overlay_mount_rootfs(
+    root: &Path,
+    rootfs_path: &Path,
+    upperdir: &Path,
+    workdir: &Path,
+) -> Result<()> {
+    info!(
+        "Overlay mounting rootfs {:?} into container {:?} (upper={:?}, work={:?})",
+        rootfs_path, root, upperdir, workdir
+    );
+
+    let lowerdir = validate_overlay_mount_dir(rootfs_path, "rootfs lowerdir")?;
+    let upperdir = validate_overlay_mount_dir(upperdir, "rootfs overlay upperdir")?;
+    let workdir = validate_overlay_mount_dir(workdir, "rootfs overlay workdir")?;
+    validate_overlay_mount_dir(root, "container root")?;
+
+    let options = format!(
+        "lowerdir={},upperdir={},workdir={}",
+        overlay_option_path(&lowerdir, "rootfs lowerdir")?,
+        overlay_option_path(&upperdir, "rootfs overlay upperdir")?,
+        overlay_option_path(&workdir, "rootfs overlay workdir")?
+    );
+
+    mount(
+        Some("overlay"),
+        root,
+        Some("overlay"),
+        MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
+        Some(options.as_str()),
+    )
+    .map_err(|e| {
+        NucleusError::FilesystemError(format!(
+            "Failed to overlay mount rootfs {:?} -> {:?}: {}",
+            lowerdir, root, e
+        ))
+    })?;
+
+    bind_mount_rootfs_store_paths(root, rootfs_path)?;
+
+    Ok(())
+}
+
+fn validate_overlay_mount_dir(path: &Path, label: &str) -> Result<PathBuf> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|e| {
+        NucleusError::FilesystemError(format!("Failed to stat {} {:?}: {}", label, path, e))
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(NucleusError::FilesystemError(format!(
+            "{} must not be a symlink: {:?}",
+            label, path
+        )));
+    }
+    if !metadata.is_dir() {
+        return Err(NucleusError::FilesystemError(format!(
+            "{} must be a directory: {:?}",
+            label, path
+        )));
+    }
+    std::fs::canonicalize(path).map_err(|e| {
+        NucleusError::FilesystemError(format!(
+            "Failed to canonicalize {} {:?}: {}",
+            label, path, e
+        ))
+    })
+}
+
+fn overlay_option_path(path: &Path, label: &str) -> Result<String> {
+    let rendered = path.to_str().ok_or_else(|| {
+        NucleusError::FilesystemError(format!("{} path is not valid UTF-8: {:?}", label, path))
+    })?;
+    if rendered.contains(',') || rendered.contains(':') {
+        return Err(NucleusError::FilesystemError(format!(
+            "{} path contains a character unsupported in overlay mount options: {}",
+            label, rendered
+        )));
+    }
+    Ok(rendered.to_string())
+}
+
 fn bind_mount_rootfs_store_paths(root: &Path, rootfs_path: &Path) -> Result<()> {
     let store_paths_file = rootfs_path.join(ROOTFS_STORE_PATHS_FILE);
     if !store_paths_file.exists() {

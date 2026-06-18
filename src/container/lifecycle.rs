@@ -151,6 +151,17 @@ impl ContainerLifecycle {
             }
         }
 
+        if let Ok(overlay_dir) = state_mgr.rootfs_overlay_dir_path(&state.id) {
+            if overlay_dir.exists() {
+                if let Err(e) = std::fs::remove_dir_all(&overlay_dir) {
+                    warn!(
+                        "Failed to remove rootfs overlay directory {:?}: {}",
+                        overlay_dir, e
+                    );
+                }
+            }
+        }
+
         state_mgr.delete_state(&state.id)?;
         info!("Removed container {}", state.id);
         Ok(())

@@ -11,14 +11,26 @@ let
 
       command = mkOption {
         type = types.listOf types.str;
+        default = [ ];
         description = "Command and arguments to run inside the container.";
       };
 
       rootfs = mkOption {
-        type = types.package;
+        type = types.nullOr types.package;
+        default = null;
         description = ''
           Nix-built rootfs derivation (e.g. pkgs.buildEnv).
           Mounted read-only as the container filesystem instead of host bind mounts.
+        '';
+      };
+
+      image = mkOption {
+        type = types.nullOr types.package;
+        default = null;
+        description = ''
+          Nix-built Nucleus image derivation produced by nucleus.lib.mkImage.
+          Mutually exclusive with rootfs. The module uses the image manifest's
+          base rootfs and command unless command is set explicitly.
         '';
       };
 
@@ -418,6 +430,20 @@ let
         map (c: "${c.name}:${toString c.source}") (lib.filter (c: !c.encrypted) containerCfg.credentials);
       loadCredentialEncryptedEntries =
         map (c: "${c.name}:${toString c.source}") (lib.filter (c: c.encrypted) containerCfg.credentials);
+      imageManifest =
+        if containerCfg.image != null
+        then builtins.fromJSON (builtins.readFile "${containerCfg.image}/manifest.json")
+        else null;
+      effectiveRootfs =
+        if containerCfg.image != null
+        then imageManifest.base.rootfs_path
+        else toString containerCfg.rootfs;
+      effectiveCommand =
+        if containerCfg.command != [ ]
+        then containerCfg.command
+        else if imageManifest != null
+        then imageManifest.config.command
+        else [ ];
       nucleusArgs = lib.concatStringsSep " " (
         [
           "--service-mode" "production"
@@ -425,7 +451,7 @@ let
           "--memory" (e containerCfg.memory)
           "--pids" (e (toString containerCfg.pids))
           "--network" (e containerCfg.network)
-          "--rootfs" (e (toString containerCfg.rootfs))
+          "--rootfs" (e effectiveRootfs)
           "--name" (e name)
         ]
         ++ lib.optionals (containerCfg.user != null) [ "--user" (e containerCfg.user) ]
@@ -487,8 +513,16 @@ let
         ]
         ++ containerCfg.extraArgs
       );
-      commandStr = lib.concatStringsSep " " (map lib.escapeShellArg containerCfg.command);
+      commandStr = lib.concatStringsSep " " (map lib.escapeShellArg effectiveCommand);
     in
+    assert lib.assertMsg (containerCfg.rootfs != null || containerCfg.image != null)
+      "services.nucleus.containers.${name}: set either rootfs or image";
+    assert lib.assertMsg (!(containerCfg.rootfs != null && containerCfg.image != null))
+      "services.nucleus.containers.${name}: rootfs and image are mutually exclusive";
+    assert lib.assertMsg (effectiveCommand != [ ])
+      "services.nucleus.containers.${name}: command is required when image manifest command is empty";
+    assert lib.assertMsg (imageManifest == null || imageManifest.diff == null)
+      "services.nucleus.containers.${name}: image diffs are not yet supported by the NixOS production launcher";
     nameValuePair "nucleus-${name}" {
       description = "Nucleus container: ${name}";
       after = [ "network-online.target" ];

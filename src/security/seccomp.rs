@@ -126,6 +126,8 @@ impl SeccompManager {
             libc::SYS_getgid,
             libc::SYS_geteuid,
             libc::SYS_getegid,
+            libc::SYS_getresuid,
+            libc::SYS_getresgid,
             libc::SYS_getppid,
             libc::SYS_setsid,
             libc::SYS_getgroups,
@@ -214,6 +216,9 @@ impl SeccompManager {
             libc::SYS_getpeername,
             libc::SYS_socketpair,
             libc::SYS_getsockopt,
+            // Safe with network mode disabled because socket(AF_INET/AF_INET6)
+            // remains blocked; this permits AF_UNIX probes such as nscd.
+            libc::SYS_connect,
             // Poll/Select
             libc::SYS_ppoll,
             libc::SYS_pselect6,
@@ -273,7 +278,6 @@ impl SeccompManager {
     fn network_mode_syscalls(allow_network: bool) -> Vec<i64> {
         if allow_network {
             vec![
-                libc::SYS_connect,
                 libc::SYS_sendto,
                 libc::SYS_recvfrom,
                 libc::SYS_sendmsg,
@@ -376,18 +380,19 @@ impl SeccompManager {
 
         // ioctl: allow only safe terminal operations (arg0 = request code)
         let ioctl_allowed: &[u64] = &[
-            0x5401, // TCGETS
-            0x5402, // TCSETS
-            0x5403, // TCSETSW
-            0x5404, // TCSETSF
-            0x540B, // TCFLSH
-            0x540E, // TIOCSCTTY
-            0x540F, // TIOCGPGRP
-            0x5410, // TIOCSPGRP
-            0x5413, // TIOCGWINSZ
-            0x5429, // TIOCGSID
-            0x541B, // FIONREAD
-            0x5421, // M12: FIONBIO – allowed because fcntl(F_SETFL, O_NONBLOCK)
+            0x5401,        // TCGETS
+            libc::TCGETS2, // termios2 read-only query used by modern shells
+            0x5402,        // TCSETS
+            0x5403,        // TCSETSW
+            0x5404,        // TCSETSF
+            0x540B,        // TCFLSH
+            0x540E,        // TIOCSCTTY
+            0x540F,        // TIOCGPGRP
+            0x5410,        // TIOCSPGRP
+            0x5413,        // TIOCGWINSZ
+            0x5429,        // TIOCGSID
+            0x541B,        // FIONREAD
+            0x5421,        // M12: FIONBIO – allowed because fcntl(F_SETFL, O_NONBLOCK)
             // achieves the same result and is already permitted. Blocking
             // FIONBIO only breaks tokio/mio for no security gain.
             0x5451, // FIOCLEX
@@ -430,6 +435,12 @@ impl SeccompManager {
             38, // PR_SET_NO_NEW_PRIVS
             40, // PR_GET_TID_ADDRESS – read-only, returns thread ID address
             39, // PR_GET_NO_NEW_PRIVS
+            // Some Nix-packaged binaries attempt PR_SET_MM_ARG_START to update
+            // their visible argv range. The operation is kernel-gated by
+            // CAP_SYS_RESOURCE; Nucleus drops all capabilities before seccomp,
+            // so allowing this option lets the kernel return EPERM instead of
+            // killing otherwise ordinary workloads.
+            libc::PR_SET_MM as u64,
         ];
         let mut prctl_rules = Vec::new();
         for &option in prctl_allowed {
@@ -922,12 +933,22 @@ impl SeccompManager {
 
         info!("Applying seccomp trace filter (allow-all + LOG)");
 
-        // Create an empty rule set – with SeccompAction::Allow as default,
-        // every syscall is permitted. The LOG flag causes the kernel to
-        // audit each syscall decision.
+        let bpf_prog = Self::compile_trace_filter()?;
+
+        // Apply with LOG flag so kernel audits every syscall.
+        Self::apply_bpf_program(&bpf_prog, true)?;
+        self.applied = true;
+        info!("Seccomp trace filter applied (all syscalls allowed + logged)");
+        Ok(true)
+    }
+
+    fn compile_trace_filter() -> Result<BpfProgram> {
+        // Create an empty rule set. SeccompAction::Log allows each syscall
+        // while requesting an audit/log record; SeccompFilter requires the
+        // unused match action to be distinct from the mismatch action.
         let filter = SeccompFilter::new(
             BTreeMap::new(),
-            SeccompAction::Allow, // default: allow everything
+            SeccompAction::Log,   // default: allow everything and log it
             SeccompAction::Allow, // match action (unused – no rules)
             std::env::consts::ARCH.try_into().map_err(|e| {
                 NucleusError::SeccompError(format!("Unsupported architecture: {:?}", e))
@@ -935,15 +956,9 @@ impl SeccompManager {
         )
         .map_err(|e| NucleusError::SeccompError(format!("Failed to create trace filter: {}", e)))?;
 
-        let bpf_prog: BpfProgram = filter.try_into().map_err(|e| {
-            NucleusError::SeccompError(format!("Failed to compile trace BPF: {}", e))
-        })?;
-
-        // Apply with LOG flag so kernel audits every syscall
-        Self::apply_bpf_program(&bpf_prog, true)?;
-        self.applied = true;
-        info!("Seccomp trace filter applied (all syscalls allowed + logged)");
-        Ok(true)
+        filter
+            .try_into()
+            .map_err(|e| NucleusError::SeccompError(format!("Failed to compile trace BPF: {}", e)))
     }
 
     /// Syscalls that the built-in filter restricts at the argument level.
@@ -1725,11 +1740,14 @@ mod tests {
         assert!(none.is_empty());
 
         let enabled = SeccompManager::network_mode_syscalls(true);
-        assert!(enabled.contains(&libc::SYS_connect));
         assert!(enabled.contains(&libc::SYS_bind));
         assert!(enabled.contains(&libc::SYS_listen));
         assert!(enabled.contains(&libc::SYS_accept));
         assert!(enabled.contains(&libc::SYS_setsockopt));
+        assert!(
+            SeccompManager::base_allowed_syscalls().contains(&libc::SYS_connect),
+            "connect is allowed for AF_UNIX probes; network sockets are blocked by socket() domain filtering"
+        );
     }
 
     #[test]
@@ -1738,6 +1756,17 @@ mod tests {
         assert!(base.contains(&libc::SYS_landlock_create_ruleset));
         assert!(base.contains(&libc::SYS_landlock_add_rule));
         assert!(base.contains(&libc::SYS_landlock_restrict_self));
+    }
+
+    #[test]
+    fn test_process_identity_syscalls_present_in_base_allowlist() {
+        let base = SeccompManager::base_allowed_syscalls();
+        assert!(base.contains(&libc::SYS_getuid));
+        assert!(base.contains(&libc::SYS_getgid));
+        assert!(base.contains(&libc::SYS_geteuid));
+        assert!(base.contains(&libc::SYS_getegid));
+        assert!(base.contains(&libc::SYS_getresuid));
+        assert!(base.contains(&libc::SYS_getresgid));
     }
 
     #[cfg(any(
@@ -1809,10 +1838,15 @@ mod tests {
         // execveat removed from base (arg-filtered separately).
         // sysinfo removed (L8: leaks host info).
         // prlimit64 moved to arg-filtered (M3).
-        assert_eq!(base.len(), 171);
-        assert_eq!(net.len(), 11);
-        assert_eq!(base.len() + 9, 180);
-        assert_eq!(base.len() + net.len() + 9, 191);
+        assert_eq!(base.len(), 174);
+        assert_eq!(net.len(), 10);
+        assert_eq!(base.len() + 9, 183);
+        assert_eq!(base.len() + net.len() + 9, 193);
+    }
+
+    #[test]
+    fn test_trace_filter_compiles() {
+        SeccompManager::compile_trace_filter().expect("trace filter must compile");
     }
 
     #[test]

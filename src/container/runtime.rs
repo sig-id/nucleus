@@ -1,15 +1,16 @@
 use crate::audit::{audit, audit_error, AuditEventType};
 use crate::container::{
     ContainerConfig, ContainerState, ContainerStateManager, ContainerStateParams, OciStatus,
-    ServiceMode, WorkspaceMode,
+    RootfsMode, ServiceMode, WorkspaceMode,
 };
 use crate::error::{NucleusError, Result, StateTransition};
 use crate::filesystem::{
     audit_mounts, bind_mount_host_paths, bind_mount_rootfs, copy_workspace_in, create_dev_nodes,
     create_minimal_fs, mask_proc_paths, mount_home_tmpfs, mount_procfs, mount_provider_configs,
-    mount_secrets_inmemory, mount_volumes, mount_workspace, snapshot_context_dir, switch_root,
-    sync_workspace_out, validate_production_rootfs_path, verify_context_manifest,
-    verify_rootfs_attestation, FilesystemState, LazyContextPopulator, TmpfsMount,
+    mount_secrets_inmemory, mount_volumes, mount_workspace, overlay_mount_rootfs,
+    snapshot_context_dir, switch_root, sync_workspace_out, validate_production_rootfs_path,
+    verify_context_manifest, verify_rootfs_attestation, FilesystemState, LazyContextPopulator,
+    TmpfsMount,
 };
 use crate::isolation::{NamespaceManager, UserNamespaceMapper};
 use crate::network::{BridgeDriver, BridgeNetwork, NatBackend, NetworkMode, UserspaceNetwork};
@@ -341,6 +342,82 @@ impl Container {
         Ok(())
     }
 
+    fn prepare_rootfs_overlay(
+        config: &mut ContainerConfig,
+        state_mgr: &ContainerStateManager,
+        host_is_root: bool,
+        needs_external_userns_mapping: bool,
+    ) -> Result<()> {
+        if config.rootfs_mode != RootfsMode::Overlay {
+            return Ok(());
+        }
+        if config.rootfs_path.is_none() {
+            return Err(NucleusError::ConfigError(
+                "--rootfs-mode overlay requires a rootfs path".to_string(),
+            ));
+        }
+        if config.rootfs_overlay.is_some() {
+            return Ok(());
+        }
+
+        let overlay_dir = state_mgr.rootfs_overlay_dir_path(&config.id)?;
+        if overlay_dir.exists() {
+            return Err(NucleusError::FilesystemError(format!(
+                "Rootfs overlay directory already exists: {}",
+                overlay_dir.display()
+            )));
+        }
+        std::fs::create_dir(&overlay_dir).map_err(|e| {
+            NucleusError::FilesystemError(format!(
+                "Failed to create rootfs overlay directory {:?}: {}",
+                overlay_dir, e
+            ))
+        })?;
+        std::fs::set_permissions(&overlay_dir, std::fs::Permissions::from_mode(0o700)).map_err(
+            |e| {
+                NucleusError::FilesystemError(format!(
+                    "Failed to secure rootfs overlay directory {:?}: {}",
+                    overlay_dir, e
+                ))
+            },
+        )?;
+
+        let upperdir = overlay_dir.join("upper");
+        let workdir = overlay_dir.join("work");
+        std::fs::create_dir(&upperdir).map_err(|e| {
+            NucleusError::FilesystemError(format!(
+                "Failed to create rootfs overlay upperdir {:?}: {}",
+                upperdir, e
+            ))
+        })?;
+        std::fs::create_dir(&workdir).map_err(|e| {
+            NucleusError::FilesystemError(format!(
+                "Failed to create rootfs overlay workdir {:?}: {}",
+                workdir, e
+            ))
+        })?;
+
+        if host_is_root && needs_external_userns_mapping {
+            let user_config = config.user_ns_config.as_ref().ok_or_else(|| {
+                NucleusError::ExecError("Missing user namespace configuration".to_string())
+            })?;
+            let host_uid = Self::mapped_host_id_for_container_id(
+                &user_config.uid_mappings,
+                0,
+                "uid mappings",
+            )?;
+            let host_gid = Self::mapped_host_id_for_container_id(
+                &user_config.gid_mappings,
+                0,
+                "gid mappings",
+            )?;
+            Self::chown_tree_no_symlinks(&overlay_dir, host_uid, host_gid)?;
+        }
+
+        config.rootfs_overlay = Some(crate::container::RootfsOverlayConfig { upperdir, workdir });
+        Ok(())
+    }
+
     fn chown_tree_no_symlinks(path: &Path, uid: u32, gid: u32) -> Result<()> {
         let metadata = std::fs::symlink_metadata(path).map_err(|e| {
             NucleusError::FilesystemError(format!(
@@ -636,6 +713,12 @@ impl Container {
             && (!config.use_gvisor || gvisor_needs_precreated_userns);
         let runtime_base_override =
             Self::prepare_runtime_base_override(&config, is_root, needs_external_userns_mapping)?;
+        Self::prepare_rootfs_overlay(
+            &mut config,
+            &state_mgr,
+            is_root,
+            needs_external_userns_mapping,
+        )?;
         Self::prepare_workspace_staging(
             &mut config,
             runtime_base_override.as_deref(),
@@ -780,6 +863,13 @@ impl Container {
                     state.config_hash = config.config_hash;
                     state.bundle_path =
                         config.rootfs_path.as_ref().map(|p| p.display().to_string());
+                    state.rootfs_path =
+                        config.rootfs_path.as_ref().map(|p| p.display().to_string());
+                    state.rootfs_mode = config.rootfs_mode;
+                    if let Some(overlay) = config.rootfs_overlay.as_ref() {
+                        state.rootfs_upperdir = Some(overlay.upperdir.display().to_string());
+                        state.rootfs_workdir = Some(overlay.workdir.display().to_string());
+                    }
 
                     let mut network_driver: Option<BridgeDriver> = None;
                     let trace_reader = Self::maybe_start_seccomp_trace_reader(&config, target_pid)?;
@@ -1115,6 +1205,31 @@ impl Container {
         tmpfs.mount()?;
         fs_state = fs_state.transition(FilesystemState::Mounted)?;
 
+        let rootfs_overlay_mounted = if self.config.rootfs_mode == RootfsMode::Overlay {
+            let rootfs_path = self.config.rootfs_path.as_ref().ok_or_else(|| {
+                NucleusError::ConfigError(
+                    "--rootfs-mode overlay requires a rootfs path".to_string(),
+                )
+            })?;
+            if self.config.verify_rootfs_attestation {
+                verify_rootfs_attestation(rootfs_path)?;
+            }
+            let overlay = self.config.rootfs_overlay.as_ref().ok_or_else(|| {
+                NucleusError::FilesystemError(
+                    "rootfs overlay mode missing prepared upper/work dirs".to_string(),
+                )
+            })?;
+            overlay_mount_rootfs(
+                &container_root,
+                rootfs_path,
+                &overlay.upperdir,
+                &overlay.workdir,
+            )?;
+            true
+        } else {
+            false
+        };
+
         // 4. Create minimal filesystem structure
         create_minimal_fs(&container_root)?;
 
@@ -1154,7 +1269,9 @@ impl Container {
         fs_state = fs_state.transition(FilesystemState::Populated)?;
 
         // 7. Mount runtime paths: either a pre-built rootfs or host bind mounts
-        if let Some(ref rootfs_path) = self.config.rootfs_path {
+        if rootfs_overlay_mounted {
+            debug!("Rootfs already mounted through overlayfs");
+        } else if let Some(ref rootfs_path) = self.config.rootfs_path {
             let rootfs_path = if self.config.service_mode == ServiceMode::Production {
                 validate_production_rootfs_path(rootfs_path)?
             } else {
@@ -1308,8 +1425,15 @@ impl Container {
                 format!("capability policy applied from {:?}", policy_path),
             );
         } else {
+            let overlay_rootfs_caps = [Capability::CAP_DAC_OVERRIDE, Capability::CAP_FOWNER];
+            let overlay_rootfs_mode = self.config.rootfs_mode == RootfsMode::Overlay;
+
             // Phase 1: drop bounding set while CAP_SETPCAP is still effective
-            cap_mgr.drop_bounding_set()?;
+            if overlay_rootfs_mode {
+                cap_mgr.drop_bounding_set_except(&overlay_rootfs_caps)?;
+            } else {
+                cap_mgr.drop_bounding_set()?;
+            }
 
             // Identity switch: setgroups/setgid/setuid while CAP_SETUID/CAP_SETGID
             // are still in the effective set. For non-root target UIDs, the kernel
@@ -1321,13 +1445,21 @@ impl Container {
 
             // Phase 2: explicitly clear any remaining caps (handles root-stays-root
             // case where kernel doesn't auto-clear).
-            cap_mgr.finalize_drop()?;
+            if overlay_rootfs_mode {
+                cap_mgr.finalize_drop_except(&overlay_rootfs_caps)?;
+            } else {
+                cap_mgr.finalize_drop()?;
+            }
 
             audit(
                 &self.config.id,
                 &self.config.name,
                 AuditEventType::CapabilitiesDropped,
-                "all capabilities dropped including bounding set",
+                if overlay_rootfs_mode {
+                    "capabilities dropped except overlay rootfs write caps"
+                } else {
+                    "all capabilities dropped including bounding set"
+                },
             );
         }
         sec_state = sec_state.transition(SecurityState::CapabilitiesDropped)?;
@@ -1475,6 +1607,9 @@ impl Container {
                 self.config.workspace.allow_execute,
             );
             landlock_mgr.add_rw_path(&self.config.home.to_string_lossy());
+            if self.config.rootfs_mode == RootfsMode::Overlay {
+                landlock_mgr.add_rw_exec_path("/");
+            }
             // Register volume mount destinations so Landlock permits access to them
             for provider_config in &self.config.provider_configs {
                 let provider_dest = crate::filesystem::normalize_provider_config_destination(
@@ -2548,6 +2683,30 @@ mod tests {
         assert!(
             !fn_body.contains("mount_secrets(&"),
             "setup_and_exec must not bind-mount secrets from the host"
+        );
+    }
+
+    #[test]
+    fn test_overlay_rootfs_registers_writable_landlock_root() {
+        let source = include_str!("runtime.rs");
+        let fn_body = extract_fn_body(source, "fn setup_and_exec");
+        assert!(
+            fn_body.contains("self.config.rootfs_mode == RootfsMode::Overlay")
+                && fn_body.contains("landlock_mgr.add_rw_exec_path(\"/\")"),
+            "overlay rootfs mode must permit writes through the default Landlock policy"
+        );
+    }
+
+    #[test]
+    fn test_overlay_rootfs_keeps_only_write_caps() {
+        let source = include_str!("runtime.rs");
+        let fn_body = extract_fn_body(source, "fn setup_and_exec");
+        assert!(
+            fn_body.contains(
+                "let overlay_rootfs_caps = [Capability::CAP_DAC_OVERRIDE, Capability::CAP_FOWNER]"
+            ) && fn_body.contains("cap_mgr.drop_bounding_set_except(&overlay_rootfs_caps)")
+                && fn_body.contains("cap_mgr.finalize_drop_except(&overlay_rootfs_caps)"),
+            "overlay rootfs mode must keep only DAC_OVERRIDE/FOWNER through the cap drop"
         );
     }
 

@@ -581,8 +581,8 @@ mod tests {
     fn test_denied_syscall_cannot_match_mprotect_arg_predicate() {
         let rules = crate::security::SeccompManager::minimal_filter_for_test(false, &[]);
         assert!(
-            !rules.contains_key(&libc::SYS_connect),
-            "connect must be denied when networking is disabled"
+            !rules.contains_key(&libc::SYS_sendto),
+            "sendto must be denied when networking is disabled"
         );
         assert!(
             rules
@@ -601,14 +601,14 @@ mod tests {
 
         for mprotect_allowed_prot in [0, libc::PROT_WRITE as u64, libc::PROT_EXEC as u64] {
             let data = make_seccomp_data(
-                libc::SYS_connect as u32,
+                libc::SYS_sendto as u32,
                 AUDIT_ARCH_X86_64,
                 [0, 0, mprotect_allowed_prot, 0, 0, 0],
             );
             assert_eq!(
                 bpf_eval(&prog, &data),
                 RET_KILL,
-                "denied connect syscall must not reuse mprotect arg2 predicate ({})",
+                "denied sendto syscall must not reuse mprotect arg2 predicate ({})",
                 mprotect_allowed_prot
             );
         }
@@ -693,6 +693,60 @@ mod tests {
                 subcommand
             );
         }
+    }
+
+    #[test]
+    fn test_builtin_prctl_allows_pr_set_mm_for_kernel_capability_check() {
+        let rules = crate::security::SeccompManager::minimal_filter_for_test(true, &[]);
+        let prog = compile_bitmap_bpf_with_errno_syscalls(
+            rules,
+            crate::security::SeccompManager::errno_denied_syscalls_for_test(),
+            SeccompAction::KillProcess,
+            SeccompAction::Allow,
+            TargetArch::x86_64,
+        )
+        .unwrap();
+
+        let set_mm_arg_start = make_seccomp_data(
+            libc::SYS_prctl as u32,
+            AUDIT_ARCH_X86_64,
+            [
+                libc::PR_SET_MM as u64,
+                libc::PR_SET_MM_ARG_START as u64,
+                0x1000,
+                0,
+                0,
+                0,
+            ],
+        );
+        assert_eq!(bpf_eval(&prog, &set_mm_arg_start), RET_ALLOW);
+    }
+
+    #[test]
+    fn test_builtin_ioctl_allows_tcgets2_for_shell_terminal_probe() {
+        let rules = crate::security::SeccompManager::minimal_filter_for_test(true, &[]);
+        let prog = compile_bitmap_bpf_with_errno_syscalls(
+            rules,
+            crate::security::SeccompManager::errno_denied_syscalls_for_test(),
+            SeccompAction::KillProcess,
+            SeccompAction::Allow,
+            TargetArch::x86_64,
+        )
+        .unwrap();
+
+        let termios2_query = make_seccomp_data(
+            libc::SYS_ioctl as u32,
+            AUDIT_ARCH_X86_64,
+            [0, libc::TCGETS2, 0, 0, 0, 0],
+        );
+        assert_eq!(bpf_eval(&prog, &termios2_query), RET_ALLOW);
+
+        let unknown_ioctl = make_seccomp_data(
+            libc::SYS_ioctl as u32,
+            AUDIT_ARCH_X86_64,
+            [0, 0x1234, 0, 0, 0, 0],
+        );
+        assert_eq!(bpf_eval(&prog, &unknown_ioctl), RET_KILL);
     }
 
     #[test]

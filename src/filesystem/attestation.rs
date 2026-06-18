@@ -51,6 +51,10 @@ pub fn verify_rootfs_attestation(root: &Path) -> Result<()> {
     compare_manifests(&expected, &actual, "rootfs")
 }
 
+pub fn read_rootfs_attestation(root: &Path) -> Result<DirectoryManifest> {
+    read_manifest_file(&root.join(ROOTFS_ATTESTATION_FILE))
+}
+
 pub fn is_immediate_nix_store_object_path(path: &Path) -> bool {
     immediate_nix_store_object_name(path).is_some()
 }

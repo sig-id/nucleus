@@ -87,6 +87,94 @@
               done > "$manifest"
         '';
 
+      # Helper: build a cold, thin Nucleus image directly from a Nix rootfs.
+      # The resulting store path has the same manifest schema as `nucleus image
+      # commit`, but omits image.sig because the Nix store/substituter signature
+      # is the integrity root for build-time images.
+      lib.mkImage =
+        { pkgs
+        , rootfs
+        , config
+        , name ? "nucleus-image"
+        , parentImageId ? null
+        }:
+        assert pkgs.lib.assertMsg (config ? command) "nucleus.lib.mkImage requires config.command";
+        let
+          imageConfig = {
+            command = config.command;
+            env = config.env or { };
+            workdir = config.workdir or "/workspace";
+            uid = config.uid or 0;
+            gid = config.gid or 0;
+            additional_gids = config.additionalGids or (config.additional_gids or [ ]);
+          };
+          parentImageIdJson = builtins.toJSON parentImageId;
+        in
+        pkgs.runCommand name {
+          nativeBuildInputs = [ pkgs.coreutils pkgs.python3 ];
+          passAsFile = [ "imageConfigJson" ];
+          imageConfigJson = builtins.toJSON imageConfig;
+        } ''
+          mkdir -p "$out"
+          cp "${rootfs}/.nucleus-rootfs-sha256" "$out/rootfs.sha256"
+          cp "${rootfs}/.nucleus-rootfs-store-paths" "$out/store-paths"
+
+          ROOTFS_PATH="${rootfs}" \
+          IMAGE_CONFIG_JSON_PATH="$imageConfigJsonPath" \
+          PARENT_IMAGE_ID_JSON='${parentImageIdJson}' \
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          rootfs = os.environ["ROOTFS_PATH"]
+          out = Path(os.environ["out"])
+          image_config_path = Path(os.environ["IMAGE_CONFIG_JSON_PATH"])
+          image_config_raw = json.loads(image_config_path.read_text())
+          image_config = {
+              "command": list(image_config_raw["command"]),
+              "env": dict(sorted(image_config_raw.get("env", {}).items())),
+              "workdir": image_config_raw.get("workdir", "/workspace"),
+              "uid": int(image_config_raw.get("uid", 0)),
+              "gid": int(image_config_raw.get("gid", 0)),
+              "additional_gids": list(image_config_raw.get("additional_gids", [])),
+          }
+
+          store_paths = sorted({
+              line.strip()
+              for line in (out / "store-paths").read_text().splitlines()
+              if line.strip()
+          })
+          attestation = {}
+          for line in (out / "rootfs.sha256").read_text().splitlines():
+              if not line.strip():
+                  continue
+              digest, rel = line.split("\t", 1)
+              attestation[rel] = digest
+          attestation = dict(sorted(attestation.items()))
+
+          manifest = {
+              "schema_version": 1,
+              "image_id": "",
+              "parent_image_id": json.loads(os.environ["PARENT_IMAGE_ID_JSON"]),
+              "created_at": 0,
+              "nucleus_version": "0.3.8",
+              "base": {
+                  "rootfs_path": rootfs,
+                  "store_paths": store_paths,
+                  "attestation": attestation,
+              },
+              "diff": None,
+              "config": image_config,
+              "live": None,
+          }
+          canonical = json.dumps(manifest, separators=(",", ":")).encode()
+          manifest["image_id"] = hashlib.sha256(canonical).hexdigest()
+          (out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+          PY
+        '';
+
       # Helper: build a reusable rootfs for ephemeral provider agents.
       # This is intentionally broader than mkRootfs's minimal default: Mitos
       # and similar launchers need shells, git, TLS, provider CLIs, compilers,

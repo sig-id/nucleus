@@ -386,6 +386,34 @@ pub struct VolumeMount {
     pub read_only: bool,
 }
 
+/// How a pre-built rootfs is exposed inside the container.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    clap::ValueEnum,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum RootfsMode {
+    /// Bind-mount the rootfs read-only, preserving the historical behavior.
+    #[default]
+    Bind,
+    /// Mount the rootfs through overlayfs with a persistent upperdir.
+    Overlay,
+}
+
+/// Host-side overlayfs paths for a writable rootfs.
+#[derive(Debug, Clone)]
+pub struct RootfsOverlayConfig {
+    pub upperdir: PathBuf,
+    pub workdir: PathBuf,
+}
+
 /// How a host workspace is exposed at `/workspace`.
 #[derive(
     Debug,
@@ -550,6 +578,13 @@ pub struct ContainerConfig {
     /// Pre-built rootfs path (Nix store path). When set, this is bind-mounted
     /// as the container root instead of bind-mounting host /bin, /usr, /lib, etc.
     pub rootfs_path: Option<PathBuf>,
+
+    /// Mount mode for `rootfs_path`.
+    pub rootfs_mode: RootfsMode,
+
+    /// Prepared overlayfs upper/work directories. Normally populated by the
+    /// runtime; image run may pre-seed it from an image diff.
+    pub rootfs_overlay: Option<RootfsOverlayConfig>,
 
     /// Egress policy for audited outbound network access.
     pub egress_policy: Option<EgressPolicy>,
@@ -736,6 +771,8 @@ impl ContainerConfig {
             proc_readonly: true,
             service_mode: ServiceMode::default(),
             rootfs_path: None,
+            rootfs_mode: RootfsMode::default(),
+            rootfs_overlay: None,
             egress_policy: None,
             credential_broker: None,
             health_check: None,
@@ -878,6 +915,18 @@ impl ContainerConfig {
     #[must_use]
     pub fn with_rootfs_path(mut self, path: PathBuf) -> Self {
         self.rootfs_path = Some(path);
+        self
+    }
+
+    #[must_use]
+    pub fn with_rootfs_mode(mut self, mode: RootfsMode) -> Self {
+        self.rootfs_mode = mode;
+        self
+    }
+
+    #[must_use]
+    pub fn with_rootfs_overlay(mut self, upperdir: PathBuf, workdir: PathBuf) -> Self {
+        self.rootfs_overlay = Some(RootfsOverlayConfig { upperdir, workdir });
         self
     }
 
@@ -1226,6 +1275,14 @@ impl ContainerConfig {
             ));
         };
 
+        if self.rootfs_mode == RootfsMode::Overlay {
+            return Err(crate::error::NucleusError::ConfigError(
+                "Production mode does not yet support --rootfs-mode overlay; production mount \
+                 auditing currently requires read-only rootfs bind mounts"
+                    .to_string(),
+            ));
+        }
+
         // L6: Policy files must have SHA-256 verification in production
         if self.caps_policy.is_some() && self.caps_policy_sha256.is_none() {
             return Err(crate::error::NucleusError::ConfigError(
@@ -1380,6 +1437,21 @@ impl ContainerConfig {
         }
 
         self.validate_credential_broker()?;
+
+        if self.rootfs_mode == RootfsMode::Overlay {
+            if self.rootfs_path.is_none() {
+                return Err(crate::error::NucleusError::ConfigError(
+                    "--rootfs-mode overlay requires --rootfs or --agent-toolchain-rootfs"
+                        .to_string(),
+                ));
+            }
+            if self.use_gvisor {
+                return Err(crate::error::NucleusError::ConfigError(
+                    "--rootfs-mode overlay is currently supported only with --runtime native"
+                        .to_string(),
+                ));
+            }
+        }
 
         if !self.use_gvisor {
             return Ok(());

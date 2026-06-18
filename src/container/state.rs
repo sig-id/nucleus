@@ -1,3 +1,4 @@
+use crate::container::RootfsMode;
 use crate::error::{NucleusError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -103,6 +104,22 @@ pub struct ContainerState {
     /// OCI annotations
     #[serde(default)]
     pub annotations: HashMap<String, String>,
+
+    /// Rootfs path used to launch the container, if any.
+    #[serde(default)]
+    pub rootfs_path: Option<String>,
+
+    /// Rootfs mount mode used at launch.
+    #[serde(default)]
+    pub rootfs_mode: RootfsMode,
+
+    /// Persistent overlayfs upperdir for image commit, if rootfs_mode=overlay.
+    #[serde(default)]
+    pub rootfs_upperdir: Option<String>,
+
+    /// Persistent overlayfs workdir paired with rootfs_upperdir.
+    #[serde(default)]
+    pub rootfs_workdir: Option<String>,
 }
 
 fn default_oci_status() -> OciStatus {
@@ -155,6 +172,10 @@ impl ContainerState {
             status: OciStatus::Creating,
             bundle_path: None,
             annotations: HashMap::new(),
+            rootfs_path: None,
+            rootfs_mode: RootfsMode::Bind,
+            rootfs_upperdir: None,
+            rootfs_workdir: None,
         }
     }
 
@@ -503,6 +524,14 @@ impl ContainerStateManager {
     pub fn exec_fifo_path(&self, container_id: &str) -> Result<PathBuf> {
         Self::validate_container_id(container_id)?;
         Ok(self.state_dir.join(format!("{}.exec", container_id)))
+    }
+
+    /// Return the persistent overlayfs state directory for a container.
+    pub fn rootfs_overlay_dir_path(&self, container_id: &str) -> Result<PathBuf> {
+        Self::validate_container_id(container_id)?;
+        Ok(self
+            .state_dir
+            .join(format!("{}.rootfs-overlay", container_id)))
     }
 
     /// Resolve a container reference by exact ID, name, or ID prefix

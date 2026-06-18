@@ -5,19 +5,19 @@
 
 **Extremely lightweight, security-hardened, declarative container runtime for agents and production services**
 
-Nucleus is a minimalist container runtime for Linux. It provides isolated execution environments using Linux kernel primitives without the overhead of traditional container runtimes. For production services, it is designed around a fully declarative model: Nix builds the root filesystem, the NixOS module declares the service, and Nucleus mounts a pinned, reproducible closure at runtime.
+Nucleus is a minimalist container runtime for Linux. It provides isolated execution environments using Linux kernel primitives without the overhead of traditional container runtimes. For production services, it is designed around a fully declarative model: Nix builds the root filesystem or image, the NixOS module declares the service, and Nucleus mounts pinned, reproducible runtime inputs.
 
 Nucleus supports three operating modes:
 
 - **Agent mode** (default) – ephemeral, fast-startup sandboxes for AI agent workloads
 - **Strict agent mode** – fail-closed isolation for ephemeral agent workloads without requiring production rootfs, health checks, sd_notify, or NixOS service semantics
-- **Production mode** – strict isolation for long-running, network-bound NixOS services with declarative configuration, reproducible Nix-built root filesystems, egress policy enforcement, health checks, and systemd integration
+- **Production mode** – strict isolation for long-running, network-bound NixOS services with declarative configuration, reproducible Nix-built root filesystems/images, egress policy enforcement, health checks, and systemd integration
 
 Production deployments are built to be:
 
-- **Fully declarative** – service topology, runtime settings, and mounted rootfs are defined up front instead of assembled imperatively at deploy time
-- **Nix-native** – first-class NixOS module support plus `nucleus.lib.mkRootfs` for minimal service closures
-- **Reproducible** – flake-based builds, pinned store paths, and rootfs attestation keep runtime inputs stable and auditable
+- **Fully declarative** – service topology, runtime settings, mounted rootfs, and optional images are defined up front instead of assembled imperatively at deploy time
+- **Nix-native** – first-class NixOS module support plus `nucleus.lib.mkRootfs` and `nucleus.lib.mkImage` for minimal service closures
+- **Reproducible** – flake-based builds, pinned store paths, rootfs attestation, and image signatures keep runtime inputs stable and auditable
 
 ## Benchmarks
 
@@ -60,20 +60,21 @@ benchmark noise rather than a guaranteed speedup.
 ## Why Nucleus?
 
 - **Declarative by default for services** – Production deployments are defined in NixOS and TOML rather than stitched together with ad hoc runtime scripting
-- **Deep Nix integration** – First-class NixOS module, `mkRootfs`, and Nix store closures for minimal, locked-down service roots
-- **Reproducible service builds** – Flake-based packaging, pinned inputs, and rootfs attestation make runtime state auditable and repeatable
+- **Deep Nix integration** – First-class NixOS module, `mkRootfs`, `mkImage`, and Nix store closures for minimal, locked-down service roots
+- **Reproducible service builds** – Flake-based packaging, pinned inputs, rootfs attestation, and image signatures make runtime state auditable and repeatable
 - **Zero-overhead isolation** – Direct use of cgroups, namespaces, pivot_root, capabilities, seccomp, and Landlock
 - **Memory-backed filesystems** – Container disk mapped to tmpfs, pre-populated with agent context
 - **gVisor integration** – Optional application kernel for enhanced security, including networked service mode
 - **OCI runtime-spec subset for gVisor** – Generates OCI bundle/config data for `runsc`, including process identity, mounts, namespaces, seccomp, hooks, and cgroup path wiring
 - **Detached mode** – Run containers in the background as systemd transient services with `--detach`, managed via `nucleus stop`/`logs`/`attach`
-- **Production service support** – Declarative NixOS module, egress policies, health checks, secrets mounting, sd_notify, and journald integration
+- **Production service support** – Declarative NixOS module, egress policies, credential-broker egress, health checks, secrets mounting, sd_notify, and journald integration
 - **Explicit workload identity** – Native and gVisor runtimes can drop to a configured `uid`/`gid` plus supplementary groups after privileged setup
-- **Minimal rootfs** – Replace host bind mounts with a purpose-built Nix store closure for production services
+- **Minimal rootfs** – Replace host bind mounts with a purpose-built Nix store closure or Nix-built image for production services
+- **Local image snapshots** – Commit native overlay-backed containers to signed, thin image directories, then verify, inspect, and run them later
 - **External security policies** – Per-service seccomp profiles (JSON), capability policies (TOML), and Landlock rules (TOML) with SHA-256 pinning
 - **Seccomp profile generation** – Trace mode records syscalls, then `nucleus seccomp generate` creates a minimal allowlist profile
 - **Multi-container topologies** – Compose-equivalent TOML format with dependency DAG, reconciliation, and NixOS systemd integration
-- **Integrity & audit controls** – Structured audit log, machine-readable lifecycle event streams, context hashing, rootfs attestation, seccomp deny logging, mount flag verification, and kernel lockdown assertions
+- **Integrity & audit controls** – Structured audit log, machine-readable lifecycle event streams, context hashing, rootfs attestation, image signatures, seccomp deny logging, mount flag verification, and kernel lockdown assertions
 - **Structured telemetry** – Optional OpenTelemetry export for container lifecycle tracing
 - **Linux-native** – Runs on standard Linux and NixOS
 
@@ -82,13 +83,15 @@ benchmark noise rather than a guaranteed speedup.
 Nucleus is **not** a drop-in Docker replacement, nor a strict subset of Docker.
 The feature sets overlap, but each tool does things the other does not. Nucleus is
 a hardened sandbox runtime (closer in spirit to `runc`/`gVisor`) that also does
-lightweight, declarative single-host orchestration. It drops the image-and-distribution
-half of Docker in exchange for deeper isolation, policy, and reproducibility.
+lightweight, declarative single-host orchestration. It drops Docker's build DSL,
+registry, and distribution workflow in exchange for deeper isolation, policy,
+and reproducibility. Local signed image snapshots are available, but they are
+not Docker/OCI images.
 
 | Capability | Docker | Nucleus |
 |---|---|---|
-| Root filesystem | Layered image (union mount) | tmpfs directory (agent) or Nix closure (production) |
-| Images / Dockerfile / registry | Yes | No — no images, layers, `pull`/`push`, or OCI *image* spec |
+| Root filesystem | Layered image (union mount) | tmpfs directory (agent), Nix closure (production), or overlay-backed Nix closure for snapshots |
+| Images / Dockerfile / registry | Yes | Signed local thin snapshots and Nix-built image manifests; no Dockerfile, registry, `pull`/`push`, or OCI *image* spec |
 | Persistent storage | Named volumes + storage drivers | Ephemeral tmpfs; persistence only via explicit `--volume` binds |
 | Architecture | `dockerd` daemon + socket API | Single binary, direct fork/exec; detached = systemd transient unit |
 | Networking | CNI plugins, overlay networks | `none` / `host` / `bridge` only |
@@ -97,13 +100,15 @@ half of Docker in exchange for deeper isolation, policy, and reproducibility.
 | Filesystem ACLs | AppArmor/SELinux profiles | Landlock LSM, per-service, irreversible |
 | gVisor | Optional add-on runtime | First-class integrated runtime with explicit network modes |
 | Security policies | Bundled defaults | Externalized seccomp/caps/Landlock, SHA-256 pinned + trace-generated |
-| Reproducibility | Image digests | Nix closures, rootfs attestation, first-class NixOS module |
+| Reproducibility | Image digests | Nix closures, rootfs attestation, image signatures, first-class NixOS module |
 | Verification | — | TLA+ specs + model-based tests across subsystems |
 | Default hardening | ~300 syscalls, some caps kept | All caps dropped, small seccomp allowlist, up to 8 namespaces |
 
-If your mental model is "run my image instead of `docker run`," it will not fit:
-there are no images, no registry, and no persistent state. If it is "run untrusted
-or ephemeral workloads with stronger, auditable isolation," that is the target.
+If your mental model is "run my Docker image instead of `docker run`," it will
+not fit: there is no Dockerfile, registry, pull/push lifecycle, or implicit
+persistent state. Nucleus images are local signed snapshots or Nix-built
+manifests over Nix rootfs closures. If your model is "run untrusted or ephemeral
+workloads with stronger, auditable isolation," that is the target.
 
 ## Architecture
 
@@ -117,11 +122,12 @@ Nucleus leverages Linux kernel isolation primitives:
 - **Landlock** – Path-based filesystem access control via hardcoded defaults or TOML policy file (Linux 5.13+)
 - **gVisor** – Optional application kernel (runsc) with none, bridge handoff, and explicit gvisor-host network modes
 - **OCI bundle generation** – Emits OCI `config.json` plus bundle layout for gVisor, including `process.user`, lifecycle hooks, seccomp, resource limits, and namespace mappings
+- **Image snapshots** – Local signed manifests with optional overlay diffs rooted in attested Nix rootfs closures
 - **PID 1 init** – Mini-init supervisor in production mode for zombie reaping and signal forwarding
 - **In-memory secrets** – Dedicated tmpfs at `/run/secrets` with volatile zeroing of source buffers
 - **Mount audit** – Post-setup verification of mount flags in production mode
 
-Container filesystem is backed by tmpfs and either populated with context files (agent mode) or mounted from a pre-built Nix rootfs closure (production mode). That lets production services run from a declaratively built, reproducible root filesystem instead of inheriting mutable host state.
+Container filesystem is backed by tmpfs and either populated with context files (agent mode) or mounted from a pre-built Nix rootfs closure (production mode). Snapshot workflows can mount that Nix rootfs with a writable native overlay and commit the overlay upperdir as a signed local image. That lets services run from declaratively built, reproducible filesystem inputs instead of inheriting mutable host state.
 
 ## Platform Support
 
@@ -145,6 +151,7 @@ The Cargo package name is `nucleus-container`; it installs the `nucleus` binary.
 
 ## Recent Features
 
+- **Local signed image snapshots** – Native overlay-backed containers can be committed, verified, inspected, loaded, and run as thin image directories over a Nix rootfs base.
 - **Privilege drop for services** – `--user`, `--group`, and `--additional-group` now apply a real post-setup workload identity in both the native runtime and gVisor.
 - **Ownership-aware secrets and writable paths** – Production secret staging and NixOS `createHostPath = true` defaults now align file ownership with the configured workload user/group.
 - **OCI bundle identity support** – Generated gVisor OCI configs now carry `process.user` including supplementary groups, alongside namespaces, mounts, resource limits, seccomp, hooks, and `cgroupsPath`.
@@ -330,6 +337,43 @@ The repository also exposes `packages.${system}.agent-toolchain-rootfs` as a
 default shell/Git/compiler/package-manager rootfs. Integrations that need exact
 provider CLIs should call `mkAgentToolchainRootfs` with pinned provider package
 derivations and pass the resulting store path to `--agent-toolchain-rootfs`.
+
+### Image Snapshots
+
+Nucleus images are local directories containing a manifest, rootfs attestation,
+store path list, optional overlay diff, and a signature for runtime-committed
+images. They are not OCI/Docker images and are not pushed to or pulled from a
+registry.
+
+```bash
+# Start an overlay-backed native container from a Nix rootfs
+nucleus create -d \
+  --name worker \
+  --runtime native \
+  --trust-level trusted \
+  --rootfs /nix/store/...-worker-rootfs \
+  --rootfs-mode overlay \
+  -- /bin/sh -c 'echo committed > /tmp/result; sleep 3600'
+
+# Commit the overlay upperdir as a signed thin image
+nucleus image commit worker -o ./worker.nucleus-image
+
+# Verify/load and inspect the image
+nucleus image load ./worker.nucleus-image
+nucleus image inspect ./worker.nucleus-image
+
+# Run the manifest command, or override it after --
+nucleus image run ./worker.nucleus-image -- /bin/cat /tmp/result
+```
+
+`nucleus image commit` requires a container launched with `--rootfs-mode
+overlay`; overlay rootfs mode is currently native-runtime only and production
+mode rejects it. Runtime-committed images are signed with a host-local HMAC key.
+Set `NUCLEUS_IMAGE_HMAC_KEY_FILE` to pin that key path; otherwise Nucleus creates
+an owner-only key under `/var/lib/nucleus` for root or the user's data directory
+for non-root runs. Nix-built images from `nucleus.lib.mkImage` live in
+`/nix/store` and omit `image.sig` because Nix store/substituter trust is the
+integrity root.
 
 ### Detached Mode
 
@@ -700,6 +744,11 @@ in
       egressDomains = [ "api.example.com" ];
       egressTcpPorts = [ 443 8443 ];
 
+      # Credential broker alternative for bearer-token APIs.
+      # Mutually exclusive with egressAllow / egressDomains above.
+      # credentialBroker = "10.0.42.1:8080";
+      # credentialBrokerNoProxyEnv = false;
+
       # Health checking
       healthCheck = "curl -sf http://localhost:8080/health";
       healthInterval = 30;
@@ -746,6 +795,15 @@ in
 Writable bind volumes are automatically added to the generated systemd unit's `ReadWritePaths`. When `createHostPath = true`, the NixOS module creates the host directory with `systemd-tmpfiles` before the container starts. If the container declares a workload `user`/`group`, those become the default tmpfiles owner for new writable paths unless the volume overrides them.
 
 Credentials declared via `credentials = [ ... ]` use systemd's credential pipeline (`LoadCredential` or `LoadCredentialEncrypted`) and are mounted into the container through Nucleus's secret path. The CLI flag `--systemd-credential NAME:DEST` resolves `NAME` from `CREDENTIALS_DIRECTORY` at runtime.
+
+For bearer-token API clients, the NixOS module exposes `credentialBroker = "IP:PORT";` and `credentialBrokerNoProxyEnv = true;`. This maps to `--credential-broker` and installs broker-only egress, so leave `egressAllow`, `egressDomains`, and egress port allowlists empty when using it.
+
+Set `image = appImage;` instead of `rootfs = proxyRootfs;` when a service should
+consume a Nix-built image produced by `nucleus.lib.mkImage`. `rootfs` and
+`image` are mutually exclusive. When `command = [ ];`, the module uses the image
+manifest command. The NixOS production launcher currently supports build-time
+images without overlay diffs; committed runtime image diffs are a local CLI
+workflow.
 
 Set `user`, `group`, and optional `supplementaryGroups` on a NixOS container definition when the workload should run as a dedicated service account instead of root.
 
@@ -807,11 +865,61 @@ instead. It layers a broad agent development toolchain on top of `mkRootfs`,
 keeps `/bin/sh` and `/usr/bin/env` compatibility paths available, and accepts
 provider CLI packages through `providerPackages`.
 
+### Building an Image
+
+Use `nucleus.lib.mkImage` to package a Nix rootfs plus default process config as
+a reproducible Nucleus image:
+
+```nix
+let
+  appRootfs = nucleus.lib.mkRootfs {
+    inherit pkgs;
+    name = "my-service-rootfs";
+    packages = [
+      my-service-package
+      pkgs.cacert
+      pkgs.curl
+    ];
+  };
+
+  appImage = nucleus.lib.mkImage {
+    inherit pkgs;
+    name = "my-service-image";
+    rootfs = appRootfs;
+    config = {
+      command = [ "/bin/my-service" "--config" "/etc/my-service.toml" ];
+      env = {
+        RUST_LOG = "info";
+      };
+      workdir = "/";
+      uid = 0;
+      gid = 0;
+    };
+  };
+in
+{
+  services.nucleus.containers.my-service = {
+    enable = true;
+    image = appImage;
+    command = [ ]; # use the image manifest command
+    memory = "512M";
+    cpus = 1.0;
+  };
+}
+```
+
+`mkImage` writes `manifest.json`, `rootfs.sha256`, and `store-paths` into a Nix
+store output. Build-time images are cold and thin: the rootfs remains a Nix
+store path, and the image manifest has no overlay diff unless it was produced by
+the CLI `nucleus image commit` workflow.
+
 ## Security Notes
 
 **Do not pass secrets via `-e` / `--env`.** Environment variables are visible in `/proc/<pid>/environ` to any process that can read it (mitigated by `hidepid=2` in production mode, but not in agent mode). Use `--secret` instead when a file works. If a provider CLI requires sensitive environment variables, use `--env-fd FD`; the fd carries a JSON object such as `{"OPENAI_API_KEY":"..."}` or a JSON array of `KEY=VALUE` strings so the values are not exposed through Nucleus argv.
 
 **Prefer credential brokers for bearer-token APIs.** If untrusted code can drive a provider CLI, do not place the bearer token in the sandbox environment. Run a host-side broker that holds the credential, injects it into approved upstream requests, rate-limits and audits usage, and start Nucleus with `--credential-broker IP:PORT` so the sandbox can only reach that broker endpoint.
+
+**Protect the local image signing key.** Runtime-committed image directories are verified with the host-local HMAC key selected by `NUCLEUS_IMAGE_HMAC_KEY_FILE` or the default owner-only key path. Treat that file like deployment signing material: do not share it across trust domains unless those hosts should be able to trust and produce each other's local image snapshots.
 
 **Privilege dropping is explicit.** Nucleus must start with elevated privileges to create namespaces, mount filesystems, and configure cgroups/networking. Use `--user` / `--group` (or the NixOS module's `user` / `group` options) so the workload itself does not continue running as root after setup. In production mode, staged secrets under `/run/secrets` are re-owned to that workload identity.
 
@@ -827,7 +935,7 @@ provider CLI packages through `providerPackages`.
 | Host networking | Allowed with flag | Native `host` forbidden; `gvisor-host` allowed with gVisor + explicit opt-in | Native `host` forbidden; `gvisor-host` allowed with gVisor + explicit opt-in |
 | Cgroup limits | Best-effort | Required (fatal on create/apply failure) | Required (fatal on create/apply failure) |
 | Bridge DNS | Defaults to 8.8.8.8/8.8.4.4 | Must be configured explicitly | Must be configured explicitly |
-| Rootfs | Host bind mounts unless `--rootfs` or `--agent-toolchain-rootfs` is supplied | Host bind mounts unless `--rootfs` or `--agent-toolchain-rootfs` is supplied | Pre-built Nix closure (`--rootfs`) |
+| Rootfs | Host bind mounts unless `--rootfs` (optionally with `--rootfs-mode overlay`) or `--agent-toolchain-rootfs` is supplied | Host bind mounts unless `--rootfs` (optionally with `--rootfs-mode overlay`) or `--agent-toolchain-rootfs` is supplied | Pre-built Nix closure (`--rootfs`) or build-time `mkImage` image without an overlay diff |
 | Workspace | Optional `/workspace`; bind/copy-in-out for agents | Optional `/workspace`; bind/copy-in-out for agents | Optional, non-executable unless read-only or policy-specific |
 | Egress policy | Optional | Optional | Deny-all default where enforceable; unavailable with `gvisor-host` |
 | Memory limit | Optional | Optional | Required |
@@ -1010,6 +1118,7 @@ nucleus/
 │   ├── isolation/      # Namespace management, user mapping, attach
 │   ├── resources/      # cgroup v2 resource control, stats
 │   ├── filesystem/     # tmpfs, rootfs mounting, context population, secrets, attestation
+│   ├── image/          # Local signed image manifests, diff export/import, verification
 │   ├── security/       # Capabilities, seccomp, Landlock, gVisor, OCI, policy files
 │   │   ├── caps_policy.rs       # TOML capability policy loader
 │   │   ├── landlock_policy.rs   # TOML Landlock policy loader
@@ -1036,7 +1145,7 @@ nucleus/
 │   └── tla_*           # tla-connect driver tests
 ├── formal/tla/         # TLA+ formal specifications
 ├── intent/             # Intent high-level specs
-└── flake.nix           # Nix flake (packages, modules, lib.mkRootfs)
+└── flake.nix           # Nix flake (packages, modules, lib.mkRootfs, lib.mkImage)
 ```
 
 ### Testing

@@ -6,8 +6,8 @@ use nucleus::container::{
     parse_signal, validate_container_name, validate_hostname, ConsoleSize, Container,
     ContainerConfig, ContainerLifecycle, ContainerState, ContainerStateManager,
     ContainerStateParams, HealthCheck, KernelLockdownMode, NetworkModeArg, OciStatus,
-    ProcessIdentity, ProviderConfigMount, ReadinessProbe, RuntimeSelection, SeccompMode,
-    SecretMount, ServiceMode, TrustLevel, VolumeMount, VolumeSource, WorkspaceConfig,
+    ProcessIdentity, ProviderConfigMount, ReadinessProbe, RootfsMode, RuntimeSelection,
+    SeccompMode, SecretMount, ServiceMode, TrustLevel, VolumeMount, VolumeSource, WorkspaceConfig,
     WorkspaceMode, DEFAULT_HOME_PATH,
 };
 use nucleus::error::{NucleusError, Result};
@@ -16,6 +16,7 @@ use nucleus::filesystem::{
     normalize_volume_destination, validate_agent_toolchain_rootfs_path, validate_bind_mount_source,
     validate_provider_config_source, validate_workspace_host_path, ContextMode,
 };
+use nucleus::image::{self, ImageCommitOptions};
 use nucleus::isolation::{ContainerAttach, NamespaceConfig};
 use nucleus::network::{
     BridgeConfig, CredentialBrokerConfig, EgressPolicy, NatBackend, NetworkMode, PortForward,
@@ -26,6 +27,7 @@ use nucleus::topology::{
     execute_reconcile, plan_reconcile, DependencyGraph, ReconcileAction, TopologyConfig,
 };
 use serde::{Deserialize, Serialize};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use tracing::info;
@@ -622,6 +624,7 @@ const RUN_CONFIG_PATH_CONFLICTS: &[&str] = &[
     "service_mode",
     "strict_agent",
     "rootfs",
+    "rootfs_mode",
     "agent_toolchain_rootfs",
     "egress_allow",
     "egress_domains",
@@ -710,6 +713,7 @@ const RUN_CONFIG_FD_CONFLICTS: &[&str] = &[
     "service_mode",
     "strict_agent",
     "rootfs",
+    "rootfs_mode",
     "agent_toolchain_rootfs",
     "egress_allow",
     "egress_domains",
@@ -934,6 +938,10 @@ enum Commands {
         /// Pre-built rootfs path (Nix store closure). Replaces host bind mounts.
         #[arg(long)]
         rootfs: Option<String>,
+
+        /// Rootfs mount mode: bind (read-only) or overlay (writable upperdir)
+        #[arg(long = "rootfs-mode", default_value = "bind")]
+        rootfs_mode: RootfsMode,
 
         /// Agent/strict-agent rootfs containing provider CLIs and developer tools
         #[arg(long = "agent-toolchain-rootfs", conflicts_with = "rootfs")]
@@ -1204,6 +1212,10 @@ enum Commands {
         input: String,
     },
 
+    /// Manage Nucleus image snapshots
+    #[command(subcommand)]
+    Image(ImageCommands),
+
     /// View logs for a detached container (from systemd journal)
     Logs {
         /// Container ID, name, or ID prefix
@@ -1237,6 +1249,53 @@ enum SeccompCommands {
         /// Output file (default: stdout)
         #[arg(short, long)]
         output: Option<String>,
+    },
+}
+
+#[derive(Parser, Debug)]
+enum ImageCommands {
+    /// Commit an overlay-backed container to a cold thin image
+    Commit {
+        /// Container ID, name, or ID prefix
+        container: String,
+
+        /// Output directory for image data
+        #[arg(short, long)]
+        output: String,
+
+        /// Embed a closure export for air-gapped transfer
+        #[arg(long)]
+        fat: bool,
+
+        /// Include a CRIU checkpoint for a live snapshot
+        #[arg(long)]
+        live: bool,
+
+        /// External signing key path
+        #[arg(long)]
+        sign: Option<PathBuf>,
+    },
+
+    /// Run a cold image snapshot
+    Run {
+        /// Image directory
+        image: String,
+
+        /// Override the manifest command
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
+
+    /// Verify an image and print its manifest
+    Inspect {
+        /// Image directory
+        image: String,
+    },
+
+    /// Verify/load an image artifact
+    Load {
+        /// Image directory
+        image: String,
     },
 }
 
@@ -1330,6 +1389,8 @@ struct RunConfig {
     strict_agent: bool,
     rootfs: Option<String>,
     #[serde(default)]
+    rootfs_mode: RootfsMode,
+    #[serde(default)]
     agent_toolchain_rootfs: Option<String>,
     egress_allow: Vec<String>,
     #[serde(default)]
@@ -1421,6 +1482,7 @@ impl Default for RunConfig {
             service_mode: ServiceMode::Agent,
             strict_agent: false,
             rootfs: None,
+            rootfs_mode: RootfsMode::Bind,
             agent_toolchain_rootfs: None,
             egress_allow: Vec::new(),
             egress_domains: Vec::new(),
@@ -1817,6 +1879,118 @@ fn try_main() -> Result<i32> {
             Ok(0)
         }
 
+        Commands::Image(image_cmd) => match image_cmd {
+            ImageCommands::Commit {
+                container,
+                output,
+                fat,
+                live,
+                sign,
+            } => {
+                let state_mgr = ContainerStateManager::new_with_root(state_root.clone())?;
+                let state = state_mgr.resolve_container(&container)?;
+                let manifest = image::commit_container_image(
+                    &state,
+                    &PathBuf::from(&output),
+                    &ImageCommitOptions {
+                        fat,
+                        live,
+                        sign_key: sign,
+                    },
+                )?;
+                println!("{}", manifest.image_id);
+                Ok(0)
+            }
+            ImageCommands::Run { image, args } => {
+                let image_dir = PathBuf::from(&image);
+                let manifest = image::load_image(&image_dir)?;
+                let command = if args.is_empty() {
+                    manifest.config.command.clone()
+                } else {
+                    args
+                };
+                if command.is_empty() {
+                    return Err(NucleusError::ConfigError(
+                        "Image manifest has no command; pass one after --".to_string(),
+                    ));
+                }
+
+                let mut config = ContainerConfig::try_new(None, command)?
+                    .with_gvisor(false)
+                    .with_trust_level(TrustLevel::Trusted)
+                    .with_rootfs_path(PathBuf::from(&manifest.base.rootfs_path))
+                    .with_rootfs_mode(RootfsMode::Overlay)
+                    .with_workdir(normalize_container_destination(Path::new(
+                        &manifest.config.workdir,
+                    ))?)
+                    .with_process_identity(ProcessIdentity {
+                        uid: manifest.config.uid,
+                        gid: manifest.config.gid,
+                        additional_gids: manifest.config.additional_gids.clone(),
+                    });
+                for (key, value) in manifest.config.env.clone() {
+                    config = config.with_env(key, value);
+                }
+                if let Some(ref root) = state_root {
+                    config = config.with_state_root(root.clone());
+                }
+
+                let state_mgr = ContainerStateManager::new_with_root(state_root.clone())?;
+                let overlay_dir = state_mgr.rootfs_overlay_dir_path(&config.id)?;
+                if overlay_dir.exists() {
+                    return Err(NucleusError::ConfigError(format!(
+                        "Image run overlay directory already exists: {}",
+                        overlay_dir.display()
+                    )));
+                }
+                std::fs::create_dir(&overlay_dir).map_err(|e| {
+                    NucleusError::FilesystemError(format!(
+                        "Failed to create image run overlay dir {:?}: {}",
+                        overlay_dir, e
+                    ))
+                })?;
+                std::fs::set_permissions(&overlay_dir, std::fs::Permissions::from_mode(0o700))
+                    .map_err(|e| {
+                        NucleusError::FilesystemError(format!(
+                            "Failed to secure image run overlay dir {:?}: {}",
+                            overlay_dir, e
+                        ))
+                    })?;
+                let upperdir = overlay_dir.join("upper");
+                let workdir = overlay_dir.join("work");
+                std::fs::create_dir(&upperdir).map_err(|e| {
+                    NucleusError::FilesystemError(format!(
+                        "Failed to create image run upperdir {:?}: {}",
+                        upperdir, e
+                    ))
+                })?;
+                std::fs::create_dir(&workdir).map_err(|e| {
+                    NucleusError::FilesystemError(format!(
+                        "Failed to create image run workdir {:?}: {}",
+                        workdir, e
+                    ))
+                })?;
+                image::copy_image_diff_to_upper(&image_dir, &upperdir)?;
+                config = config.with_rootfs_overlay(upperdir, workdir);
+
+                println!("{}", config.id);
+                let event_sink =
+                    nucleus::telemetry::EventSink::from_cli(events_fd, events_jsonl.as_deref())?;
+                let container = Container::new(config).with_event_sink(event_sink);
+                container.run()
+            }
+            ImageCommands::Inspect { image } => {
+                let manifest = image::load_image(&PathBuf::from(&image))?;
+                println!("{}", serde_json::to_string_pretty(&manifest)?);
+                Ok(0)
+            }
+            ImageCommands::Load { image } => {
+                let manifest = image::load_image(&PathBuf::from(&image))?;
+                println!("Image {} verified", manifest.image_id);
+                Ok(0)
+            }
+        },
+
         Commands::Create {
             config,
             config_fd,
@@ -1859,6 +2033,7 @@ fn try_main() -> Result<i32> {
             service_mode,
             strict_agent,
             rootfs,
+            rootfs_mode,
             agent_toolchain_rootfs,
             egress_allow,
             egress_domains,
@@ -1962,6 +2137,7 @@ fn try_main() -> Result<i32> {
                     service_mode,
                     strict_agent,
                     rootfs,
+                    rootfs_mode,
                     agent_toolchain_rootfs,
                     egress_allow,
                     egress_domains,
@@ -2155,6 +2331,7 @@ fn try_main() -> Result<i32> {
                 service_mode,
                 strict_agent,
                 rootfs,
+                rootfs_mode,
                 agent_toolchain_rootfs,
                 egress_allow,
                 egress_domains,
@@ -2298,6 +2475,7 @@ fn try_main() -> Result<i32> {
                 .with_trust_level(trust_level)
                 .with_proc_readonly(!proc_rw)
                 .with_service_mode(service_mode)
+                .with_rootfs_mode(rootfs_mode)
                 .with_sd_notify(sd_notify)
                 .with_seccomp_log_denied(seccomp_log_denied)
                 .with_verify_context_integrity(verify_context_integrity)
@@ -3006,6 +3184,7 @@ mod tests {
             service_mode: ServiceMode::Production,
             strict_agent: false,
             rootfs: Some("/nix/store/rootfs".to_string()),
+            rootfs_mode: RootfsMode::Overlay,
             agent_toolchain_rootfs: None,
             egress_allow: vec!["10.0.0.0/8".to_string()],
             egress_domains: vec!["api.example.com".to_string()],
@@ -3062,6 +3241,7 @@ mod tests {
         let encoded = serde_json::to_string(&request).unwrap();
         let decoded: RunConfig = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded.command, request.command);
+        assert_eq!(decoded.rootfs_mode, RootfsMode::Overlay);
         assert_eq!(decoded.publish, request.publish);
         assert_eq!(decoded.egress_domains, request.egress_domains);
         assert_eq!(decoded.credential_broker, request.credential_broker);
@@ -3113,6 +3293,7 @@ mod tests {
             service_mode: ServiceMode::Agent,
             strict_agent: false,
             rootfs: None,
+            rootfs_mode: RootfsMode::Bind,
             agent_toolchain_rootfs: None,
             egress_allow: Vec::new(),
             egress_domains: Vec::new(),
@@ -3397,6 +3578,82 @@ service_mode = "strict-agent"
             err.to_string().contains("cannot be used with"),
             "expected clap conflict, got: {err}"
         );
+    }
+
+    #[test]
+    fn test_rootfs_mode_overlay_flag_parses() {
+        let cli = Cli::try_parse_from([
+            "nucleus",
+            "create",
+            "--runtime",
+            "native",
+            "--rootfs",
+            "/tmp/rootfs",
+            "--rootfs-mode",
+            "overlay",
+            "--",
+            "/bin/true",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Create { rootfs_mode, .. } => {
+                assert_eq!(rootfs_mode, RootfsMode::Overlay);
+            }
+            _ => panic!("expected create command"),
+        }
+    }
+
+    #[test]
+    fn test_image_commit_cli_parses() {
+        let cli = Cli::try_parse_from([
+            "nucleus",
+            "image",
+            "commit",
+            "worker",
+            "--output",
+            "/tmp/worker.nucleus-image",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Image(ImageCommands::Commit {
+                container,
+                output,
+                fat,
+                live,
+                sign,
+            }) => {
+                assert_eq!(container, "worker");
+                assert_eq!(output, "/tmp/worker.nucleus-image");
+                assert!(!fat);
+                assert!(!live);
+                assert!(sign.is_none());
+            }
+            _ => panic!("expected image commit command"),
+        }
+    }
+
+    #[test]
+    fn test_image_run_cli_accepts_command_override() {
+        let cli = Cli::try_parse_from([
+            "nucleus",
+            "image",
+            "run",
+            "/tmp/worker.nucleus-image",
+            "--",
+            "/bin/echo",
+            "ok",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Image(ImageCommands::Run { image, args }) => {
+                assert_eq!(image, "/tmp/worker.nucleus-image");
+                assert_eq!(args, vec!["/bin/echo".to_string(), "ok".to_string()]);
+            }
+            _ => panic!("expected image run command"),
+        }
     }
 
     #[test]

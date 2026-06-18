@@ -11,6 +11,7 @@ pub mod checkpoint;
 pub mod container;
 pub mod error;
 pub mod filesystem;
+pub mod image;
 pub mod isolation;
 pub mod network;
 pub mod oci;
