@@ -159,6 +159,13 @@ impl Container {
                 debug!("Blocking dangerous environment variable: {}", key);
                 continue;
             }
+            if self.config.credential_broker_owns_env(key) {
+                debug!(
+                    "Ignoring user-supplied credential broker identity environment variable: {}",
+                    key
+                );
+                continue;
+            }
             env.push(CString::new(format!("{}={}", key, value)).map_err(|e| {
                 NucleusError::ExecError(format!(
                     "Invalid environment variable value for {}: {}",
@@ -176,12 +183,15 @@ impl Container {
                 debug!("Blocking dangerous derived environment variable: {}", key);
                 continue;
             }
-            // User env wins over derived env on key collision.
-            if self
-                .config
-                .environment
-                .iter()
-                .any(|(existing_key, _)| existing_key == key)
+            // User env wins over generic derived env on key collision. Broker
+            // identity is security-sensitive launch state and remains
+            // authoritative in broker mode.
+            if !self.config.credential_broker_owns_env(key)
+                && self
+                    .config
+                    .environment
+                    .iter()
+                    .any(|(existing_key, _)| existing_key == key)
             {
                 continue;
             }

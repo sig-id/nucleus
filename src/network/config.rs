@@ -426,6 +426,18 @@ impl CredentialBrokerConfig {
         Ok(())
     }
 
+    pub fn validate_for_bridge(&self, bridge: &BridgeConfig) -> Result<(), String> {
+        self.validate()?;
+        let gateway = bridge.gateway_ipv4()?;
+        if self.broker_ip != gateway {
+            return Err(format!(
+                "Credential broker IP must be the host-side bridge address {} for subnet {}, got {}",
+                gateway, bridge.subnet, self.broker_ip
+            ));
+        }
+        Ok(())
+    }
+
     pub fn broker_cidr(&self) -> String {
         format!("{}/32", self.broker_ip)
     }

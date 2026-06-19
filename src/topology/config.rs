@@ -418,18 +418,36 @@ impl TopologyConfig {
             }
 
             if let Some(endpoint) = &svc.credential_broker {
-                crate::network::CredentialBrokerConfig::parse_endpoint(endpoint).map_err(|e| {
-                    crate::error::NucleusError::ConfigError(format!(
-                        "Service '{}' has invalid credential_broker '{}': {}",
-                        name, endpoint, e
-                    ))
-                })?;
+                let broker = crate::network::CredentialBrokerConfig::parse_endpoint(endpoint)
+                    .map_err(|e| {
+                        crate::error::NucleusError::ConfigError(format!(
+                            "Service '{}' has invalid credential_broker '{}': {}",
+                            name, endpoint, e
+                        ))
+                    })?;
                 if svc.networks.is_empty() {
                     return Err(crate::error::NucleusError::ConfigError(format!(
                         "Service '{}' uses credential_broker but has no bridge network",
                         name
                     )));
                 }
+                let network_name = &svc.networks[0];
+                let network = self.networks.get(network_name).ok_or_else(|| {
+                    crate::error::NucleusError::ConfigError(format!(
+                        "Service '{}' references unknown network '{}'",
+                        name, network_name
+                    ))
+                })?;
+                let bridge = crate::network::BridgeConfig {
+                    subnet: network.subnet.clone(),
+                    ..crate::network::BridgeConfig::default()
+                };
+                broker.validate_for_bridge(&bridge).map_err(|e| {
+                    crate::error::NucleusError::ConfigError(format!(
+                        "Service '{}' has invalid credential_broker '{}': {}",
+                        name, endpoint, e
+                    ))
+                })?;
                 if !svc.egress_allow.is_empty()
                     || !svc.egress_domains.is_empty()
                     || !svc.egress_tcp_ports.is_empty()
@@ -594,7 +612,7 @@ rootfs = "/nix/store/web"
 command = ["/bin/web"]
 memory = "256M"
 networks = ["internal"]
-credential_broker = "10.0.42.1:8080"
+credential_broker = "10.42.0.1:8080"
 credential_broker_no_proxy_env = true
 "#;
         let config = TopologyConfig::from_toml(toml).unwrap();
@@ -614,7 +632,7 @@ rootfs = "/nix/store/web"
 command = ["/bin/web"]
 memory = "256M"
 networks = ["internal"]
-credential_broker = "10.0.42.1:8080"
+credential_broker = "10.42.0.1:8080"
 egress_domains = ["api.example.com"]
 "#;
         let config = TopologyConfig::from_toml(toml).unwrap();
@@ -635,12 +653,54 @@ rootfs = "/nix/store/web"
 command = ["/bin/web"]
 memory = "256M"
 networks = ["internal"]
-credential_broker = "10.0.42.1:8080"
+credential_broker = "10.42.0.1:8080"
 egress_udp_ports = [53]
 "#;
         let config = TopologyConfig::from_toml(toml).unwrap();
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("credential_broker"));
+    }
+
+    #[test]
+    fn test_validate_rejects_credential_broker_outside_bridge_gateway() {
+        let toml = r#"
+name = "bad"
+
+[networks.internal]
+driver = "bridge"
+
+[services.web]
+rootfs = "/nix/store/web"
+command = ["/bin/web"]
+memory = "256M"
+networks = ["internal"]
+credential_broker = "169.254.169.254:80"
+"#;
+        let config = TopologyConfig::from_toml(toml).unwrap();
+        let err = config.validate().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("host-side bridge address 10.42.0.1"));
+    }
+
+    #[test]
+    fn test_validate_accepts_credential_broker_custom_bridge_gateway() {
+        let toml = r#"
+name = "brokered"
+
+[networks.internal]
+driver = "bridge"
+subnet = "10.0.42.0/24"
+
+[services.web]
+rootfs = "/nix/store/web"
+command = ["/bin/web"]
+memory = "256M"
+networks = ["internal"]
+credential_broker = "10.0.42.1:8080"
+"#;
+        let config = TopologyConfig::from_toml(toml).unwrap();
+        assert!(config.validate().is_ok());
     }
 
     #[test]

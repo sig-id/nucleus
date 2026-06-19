@@ -1471,15 +1471,8 @@ impl Container {
                 format!("capability policy applied from {:?}", policy_path),
             );
         } else {
-            let overlay_rootfs_caps = [Capability::CAP_DAC_OVERRIDE, Capability::CAP_FOWNER];
-            let overlay_rootfs_mode = self.config.rootfs_mode == RootfsMode::Overlay;
-
             // Phase 1: drop bounding set while CAP_SETPCAP is still effective
-            if overlay_rootfs_mode {
-                cap_mgr.drop_bounding_set_except(&overlay_rootfs_caps)?;
-            } else {
-                cap_mgr.drop_bounding_set()?;
-            }
+            cap_mgr.drop_bounding_set()?;
 
             // Identity switch: setgroups/setgid/setuid while CAP_SETUID/CAP_SETGID
             // are still in the effective set. For non-root target UIDs, the kernel
@@ -1491,21 +1484,13 @@ impl Container {
 
             // Phase 2: explicitly clear any remaining caps (handles root-stays-root
             // case where kernel doesn't auto-clear).
-            if overlay_rootfs_mode {
-                cap_mgr.finalize_drop_except(&overlay_rootfs_caps)?;
-            } else {
-                cap_mgr.finalize_drop()?;
-            }
+            cap_mgr.finalize_drop()?;
 
             audit(
                 &self.config.id,
                 &self.config.name,
                 AuditEventType::CapabilitiesDropped,
-                if overlay_rootfs_mode {
-                    "capabilities dropped except CAP_DAC_OVERRIDE and CAP_FOWNER required for overlay rootfs copy-up"
-                } else {
-                    "all capabilities dropped including bounding set"
-                },
+                "all capabilities dropped including bounding set",
             );
         }
         sec_state = sec_state.transition(SecurityState::CapabilitiesDropped)?;
@@ -1653,9 +1638,6 @@ impl Container {
                 self.config.workspace.allow_execute,
             );
             landlock_mgr.add_rw_path(&self.config.home.to_string_lossy());
-            if self.config.rootfs_mode == RootfsMode::Overlay {
-                landlock_mgr.add_rw_exec_path("/");
-            }
             // Register volume mount destinations so Landlock permits access to them
             for provider_config in &self.config.provider_configs {
                 let provider_dest = crate::filesystem::normalize_provider_config_destination(
@@ -1688,16 +1670,8 @@ impl Container {
                 &self.config.id,
                 &self.config.name,
                 AuditEventType::LandlockApplied,
-                if self.config.rootfs_mode == RootfsMode::Overlay
-                    && self.config.seccomp_mode == SeccompMode::Trace
-                {
-                    "landlock applied with overlay rootfs trade-off: / is granted rwx; seccomp trace mode means security state is not locked"
-                        .to_string()
-                } else if self.config.rootfs_mode == RootfsMode::Overlay {
-                    "landlock applied with overlay rootfs trade-off: / is granted rwx so rootfs writes can copy up"
-                        .to_string()
-                } else if self.config.seccomp_mode == SeccompMode::Trace {
-                    "landlock applied, but seccomp in trace mode – not locked".to_string()
+                if self.config.seccomp_mode == SeccompMode::Trace {
+                    "landlock applied, but seccomp in trace mode - not locked".to_string()
                 } else {
                     "security state locked: all hardening layers active".to_string()
                 },
@@ -2760,26 +2734,25 @@ mod tests {
     }
 
     #[test]
-    fn test_overlay_rootfs_registers_writable_landlock_root() {
+    fn test_overlay_rootfs_does_not_register_writable_landlock_root() {
         let source = include_str!("runtime.rs");
         let fn_body = extract_fn_body(source, "fn setup_and_exec");
         assert!(
-            fn_body.contains("self.config.rootfs_mode == RootfsMode::Overlay")
-                && fn_body.contains("landlock_mgr.add_rw_exec_path(\"/\")"),
-            "overlay rootfs mode must permit writes through the default Landlock policy"
+            !fn_body.contains("landlock_mgr.add_rw_exec_path(\"/\")"),
+            "overlay rootfs mode must not grant broad read/write/execute Landlock access to /"
         );
     }
 
     #[test]
-    fn test_overlay_rootfs_keeps_only_write_caps() {
+    fn test_overlay_rootfs_drops_all_capabilities() {
         let source = include_str!("runtime.rs");
         let fn_body = extract_fn_body(source, "fn setup_and_exec");
         assert!(
-            fn_body.contains(
-                "let overlay_rootfs_caps = [Capability::CAP_DAC_OVERRIDE, Capability::CAP_FOWNER]"
-            ) && fn_body.contains("cap_mgr.drop_bounding_set_except(&overlay_rootfs_caps)")
-                && fn_body.contains("cap_mgr.finalize_drop_except(&overlay_rootfs_caps)"),
-            "overlay rootfs mode must keep only DAC_OVERRIDE/FOWNER through the cap drop"
+            fn_body.contains("cap_mgr.drop_bounding_set()?")
+                && fn_body.contains("cap_mgr.finalize_drop()?")
+                && !fn_body.contains("drop_bounding_set_except")
+                && !fn_body.contains("finalize_drop_except"),
+            "overlay rootfs mode must use the default drop-all capability path"
         );
     }
 

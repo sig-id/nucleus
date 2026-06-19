@@ -22,12 +22,11 @@ mod tests {
     };
     use nucleus::filesystem::{ROOTFS_ATTESTATION_FILE, ROOTFS_STORE_PATHS_FILE};
     use nucleus::image::{
-        commit_container_image, load_image, ImageCommitOptions, IMAGE_DIFF_DIR, IMAGE_MANIFEST_FILE,
-        IMAGE_ROOTFS_ATTESTATION_FILE, IMAGE_SIGNATURE_FILE, IMAGE_STORE_PATHS_FILE,
+        commit_container_image, load_image, ImageCommitOptions, IMAGE_DIFF_DIR,
+        IMAGE_MANIFEST_FILE, IMAGE_ROOTFS_ATTESTATION_FILE, IMAGE_SIGNATURE_FILE,
+        IMAGE_STORE_PATHS_FILE,
     };
-    use nucleus::network::{
-        BridgeConfig, CredentialBrokerConfig, NatBackend, NetworkMode,
-    };
+    use nucleus::network::{BridgeConfig, CredentialBrokerConfig, NatBackend, NetworkMode};
     use std::collections::BTreeMap;
     use std::fs;
     use std::os::unix::fs::symlink;
@@ -43,10 +42,8 @@ mod tests {
         fs::write(rootfs.join("bin/sh"), b"shell-body").unwrap();
 
         // Attestation sidecar: "<sha256>\t<rel-path>" lines.
-        let app_hash =
-            sha256_hex(&fs::read(rootfs.join("bin/app")).unwrap());
-        let sh_hash =
-            sha256_hex(&fs::read(rootfs.join("bin/sh")).unwrap());
+        let app_hash = sha256_hex(&fs::read(rootfs.join("bin/app")).unwrap());
+        let sh_hash = sha256_hex(&fs::read(rootfs.join("bin/sh")).unwrap());
         fs::write(
             rootfs.join(ROOTFS_ATTESTATION_FILE),
             format!("{app_hash}\tbin/app\n{sh_hash}\tbin/sh\n"),
@@ -127,8 +124,7 @@ mod tests {
     /// env (broker proxy vars + per-container identity) is intentionally kept
     /// out of `config.environment`.
     fn brokered_config(rootfs: PathBuf) -> ContainerConfig {
-        let broker =
-            CredentialBrokerConfig::parse_endpoint("10.0.42.1:8080").unwrap();
+        let broker = CredentialBrokerConfig::parse_endpoint("10.0.42.1:8080").unwrap();
         let mut config = ContainerConfig::try_new_with_id(
             Some("0123456789abcdef0123456789abcdef".to_string()),
             None,
@@ -223,8 +219,7 @@ mod tests {
             fs::read_to_string(image_dir.join(IMAGE_ROOTFS_ATTESTATION_FILE)).unwrap();
         assert!(side_attribution.contains("bin/app"));
         assert!(side_attribution.contains("bin/sh"));
-        let side_store =
-            fs::read_to_string(image_dir.join(IMAGE_STORE_PATHS_FILE)).unwrap();
+        let side_store = fs::read_to_string(image_dir.join(IMAGE_STORE_PATHS_FILE)).unwrap();
         assert!(side_store.contains("0123456789abcdfghijklmnpqrsvwxyz-coreutils"));
 
         // Diff content: real files survive, runtime artifacts are filtered.
@@ -274,7 +269,10 @@ mod tests {
         // Load succeeds and reproduces the same manifest.
         let loaded = load_image(&image_dir).unwrap();
         assert_eq!(loaded.image_id, manifest.image_id);
-        assert_eq!(loaded.config.env.get("APP_PORT").map(String::as_str), Some("8080"));
+        assert_eq!(
+            loaded.config.env.get("APP_PORT").map(String::as_str),
+            Some("8080")
+        );
 
         // Tampering with the diff must break HMAC verification.
         fs::write(

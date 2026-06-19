@@ -1478,8 +1478,7 @@ mod tests {
         use crate::container::ContainerConfig;
         use crate::network::{BridgeConfig, CredentialBrokerConfig, NatBackend, NetworkMode};
 
-        let broker =
-            CredentialBrokerConfig::parse_endpoint("10.0.42.1:8080").unwrap();
+        let broker = CredentialBrokerConfig::parse_endpoint("10.0.42.1:8080").unwrap();
         let mut config = ContainerConfig::try_new_with_id(
             Some("0123456789abcdef0123456789abcdef".to_string()),
             None,

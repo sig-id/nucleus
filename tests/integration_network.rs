@@ -299,6 +299,30 @@ mod tests {
     }
 
     #[test]
+    fn test_credential_broker_requires_bridge_gateway_ip() {
+        let default_bridge = BridgeConfig::default();
+        let broker = CredentialBrokerConfig::parse_endpoint("10.0.42.1:8080").unwrap();
+        assert!(broker.validate_for_bridge(&default_bridge).is_ok());
+
+        let metadata = CredentialBrokerConfig::parse_endpoint("169.254.169.254:80").unwrap();
+        let err = metadata.validate_for_bridge(&default_bridge).unwrap_err();
+        assert!(err.contains("host-side bridge address 10.0.42.1"));
+
+        let non_gateway = CredentialBrokerConfig::parse_endpoint("10.0.42.2:8080").unwrap();
+        let err = non_gateway
+            .validate_for_bridge(&default_bridge)
+            .unwrap_err();
+        assert!(err.contains("host-side bridge address 10.0.42.1"));
+
+        let custom_bridge = BridgeConfig {
+            subnet: "10.42.0.0/24".to_string(),
+            ..BridgeConfig::default()
+        };
+        let custom_broker = CredentialBrokerConfig::parse_endpoint("10.42.0.1:8080").unwrap();
+        assert!(custom_broker.validate_for_bridge(&custom_bridge).is_ok());
+    }
+
+    #[test]
     fn test_credential_broker_policy_denies_dns_and_allows_only_broker() {
         let broker = CredentialBrokerConfig::parse_endpoint("10.0.42.1:8080").unwrap();
         let policy = broker.egress_policy();

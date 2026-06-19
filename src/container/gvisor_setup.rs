@@ -105,26 +105,34 @@ impl Container {
             );
         }
 
-        // Inject user-configured environment variables
-        if !self.config.environment.is_empty() {
-            oci_config = oci_config.with_env(&self.config.environment);
+        // Inject user-configured environment variables. In broker mode, the
+        // broker identity keys are launch-owned and must not be spoofed by user
+        // env before derived env is applied below.
+        let user_environment: Vec<(String, String)> = self
+            .config
+            .environment
+            .iter()
+            .filter(|(key, _)| !self.config.credential_broker_owns_env(key))
+            .cloned()
+            .collect();
+        if !user_environment.is_empty() {
+            oci_config = oci_config.with_env(&user_environment);
         }
 
         // Inject launch-derived environment variables (credential-broker
         // proxy/identity, etc.). These reach the workload but are excluded
-        // from image commit manifests. User env wins on collision.
+        // from image commit manifests. User env wins on generic derived-env
+        // collisions; broker identity remains authoritative in broker mode.
         if !self.config.derived_environment.is_empty() {
-            let user_keys: std::collections::HashSet<&String> = self
-                .config
-                .environment
-                .iter()
-                .map(|(key, _)| key)
-                .collect();
+            let user_keys: std::collections::HashSet<&String> =
+                self.config.environment.iter().map(|(key, _)| key).collect();
             let derived: Vec<(String, String)> = self
                 .config
                 .derived_environment
                 .iter()
-                .filter(|(key, _)| !user_keys.contains(key))
+                .filter(|(key, _)| {
+                    self.config.credential_broker_owns_env(key) || !user_keys.contains(key)
+                })
                 .cloned()
                 .collect();
             if !derived.is_empty() {

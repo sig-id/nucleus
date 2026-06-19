@@ -1025,7 +1025,7 @@ nucleus run --network bridge --credential-broker 10.0.42.1:8080 \
   -- ./provider-client
 ```
 
-Broker mode is mutually exclusive with `--egress-allow`, `--egress-domain`, `--egress-tcp-port`, and `--egress-udp-port`; adding direct routes would defeat the broker boundary. The broker endpoint must be an IPv4 address inside the bridge subnet, not `127.0.0.1`, because loopback is local to the container namespace. The default host-side bridge gateway is `10.0.42.1`; Nucleus warns if the broker IP is in the subnet but is not the configured bridge gateway, because the host must actually own that address.
+Broker mode is mutually exclusive with `--egress-allow`, `--egress-domain`, `--egress-tcp-port`, and `--egress-udp-port`; adding direct routes would defeat the broker boundary. The broker endpoint must be the host-side IPv4 bridge gateway, not `127.0.0.1`, because loopback is local to the container namespace. The default host-side bridge gateway is `10.0.42.1`; Nucleus rejects broker IPs that differ from the configured bridge gateway.
 
 Credential broker mode currently requires the kernel bridge/veth/iptables NAT backend. It rejects explicit `--nat-backend userspace`, and `--nat-backend auto` is rejected when it would resolve to userspace NAT for rootless/native containers. `slirp4netns` does not expose the host-side bridge gateway as a host-bound address for the broker.
 
