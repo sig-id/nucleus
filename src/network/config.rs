@@ -103,6 +103,25 @@ impl BridgeConfig {
         }
     }
 
+    pub fn contains_ipv4(&self, ip: Ipv4Addr) -> Result<bool, String> {
+        let (network, prefix) = parse_ipv4_cidr(&self.subnet)?;
+        Ok(ipv4_in_cidr(ip, network, prefix))
+    }
+
+    /// Return the host-side bridge gateway address for this subnet.
+    pub fn gateway_ipv4(&self) -> Result<Ipv4Addr, String> {
+        let (network, prefix) = parse_ipv4_cidr(&self.subnet)?;
+        let network_u32 = u32::from(network) & ipv4_mask(prefix);
+        let gateway = if prefix >= 31 {
+            network_u32
+        } else {
+            network_u32
+                .checked_add(1)
+                .ok_or_else(|| format!("CIDR '{}' overflowed", self.subnet))?
+        };
+        Ok(Ipv4Addr::from(gateway))
+    }
+
     /// Validate all fields to prevent argument injection into ip/iptables commands.
     pub fn validate(&self) -> crate::error::Result<()> {
         // Bridge name: alphanumeric, dash, underscore; max 15 chars (Linux IFNAMSIZ)
@@ -164,19 +183,39 @@ fn validate_ipv4_addr(s: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Validate that a string is a valid IPv4 CIDR (e.g., "10.0.42.0/24").
-fn validate_ipv4_cidr(s: &str) -> Result<(), String> {
+fn parse_ipv4_cidr(s: &str) -> Result<(Ipv4Addr, u8), String> {
     let (addr, prefix) = s
         .split_once('/')
         .ok_or_else(|| format!("Invalid CIDR (missing /prefix): '{}'", s))?;
     validate_ipv4_addr(addr)?;
+    let addr = addr
+        .parse::<Ipv4Addr>()
+        .map_err(|_| format!("Invalid IPv4 address: '{}'", addr))?;
     let prefix: u8 = prefix
         .parse()
         .map_err(|_| format!("Invalid CIDR prefix: '{}'", s))?;
     if prefix > 32 {
         return Err(format!("CIDR prefix must be 0-32, got {}", prefix));
     }
-    Ok(())
+    Ok((addr, prefix))
+}
+
+fn ipv4_mask(prefix: u8) -> u32 {
+    if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    }
+}
+
+fn ipv4_in_cidr(ip: Ipv4Addr, network: Ipv4Addr, prefix: u8) -> bool {
+    let mask = ipv4_mask(prefix);
+    (u32::from(ip) & mask) == (u32::from(network) & mask)
+}
+
+/// Validate that a string is a valid IPv4 CIDR (e.g., "10.0.42.0/24").
+fn validate_ipv4_cidr(s: &str) -> Result<(), String> {
+    parse_ipv4_cidr(s).map(|_| ())
 }
 
 /// Validate that a string is a valid IPv4 CIDR for egress rules.

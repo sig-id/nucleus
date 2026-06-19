@@ -112,6 +112,10 @@ pub struct ServiceDef {
     #[serde(default)]
     pub egress_tcp_ports: Vec<u16>,
 
+    /// Allowed egress UDP ports
+    #[serde(default)]
+    pub egress_udp_ports: Vec<u16>,
+
     /// Host-side credential broker endpoint in IPv4:PORT form.
     #[serde(default)]
     pub credential_broker: Option<String>,
@@ -429,6 +433,7 @@ impl TopologyConfig {
                 if !svc.egress_allow.is_empty()
                     || !svc.egress_domains.is_empty()
                     || !svc.egress_tcp_ports.is_empty()
+                    || !svc.egress_udp_ports.is_empty()
                 {
                     return Err(crate::error::NucleusError::ConfigError(format!(
                         "Service '{}' cannot combine credential_broker with raw egress allowlists",
@@ -537,6 +542,7 @@ nat_backend = "userspace"
 port_forwards = ["8443:8443"]
 egress_allow = ["10.42.0.0/24"]
 egress_domains = ["api.example.com"]
+egress_udp_ports = [53]
 
 [[services.web.depends_on]]
 service = "postgres"
@@ -555,6 +561,7 @@ condition = "healthy"
             config.services["web"].egress_domains,
             vec!["api.example.com"]
         );
+        assert_eq!(config.services["web"].egress_udp_ports, vec![53]);
         assert!(config.validate().is_ok());
     }
 
@@ -609,6 +616,27 @@ memory = "256M"
 networks = ["internal"]
 credential_broker = "10.0.42.1:8080"
 egress_domains = ["api.example.com"]
+"#;
+        let config = TopologyConfig::from_toml(toml).unwrap();
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("credential_broker"));
+    }
+
+    #[test]
+    fn test_validate_rejects_credential_broker_with_udp_egress() {
+        let toml = r#"
+name = "bad"
+
+[networks.internal]
+driver = "bridge"
+
+[services.web]
+rootfs = "/nix/store/web"
+command = ["/bin/web"]
+memory = "256M"
+networks = ["internal"]
+credential_broker = "10.0.42.1:8080"
+egress_udp_ports = [53]
 "#;
         let config = TopologyConfig::from_toml(toml).unwrap();
         let err = config.validate().unwrap_err();

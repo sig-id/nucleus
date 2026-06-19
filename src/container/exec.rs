@@ -167,6 +167,32 @@ impl Container {
             })?);
         }
 
+        // Append launch-derived environment variables (filtered). These come
+        // from credential-broker proxy/identity config and similar launch-
+        // computed state. They reach the workload but are excluded from image
+        // commit manifests, so filter them with the same rules as user env.
+        for (key, value) in &self.config.derived_environment {
+            if BLOCKED_ENV_VARS.contains(&key.as_str()) {
+                debug!("Blocking dangerous derived environment variable: {}", key);
+                continue;
+            }
+            // User env wins over derived env on key collision.
+            if self
+                .config
+                .environment
+                .iter()
+                .any(|(existing_key, _)| existing_key == key)
+            {
+                continue;
+            }
+            env.push(CString::new(format!("{}={}", key, value)).map_err(|e| {
+                NucleusError::ExecError(format!(
+                    "Invalid derived environment variable value for {}: {}",
+                    key, e
+                ))
+            })?);
+        }
+
         nix::unistd::execve(&program, &args, &env)?;
 
         Ok(())

@@ -15,6 +15,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 pub const DEFAULT_HOME_PATH: &str = "/home/agent";
+pub const CREDENTIAL_BROKER_CONTAINER_ID_ENV: &str = "NUCLEUS_CONTAINER_ID";
+pub const CREDENTIAL_BROKER_TOKEN_ENV: &str = "NUCLEUS_CREDENTIAL_BROKER_TOKEN";
 
 fn open_dev_urandom() -> crate::error::Result<std::fs::File> {
     let file = OpenOptions::new()
@@ -593,6 +595,10 @@ pub struct ContainerConfig {
     /// authenticated egress path.
     pub credential_broker: Option<CredentialBrokerConfig>,
 
+    /// Random per-container token surfaced to brokered workloads so the
+    /// host-side broker can authenticate and attribute requests.
+    pub credential_broker_token: String,
+
     /// Health check configuration for long-running services.
     pub health_check: Option<HealthCheck>,
 
@@ -619,6 +625,15 @@ pub struct ContainerConfig {
 
     /// Environment variables to pass to the container process.
     pub environment: Vec<(String, String)>,
+
+    /// Launch-derived environment variables applied at exec time but excluded
+    /// from `ContainerState` capture and `image commit` manifests.
+    ///
+    /// This carries values that are derived from other launch config (e.g.
+    /// credential-broker proxy env, per-container broker identity) and must
+    /// not be baked into portable artifacts. The workload still observes
+    /// them at runtime via the same exec-time env vector as `environment`.
+    pub derived_environment: Vec<(String, String)>,
 
     /// Runtime uid/gid and supplementary groups for the workload process.
     pub process_identity: ProcessIdentity,
@@ -751,6 +766,7 @@ impl ContainerConfig {
             }
             None => generate_container_id()?,
         };
+        let credential_broker_token = generate_container_id()?;
         let name = name.unwrap_or_else(|| id.clone());
         Ok(Self {
             id,
@@ -775,6 +791,7 @@ impl ContainerConfig {
             rootfs_overlay: None,
             egress_policy: None,
             credential_broker: None,
+            credential_broker_token,
             health_check: None,
             readiness_probe: None,
             secrets: Vec::new(),
@@ -784,6 +801,7 @@ impl ContainerConfig {
             provider_configs: Vec::new(),
             workdir: PathBuf::from("/workspace"),
             environment: Vec::new(),
+            derived_environment: Vec::new(),
             process_identity: ProcessIdentity::default(),
             config_hash: None,
             sd_notify: false,
@@ -939,6 +957,7 @@ impl ContainerConfig {
     #[must_use]
     pub fn with_credential_broker(mut self, broker: CredentialBrokerConfig) -> Self {
         self.credential_broker = Some(broker);
+        self = self.with_credential_broker_identity_env();
         self
     }
 
@@ -993,6 +1012,39 @@ impl ContainerConfig {
     #[must_use]
     pub fn with_env(mut self, key: String, value: String) -> Self {
         self.environment.push((key, value));
+        self
+    }
+
+    /// Append a launch-derived env var. Derived env is applied to the workload
+    /// at exec time but excluded from `ContainerState` capture and image
+    /// commit manifests. Use this for values computed from other launch state
+    /// (broker endpoints, per-container tokens) that must not be baked into
+    /// portable artifacts.
+    #[must_use]
+    pub fn with_derived_env(mut self, key: String, value: String) -> Self {
+        self.derived_environment.push((key, value));
+        self
+    }
+
+    fn upsert_derived_env(&mut self, key: &str, value: String) {
+        self.derived_environment
+            .retain(|(existing_key, _)| existing_key != key);
+        self.derived_environment.push((key.to_string(), value));
+    }
+
+    #[must_use]
+    pub fn with_credential_broker_identity_env(mut self) -> Self {
+        if self.credential_broker.is_some() {
+            // These values are per-container and must not be committed into
+            // image manifests. Route them through `derived_environment` so
+            // `state.environment` capture and `ImageConfig::from_state` stay
+            // clean.
+            self.upsert_derived_env(CREDENTIAL_BROKER_CONTAINER_ID_ENV, self.id.clone());
+            self.upsert_derived_env(
+                CREDENTIAL_BROKER_TOKEN_ENV,
+                self.credential_broker_token.clone(),
+            );
+        }
         self
     }
 
@@ -1138,12 +1190,43 @@ impl ContainerConfig {
             .validate()
             .map_err(crate::error::NucleusError::ConfigError)?;
 
-        if !matches!(self.network, crate::network::NetworkMode::Bridge(_)) {
+        let crate::network::NetworkMode::Bridge(bridge_config) = &self.network else {
             return Err(crate::error::NucleusError::ConfigError(
                 "Credential broker egress requires --network bridge so Nucleus can force the \
                  sandbox through the host-side broker endpoint"
                     .to_string(),
             ));
+        };
+
+        if bridge_config.nat_backend == crate::network::NatBackend::Userspace {
+            return Err(crate::error::NucleusError::ConfigError(
+                "Credential broker egress requires the kernel NAT backend; \
+                 slirp4netns userspace NAT cannot route to the host-side bridge broker"
+                    .to_string(),
+            ));
+        }
+
+        if !bridge_config
+            .contains_ipv4(broker.broker_ip)
+            .map_err(crate::error::NucleusError::ConfigError)?
+        {
+            return Err(crate::error::NucleusError::ConfigError(format!(
+                "Credential broker IP {} is outside bridge subnet {}",
+                broker.broker_ip, bridge_config.subnet
+            )));
+        }
+
+        let gateway = bridge_config
+            .gateway_ipv4()
+            .map_err(crate::error::NucleusError::ConfigError)?;
+        if broker.broker_ip != gateway {
+            tracing::warn!(
+                "Credential broker IP {} is inside bridge subnet {} but differs from the \
+                 host-side bridge gateway {}; ensure the host owns that address",
+                broker.broker_ip,
+                bridge_config.subnet,
+                gateway
+            );
         }
 
         let Some(policy) = &self.egress_policy else {
@@ -1667,6 +1750,47 @@ mod tests {
     }
 
     #[test]
+    fn test_credential_broker_injects_per_container_identity_env() {
+        let broker =
+            crate::network::CredentialBrokerConfig::parse_endpoint("10.0.42.1:8080").unwrap();
+        let cfg = ContainerConfig::try_new_with_id(
+            Some("0123456789abcdef0123456789abcdef".to_string()),
+            None,
+            vec!["/bin/sh".to_string()],
+        )
+        .unwrap()
+        .with_env(
+            CREDENTIAL_BROKER_TOKEN_ENV.to_string(),
+            "user-supplied".to_string(),
+        )
+        .with_credential_broker(broker);
+
+        // Per-container identity env is launch-derived: it must live in
+        // `derived_environment` so committed image manifests stay portable.
+        assert!(cfg.derived_environment.contains(&(
+            CREDENTIAL_BROKER_CONTAINER_ID_ENV.to_string(),
+            cfg.id.clone()
+        )));
+        assert_ne!(cfg.credential_broker_token, cfg.id);
+        assert!(cfg.derived_environment.contains(&(
+            CREDENTIAL_BROKER_TOKEN_ENV.to_string(),
+            cfg.credential_broker_token.clone()
+        )));
+        // The user-supplied token remains in `environment` (user env wins at
+        // exec time, so the workload observes the user's value, not the
+        // derived per-container token).
+        assert!(cfg.environment.contains(&(
+            CREDENTIAL_BROKER_TOKEN_ENV.to_string(),
+            "user-supplied".to_string()
+        )));
+        // Crucially, no broker-derived var leaks into the capture path.
+        assert!(!cfg
+            .environment
+            .iter()
+            .any(|(key, _)| key == CREDENTIAL_BROKER_CONTAINER_ID_ENV));
+    }
+
+    #[test]
     fn test_credential_broker_rejects_non_bridge_network() {
         let broker =
             crate::network::CredentialBrokerConfig::parse_endpoint("10.0.42.1:8080").unwrap();
@@ -1699,6 +1823,37 @@ mod tests {
 
         let err = cfg.validate_runtime_support().unwrap_err();
         assert!(err.to_string().contains("allow only the broker"));
+    }
+
+    #[test]
+    fn test_credential_broker_rejects_userspace_nat_backend() {
+        let broker =
+            crate::network::CredentialBrokerConfig::parse_endpoint("10.0.42.1:8080").unwrap();
+        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
+            .with_network(NetworkMode::Bridge(
+                crate::network::BridgeConfig::default()
+                    .with_nat_backend(crate::network::NatBackend::Userspace),
+            ))
+            .with_credential_broker(broker.clone())
+            .with_egress_policy(broker.egress_policy());
+
+        let err = cfg.validate_runtime_support().unwrap_err();
+        assert!(err.to_string().contains("kernel NAT backend"));
+    }
+
+    #[test]
+    fn test_credential_broker_rejects_ip_outside_bridge_subnet() {
+        let broker =
+            crate::network::CredentialBrokerConfig::parse_endpoint("8.8.8.8:8080").unwrap();
+        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
+            .with_network(NetworkMode::Bridge(crate::network::BridgeConfig::default()))
+            .with_credential_broker(broker.clone())
+            .with_egress_policy(broker.egress_policy());
+
+        let err = cfg.validate_runtime_support().unwrap_err();
+        assert!(err.to_string().contains("outside bridge subnet"));
     }
 
     #[test]

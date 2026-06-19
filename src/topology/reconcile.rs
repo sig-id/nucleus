@@ -509,6 +509,11 @@ fn build_service_run_command(
         args.push(port.to_string());
     }
 
+    for port in &svc.egress_udp_ports {
+        args.push("--egress-udp-port".to_string());
+        args.push(port.to_string());
+    }
+
     if let Some(endpoint) = &svc.credential_broker {
         args.push("--credential-broker".to_string());
         args.push(endpoint.clone());
@@ -1090,6 +1095,7 @@ command = ["/bin/web"]
 memory = "256M"
 networks = ["internal"]
 nat_backend = "userspace"
+egress_udp_ports = [53]
 "#;
         let config = TopologyConfig::from_toml(toml).unwrap();
         let svc = config.services.get("web").unwrap();
@@ -1100,6 +1106,9 @@ nat_backend = "userspace"
         assert!(args
             .windows(2)
             .any(|pair| pair[0] == "--nat-backend" && pair[1] == "userspace"));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "--egress-udp-port" && pair[1] == "53"));
     }
 
     #[test]

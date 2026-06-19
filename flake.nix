@@ -88,18 +88,17 @@
         '';
 
       # Helper: build a cold, thin Nucleus image directly from a Nix rootfs.
-      # The resulting store path has the same manifest schema as `nucleus image
-      # commit`, but omits image.sig because the Nix store/substituter signature
-      # is the integrity root for build-time images.
+      # Build-time images omit image.sig because the Nix store/substituter
+      # signature is the integrity root and do not contain runtime overlay diffs.
       lib.mkImage =
         { pkgs
         , rootfs
         , config
         , name ? "nucleus-image"
-        , parentImageId ? null
         }:
         assert pkgs.lib.assertMsg (config ? command) "nucleus.lib.mkImage requires config.command";
         let
+          cargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
           imageConfig = {
             command = config.command;
             env = config.env or { };
@@ -108,12 +107,12 @@
             gid = config.gid or 0;
             additional_gids = config.additionalGids or (config.additional_gids or [ ]);
           };
-          parentImageIdJson = builtins.toJSON parentImageId;
         in
         pkgs.runCommand name {
           nativeBuildInputs = [ pkgs.coreutils pkgs.python3 ];
           passAsFile = [ "imageConfigJson" ];
           imageConfigJson = builtins.toJSON imageConfig;
+          nucleusVersion = cargoToml.package.version;
         } ''
           mkdir -p "$out"
           cp "${rootfs}/.nucleus-rootfs-sha256" "$out/rootfs.sha256"
@@ -121,7 +120,7 @@
 
           ROOTFS_PATH="${rootfs}" \
           IMAGE_CONFIG_JSON_PATH="$imageConfigJsonPath" \
-          PARENT_IMAGE_ID_JSON='${parentImageIdJson}' \
+          NUCLEUS_VERSION="$nucleusVersion" \
           python3 - <<'PY'
           import hashlib
           import json
@@ -155,11 +154,10 @@
           attestation = dict(sorted(attestation.items()))
 
           manifest = {
-              "schema_version": 1,
+              "schema_version": 2,
               "image_id": "",
-              "parent_image_id": json.loads(os.environ["PARENT_IMAGE_ID_JSON"]),
               "created_at": 0,
-              "nucleus_version": "0.3.8",
+              "nucleus_version": os.environ["NUCLEUS_VERSION"],
               "base": {
                   "rootfs_path": rootfs,
                   "store_paths": store_paths,
@@ -167,7 +165,6 @@
               },
               "diff": None,
               "config": image_config,
-              "live": None,
           }
           canonical = json.dumps(manifest, separators=(",", ":")).encode()
           manifest["image_id"] = hashlib.sha256(canonical).hexdigest()

@@ -28,12 +28,14 @@ use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::{
     chown, fork, pipe, read, setresgid, setresuid, write, ForkResult, Gid, Pid, Uid,
 };
+use std::net::{SocketAddr, SocketAddrV4, TcpStream};
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
+use std::time::Duration;
 use tempfile::Builder;
 use tracing::{debug, error, info, info_span, warn};
 
@@ -73,6 +75,8 @@ pub struct CreatedContainer {
     pub(super) _lifecycle_span: tracing::Span,
 }
 
+const CREDENTIAL_BROKER_CONNECT_TIMEOUT: Duration = Duration::from_millis(750);
+
 impl Container {
     pub fn new(config: ContainerConfig) -> Self {
         Self {
@@ -85,6 +89,42 @@ impl Container {
     pub fn with_event_sink(mut self, event_sink: Option<EventSink>) -> Self {
         self.event_sink = event_sink;
         self
+    }
+
+    fn probe_credential_broker(broker: &crate::network::CredentialBrokerConfig) -> Result<()> {
+        let addr = SocketAddr::V4(SocketAddrV4::new(broker.broker_ip, broker.broker_port));
+        TcpStream::connect_timeout(&addr, CREDENTIAL_BROKER_CONNECT_TIMEOUT)
+            .map(|_| ())
+            .map_err(|e| {
+                NucleusError::NetworkError(format!(
+                    "Credential broker {} was not reachable within {:?}: {}",
+                    addr, CREDENTIAL_BROKER_CONNECT_TIMEOUT, e
+                ))
+            })
+    }
+
+    fn validate_credential_broker_resolved_nat(
+        config: &ContainerConfig,
+        host_is_root: bool,
+    ) -> Result<()> {
+        if config.credential_broker.is_none() {
+            return Ok(());
+        }
+        let NetworkMode::Bridge(ref bridge_config) = config.network else {
+            return Ok(());
+        };
+
+        let backend =
+            bridge_config.selected_nat_backend(host_is_root, config.user_ns_config.is_some());
+        if backend == NatBackend::Userspace {
+            return Err(NucleusError::ConfigError(
+                "Credential broker egress requires the kernel NAT backend; \
+                 --nat-backend auto resolves to userspace for rootless/native containers"
+                    .to_string(),
+            ));
+        }
+
+        Ok(())
     }
 
     /// Run the container (convenience wrapper: create + start)
@@ -599,6 +639,7 @@ impl Container {
         Self::apply_network_mode_guards(&mut config, is_root)?;
         Self::apply_trust_level_guards(&mut config)?;
         config.validate_runtime_support()?;
+        Self::validate_credential_broker_resolved_nat(&config, is_root)?;
 
         if let NetworkMode::Bridge(ref bridge_config) = config.network {
             let backend =
@@ -860,6 +901,8 @@ impl Container {
                         process_gid: config.process_identity.gid,
                         additional_gids: config.process_identity.additional_gids.clone(),
                     });
+                    state.environment = config.environment.iter().cloned().collect();
+                    state.workdir = config.workdir.display().to_string();
                     state.config_hash = config.config_hash;
                     state.bundle_path =
                         config.rootfs_path.as_ref().map(|p| p.display().to_string());
@@ -923,6 +966,9 @@ impl Container {
                                         }
                                         warn!("Failed to apply egress policy: {}", e);
                                     }
+                                }
+                                if let Some(ref broker) = config.credential_broker {
+                                    Self::probe_credential_broker(broker)?;
                                 }
                                 network_driver = Some(net);
                             }
@@ -1456,7 +1502,7 @@ impl Container {
                 &self.config.name,
                 AuditEventType::CapabilitiesDropped,
                 if overlay_rootfs_mode {
-                    "capabilities dropped except overlay rootfs write caps"
+                    "capabilities dropped except CAP_DAC_OVERRIDE and CAP_FOWNER required for overlay rootfs copy-up"
                 } else {
                     "all capabilities dropped including bounding set"
                 },
@@ -1642,7 +1688,15 @@ impl Container {
                 &self.config.id,
                 &self.config.name,
                 AuditEventType::LandlockApplied,
-                if self.config.seccomp_mode == SeccompMode::Trace {
+                if self.config.rootfs_mode == RootfsMode::Overlay
+                    && self.config.seccomp_mode == SeccompMode::Trace
+                {
+                    "landlock applied with overlay rootfs trade-off: / is granted rwx; seccomp trace mode means security state is not locked"
+                        .to_string()
+                } else if self.config.rootfs_mode == RootfsMode::Overlay {
+                    "landlock applied with overlay rootfs trade-off: / is granted rwx so rootfs writes can copy up"
+                        .to_string()
+                } else if self.config.seccomp_mode == SeccompMode::Trace {
                     "landlock applied, but seccomp in trace mode – not locked".to_string()
                 } else {
                     "security state locked: all hardening layers active".to_string()
@@ -2605,6 +2659,25 @@ mod tests {
     }
 
     #[test]
+    fn test_credential_broker_auto_nat_rejects_rootless_userspace_resolution() {
+        let broker =
+            crate::network::CredentialBrokerConfig::parse_endpoint("10.0.42.1:8080").unwrap();
+        let mut config = ContainerConfig::try_new(None, vec!["/bin/true".to_string()])
+            .unwrap()
+            .with_network(NetworkMode::Bridge(crate::network::BridgeConfig::default()))
+            .with_credential_broker(broker.clone())
+            .with_egress_policy(broker.egress_policy())
+            .with_rootless();
+
+        let err = Container::validate_credential_broker_resolved_nat(&config, false).unwrap_err();
+        assert!(err.to_string().contains("auto resolves to userspace"));
+
+        config.user_ns_config = None;
+        config.namespaces.user = false;
+        assert!(Container::validate_credential_broker_resolved_nat(&config, true).is_ok());
+    }
+
+    #[test]
     fn test_parse_kernel_lockdown_mode() {
         assert_eq!(
             Container::parse_active_lockdown_mode("none [integrity] confidentiality"),
@@ -3001,6 +3074,7 @@ mod tests {
         let deny_logger = create_body.find("maybe_start_seccomp_deny_logger").unwrap();
         let bridge_setup = create_body.find("BridgeDriver::setup_with_id").unwrap();
         let egress_policy = create_body.find("net.apply_egress_policy").unwrap();
+        let broker_probe = create_body.find("probe_credential_broker").unwrap();
         let release = create_body
             .find("Failed to notify child that parent setup is complete")
             .unwrap();
@@ -3019,8 +3093,8 @@ mod tests {
             "seccomp deny logger must receive the container cgroup scope"
         );
         assert!(
-            bridge_setup < egress_policy && egress_policy < release,
-            "parent setup gate must not release before bridge and egress policy setup"
+            bridge_setup < egress_policy && egress_policy < broker_probe && broker_probe < release,
+            "parent setup gate must not release before bridge, egress policy, and broker probe setup"
         );
         assert!(
             release < created,

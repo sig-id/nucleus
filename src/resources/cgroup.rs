@@ -19,6 +19,8 @@ const CGROUP2_SUPER_MAGIC: libc::c_long = 0x6367_7270;
 const NUCLEUS_CGROUP_ROOT_ENV: &str = "NUCLEUS_CGROUP_ROOT";
 const CGROUP_CLEANUP_RETRIES: usize = 50;
 const CGROUP_CLEANUP_SLEEP: Duration = Duration::from_millis(20);
+const CGROUP_FREEZE_RETRIES: usize = 100;
+const CGROUP_FREEZE_SLEEP: Duration = Duration::from_millis(10);
 
 /// Cgroup v2 manager
 ///
@@ -27,6 +29,12 @@ const CGROUP_CLEANUP_SLEEP: Duration = Duration::from_millis(20);
 pub struct Cgroup {
     path: PathBuf,
     state: CgroupState,
+}
+
+/// RAII guard for a frozen cgroup v2 subtree.
+pub struct CgroupFreezeGuard {
+    path: PathBuf,
+    active: bool,
 }
 
 impl Cgroup {
@@ -318,8 +326,12 @@ impl Cgroup {
 
     /// Write a value to a cgroup file
     fn write_value(&self, file: &str, value: &str) -> Result<()> {
+        Self::write_value_at(&self.path, file, value)
+    }
+
+    fn write_value_at(path: &Path, file: &str, value: &str) -> Result<()> {
         Self::validate_cgroup_name(file)?;
-        let file_path = self.path.join(file);
+        let file_path = path.join(file);
         let mut control_file = fs::OpenOptions::new()
             .write(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
@@ -342,7 +354,12 @@ impl Cgroup {
 
     /// Read a value from a cgroup file
     fn read_value(&self, file: &str) -> Result<String> {
-        let file_path = self.path.join(file);
+        Self::read_value_at(&self.path, file)
+    }
+
+    fn read_value_at(path: &Path, file: &str) -> Result<String> {
+        Self::validate_cgroup_name(file)?;
+        let file_path = path.join(file);
         fs::read_to_string(&file_path).map_err(|e| {
             NucleusError::CgroupError(format!("Failed to read {:?}: {}", file_path, e))
         })
@@ -358,22 +375,77 @@ impl Cgroup {
         Ok(true)
     }
 
-    fn parse_cgroup_events_populated(events: &str) -> Result<bool> {
+    fn parse_cgroup_events_bool(events: &str, key: &str) -> Result<bool> {
         for line in events.lines() {
-            if let Some(value) = line.strip_prefix("populated ") {
+            if let Some(value) = line
+                .strip_prefix(key)
+                .and_then(|rest| rest.strip_prefix(' '))
+            {
                 return match value.trim() {
                     "0" => Ok(false),
                     "1" => Ok(true),
                     other => Err(NucleusError::CgroupError(format!(
-                        "Unexpected populated value in cgroup.events: {}",
-                        other
+                        "Unexpected {} value in cgroup.events: {}",
+                        key, other
                     ))),
                 };
             }
         }
-        Err(NucleusError::CgroupError(
-            "Missing populated entry in cgroup.events".to_string(),
-        ))
+        Err(NucleusError::CgroupError(format!(
+            "Missing {} entry in cgroup.events",
+            key
+        )))
+    }
+
+    fn parse_cgroup_events_populated(events: &str) -> Result<bool> {
+        Self::parse_cgroup_events_bool(events, "populated")
+    }
+
+    fn read_cgroup_events_frozen(path: &Path) -> Result<bool> {
+        let events = Self::read_value_at(path, "cgroup.events")?;
+        Self::parse_cgroup_events_bool(&events, "frozen")
+    }
+
+    fn wait_for_frozen_state(path: &Path, frozen: bool) -> Result<()> {
+        let events_path = path.join("cgroup.events");
+        if !events_path.exists() {
+            return Ok(());
+        }
+
+        for attempt in 0..CGROUP_FREEZE_RETRIES {
+            if Self::read_cgroup_events_frozen(path)? == frozen {
+                return Ok(());
+            }
+            if attempt + 1 < CGROUP_FREEZE_RETRIES {
+                thread::sleep(CGROUP_FREEZE_SLEEP);
+            }
+        }
+
+        Err(NucleusError::CgroupError(format!(
+            "Timed out waiting for cgroup {:?} to become {}",
+            path,
+            if frozen { "frozen" } else { "thawed" }
+        )))
+    }
+
+    /// Freeze an existing cgroup v2 subtree until the returned guard is dropped.
+    pub fn freeze_existing(path: &Path) -> Result<CgroupFreezeGuard> {
+        Self::validate_cgroup_directory(path)?;
+        let freeze_path = path.join("cgroup.freeze");
+        if !freeze_path.exists() {
+            return Err(NucleusError::CgroupError(format!(
+                "Cgroup {:?} does not support cgroup.freeze",
+                path
+            )));
+        }
+
+        Self::write_value_at(path, "cgroup.freeze", "1")?;
+        Self::wait_for_frozen_state(path, true)?;
+        debug!("Frozen cgroup {:?}", path);
+        Ok(CgroupFreezeGuard {
+            path: path.to_path_buf(),
+            active: true,
+        })
     }
 
     fn read_pids(&self) -> Result<Vec<Pid>> {
@@ -518,6 +590,19 @@ impl Cgroup {
     }
 }
 
+impl Drop for CgroupFreezeGuard {
+    fn drop(&mut self) {
+        if self.active && self.path.exists() {
+            if let Err(e) = Cgroup::write_value_at(&self.path, "cgroup.freeze", "0")
+                .and_then(|_| Cgroup::wait_for_frozen_state(&self.path, false))
+            {
+                warn!("Failed to thaw cgroup {:?}: {}", self.path, e);
+            }
+            self.active = false;
+        }
+    }
+}
+
 impl Drop for Cgroup {
     fn drop(&mut self) {
         if !self.state.is_terminal() && self.path.exists() {
@@ -578,6 +663,15 @@ mod tests {
         assert!(Cgroup::validate_cgroup_name("../escape").is_err());
         assert!(Cgroup::validate_cgroup_name("/sys/fs/cgroup/escape").is_err());
         assert!(Cgroup::validate_cgroup_name("parent/child").is_err());
+    }
+
+    #[test]
+    fn test_parse_cgroup_events_bool_reads_frozen_state() {
+        let events = "populated 1\nfrozen 0\n";
+        assert!(!Cgroup::parse_cgroup_events_bool(events, "frozen").unwrap());
+        assert!(Cgroup::parse_cgroup_events_bool("frozen 1\n", "frozen").unwrap());
+        assert!(Cgroup::parse_cgroup_events_bool("frozen 2\n", "frozen").is_err());
+        assert!(Cgroup::parse_cgroup_events_bool("populated 1\n", "frozen").is_err());
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use crate::container::RootfsMode;
 use crate::error::{NucleusError, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::fs;
 use std::fs::OpenOptions;
@@ -49,6 +50,14 @@ pub struct ContainerState {
 
     /// Command being executed
     pub command: Vec<String>,
+
+    /// Environment variables supplied at container launch.
+    #[serde(default)]
+    pub environment: BTreeMap<String, String>,
+
+    /// Working directory supplied at container launch.
+    #[serde(default = "default_workdir")]
+    pub workdir: String,
 
     /// Start time (Unix timestamp)
     pub started_at: u64,
@@ -126,6 +135,10 @@ fn default_oci_status() -> OciStatus {
     OciStatus::Stopped
 }
 
+fn default_workdir() -> String {
+    "/workspace".to_string()
+}
+
 /// Parameters for creating a new `ContainerState`.
 pub struct ContainerStateParams {
     pub id: String,
@@ -157,6 +170,8 @@ impl ContainerState {
             name: params.name,
             pid: params.pid,
             command: params.command,
+            environment: BTreeMap::new(),
+            workdir: default_workdir(),
             started_at,
             memory_limit: params.memory_limit,
             cpu_limit: params.cpu_limit,

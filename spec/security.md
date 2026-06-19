@@ -136,6 +136,12 @@ Applied after pivot_root, Landlock restricts what the container process can do w
 | `/` | Directory traversal only (ReadDir) |
 | Everything else | **Denied** |
 
+When `--rootfs-mode overlay` is used, this default policy is deliberately
+weaker: Nucleus grants read/write/execute access to `/` so overlayfs copy-up can
+write through the rootfs. Overlay mode also keeps `CAP_DAC_OVERRIDE` and
+`CAP_FOWNER` for copy-up. Bind rootfs mode is the strict Landlock/default-drop
+posture.
+
 Workspace execution is explicit. Native Landlock denies execute on writable
 workspace mounts by default, matching the `noexec` mount option used for
 workspace bind and staging mounts. `--workspace-exec` is an agent-mode escape

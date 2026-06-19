@@ -4,19 +4,22 @@ use crate::filesystem::{
     is_immediate_nix_store_object_path, read_rootfs_attestation, DirectoryManifest,
     ROOTFS_ATTESTATION_FILE, ROOTFS_STORE_PATHS_FILE,
 };
+use crate::resources::Cgroup;
 use nix::sys::stat::{makedev, mknod, Mode, SFlag};
 use nix::unistd::Uid;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::ffi::CString;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
 
-pub const IMAGE_SCHEMA_VERSION: u32 = 1;
+pub const IMAGE_SCHEMA_VERSION: u32 = 2;
 pub const IMAGE_MANIFEST_FILE: &str = "manifest.json";
 pub const IMAGE_SIGNATURE_FILE: &str = "image.sig";
 pub const IMAGE_ROOTFS_ATTESTATION_FILE: &str = "rootfs.sha256";
@@ -28,13 +31,11 @@ const IMAGE_HMAC_KEY_SIZE: usize = 32;
 pub struct NucleusImageManifest {
     pub schema_version: u32,
     pub image_id: String,
-    pub parent_image_id: Option<String>,
     pub created_at: u64,
     pub nucleus_version: String,
     pub base: ImageBase,
     pub diff: Option<ImageDiff>,
     pub config: ImageConfig,
-    pub live: Option<CheckpointRef>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -62,25 +63,13 @@ pub struct ImageConfig {
     pub additional_gids: Vec<u32>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CheckpointRef {
-    pub path: String,
-}
-
 #[derive(Debug, Clone, Default)]
 pub struct ImageCommitOptions {
-    pub fat: bool,
-    pub live: bool,
-    pub sign_key: Option<PathBuf>,
+    pub freeze: bool,
 }
 
 impl NucleusImageManifest {
-    pub fn new(
-        base: ImageBase,
-        diff: Option<ImageDiff>,
-        config: ImageConfig,
-        live: Option<CheckpointRef>,
-    ) -> Result<Self> {
+    pub fn new(base: ImageBase, diff: Option<ImageDiff>, config: ImageConfig) -> Result<Self> {
         let created_at = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
@@ -88,13 +77,11 @@ impl NucleusImageManifest {
         let mut manifest = Self {
             schema_version: IMAGE_SCHEMA_VERSION,
             image_id: String::new(),
-            parent_image_id: None,
             created_at,
             nucleus_version: env!("CARGO_PKG_VERSION").to_string(),
             base,
             diff,
             config,
-            live,
         };
         manifest.image_id = manifest.compute_image_id()?;
         Ok(manifest)
@@ -160,8 +147,8 @@ impl ImageConfig {
     pub fn from_state(state: &ContainerState) -> Self {
         Self {
             command: state.command.clone(),
-            env: BTreeMap::new(),
-            workdir: "/workspace".to_string(),
+            env: state.environment.clone(),
+            workdir: state.workdir.clone(),
             uid: state.process_uid,
             gid: state.process_gid,
             additional_gids: state.additional_gids.clone(),
@@ -174,23 +161,6 @@ pub fn commit_container_image(
     output_dir: &Path,
     options: &ImageCommitOptions,
 ) -> Result<NucleusImageManifest> {
-    if options.fat {
-        return Err(image_error(
-            "Fat image export is not implemented yet; omit --fat for a thin image".to_string(),
-        ));
-    }
-    if options.live {
-        return Err(image_error(
-            "Live image snapshots are not implemented yet; omit --live for a cold snapshot"
-                .to_string(),
-        ));
-    }
-    if options.sign_key.is_some() {
-        return Err(image_error(
-            "External signing keys are not implemented yet; image.sig uses the local HMAC key"
-                .to_string(),
-        ));
-    }
     if state.rootfs_mode != RootfsMode::Overlay {
         return Err(image_error(format!(
             "Container {} was launched with rootfs_mode={:?}; image commit requires overlay",
@@ -213,6 +183,18 @@ pub fn commit_container_image(
     let upperdir = PathBuf::from(upperdir);
     ensure_real_directory(&upperdir, "overlay upperdir")?;
 
+    let _freeze_guard = if options.freeze {
+        let cgroup_path = state.cgroup_path.as_deref().ok_or_else(|| {
+            image_error(format!(
+                "Container {} has no recorded cgroup path; cannot freeze for image commit",
+                state.id
+            ))
+        })?;
+        Some(Cgroup::freeze_existing(Path::new(cgroup_path))?)
+    } else {
+        None
+    };
+
     prepare_image_dir(output_dir)?;
     let diff_dir = output_dir.join(IMAGE_DIFF_DIR);
     prepare_empty_dir(&diff_dir, "image diff directory")?;
@@ -221,7 +203,7 @@ pub fn commit_container_image(
     copy_base_sidecars(Path::new(rootfs_path), output_dir)?;
     let diff = export_diff(&upperdir, &diff_dir)?;
     let config = ImageConfig::from_state(state);
-    let manifest = NucleusImageManifest::new(base, Some(diff), config, None)?;
+    let manifest = NucleusImageManifest::new(base, Some(diff), config)?;
     manifest.save(output_dir)?;
     write_image_hmac(output_dir)?;
     Ok(manifest)
@@ -353,18 +335,14 @@ fn copy_tree(
                     path, dest, e
                 ))
             })?;
+            preserve_path_metadata(&path, &dest, &metadata, false)?;
             manifest.insert(rel, format!("symlink:{}", target.display()));
         } else if metadata.is_dir() {
             fs::create_dir_all(&dest).map_err(|e| {
                 image_error(format!("Failed to create diff directory {:?}: {}", dest, e))
             })?;
-            fs::set_permissions(&dest, metadata.permissions()).map_err(|e| {
-                image_error(format!(
-                    "Failed to set diff directory mode {:?}: {}",
-                    dest, e
-                ))
-            })?;
             copy_tree(root, &path, dest_root, manifest, deleted_paths)?;
+            preserve_path_metadata(&path, &dest, &metadata, true)?;
         } else if metadata.is_file() {
             if let Some(parent) = dest.parent() {
                 fs::create_dir_all(parent).map_err(|e| {
@@ -377,9 +355,7 @@ fn copy_tree(
                     path, dest, e
                 ))
             })?;
-            fs::set_permissions(&dest, metadata.permissions()).map_err(|e| {
-                image_error(format!("Failed to set diff file mode {:?}: {}", dest, e))
-            })?;
+            preserve_path_metadata(&path, &dest, &metadata, true)?;
             manifest.insert(rel, hash_file(&path)?);
         } else if metadata.file_type().is_char_device() && metadata.rdev() == 0 {
             deleted_paths.push(rel);
@@ -392,6 +368,225 @@ fn copy_tree(
     }
 
     Ok(())
+}
+
+fn preserve_path_metadata(
+    source: &Path,
+    dest: &Path,
+    metadata: &fs::Metadata,
+    follow: bool,
+) -> Result<()> {
+    set_owner(dest, metadata.uid(), metadata.gid(), follow)?;
+    if follow {
+        fs::set_permissions(
+            dest,
+            fs::Permissions::from_mode(metadata.permissions().mode()),
+        )
+        .map_err(|e| image_error(format!("Failed to set metadata mode for {:?}: {}", dest, e)))?;
+    }
+    copy_xattrs(source, dest, follow)?;
+    set_timestamps(dest, metadata, follow)
+}
+
+fn set_owner(path: &Path, uid: u32, gid: u32, follow: bool) -> Result<()> {
+    let path_c = path_cstring(path)?;
+    let flags = if follow { 0 } else { libc::AT_SYMLINK_NOFOLLOW };
+    let rc = unsafe {
+        libc::fchownat(
+            libc::AT_FDCWD,
+            path_c.as_ptr(),
+            uid as libc::uid_t,
+            gid as libc::gid_t,
+            flags,
+        )
+    };
+    if rc != 0 {
+        return Err(image_error(format!(
+            "Failed to preserve owner {}:{} for {:?}: {}",
+            uid,
+            gid,
+            path,
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(())
+}
+
+fn set_timestamps(path: &Path, metadata: &fs::Metadata, follow: bool) -> Result<()> {
+    let path_c = path_cstring(path)?;
+    let times = [
+        libc::timespec {
+            tv_sec: metadata.atime() as libc::time_t,
+            tv_nsec: metadata.atime_nsec() as libc::c_long,
+        },
+        libc::timespec {
+            tv_sec: metadata.mtime() as libc::time_t,
+            tv_nsec: metadata.mtime_nsec() as libc::c_long,
+        },
+    ];
+    let flags = if follow { 0 } else { libc::AT_SYMLINK_NOFOLLOW };
+    let rc = unsafe { libc::utimensat(libc::AT_FDCWD, path_c.as_ptr(), times.as_ptr(), flags) };
+    if rc != 0 {
+        return Err(image_error(format!(
+            "Failed to preserve timestamps for {:?}: {}",
+            path,
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(())
+}
+
+fn copy_xattrs(source: &Path, dest: &Path, follow: bool) -> Result<()> {
+    for name in list_xattrs(source, follow)? {
+        if let Some(value) = get_xattr(source, &name, follow)? {
+            set_xattr(dest, &name, &value, follow)?;
+        }
+    }
+    Ok(())
+}
+
+fn list_xattrs(path: &Path, follow: bool) -> Result<Vec<Vec<u8>>> {
+    let path_c = path_cstring(path)?;
+    let size = unsafe {
+        if follow {
+            libc::listxattr(path_c.as_ptr(), std::ptr::null_mut(), 0)
+        } else {
+            libc::llistxattr(path_c.as_ptr(), std::ptr::null_mut(), 0)
+        }
+    };
+    if size < 0 {
+        let err = std::io::Error::last_os_error();
+        if is_xattr_unsupported(&err) {
+            return Ok(Vec::new());
+        }
+        return Err(image_error(format!(
+            "Failed to list xattrs for {:?}: {}",
+            path, err
+        )));
+    }
+    if size == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut buf = vec![0u8; size as usize];
+    let read = unsafe {
+        if follow {
+            libc::listxattr(
+                path_c.as_ptr(),
+                buf.as_mut_ptr() as *mut libc::c_char,
+                buf.len(),
+            )
+        } else {
+            libc::llistxattr(
+                path_c.as_ptr(),
+                buf.as_mut_ptr() as *mut libc::c_char,
+                buf.len(),
+            )
+        }
+    };
+    if read < 0 {
+        return Err(image_error(format!(
+            "Failed to read xattr list for {:?}: {}",
+            path,
+            std::io::Error::last_os_error()
+        )));
+    }
+    buf.truncate(read as usize);
+    Ok(buf
+        .split(|byte| *byte == 0)
+        .filter(|name| !name.is_empty())
+        .map(|name| name.to_vec())
+        .collect())
+}
+
+fn get_xattr(path: &Path, name: &[u8], follow: bool) -> Result<Option<Vec<u8>>> {
+    let path_c = path_cstring(path)?;
+    let name_c = bytes_cstring(name, "xattr name")?;
+    let size = unsafe {
+        if follow {
+            libc::getxattr(path_c.as_ptr(), name_c.as_ptr(), std::ptr::null_mut(), 0)
+        } else {
+            libc::lgetxattr(path_c.as_ptr(), name_c.as_ptr(), std::ptr::null_mut(), 0)
+        }
+    };
+    if size < 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ENODATA) || is_xattr_unsupported(&err) {
+            return Ok(None);
+        }
+        return Err(image_error(format!(
+            "Failed to get xattr {:?} for {:?}: {}",
+            String::from_utf8_lossy(name),
+            path,
+            err
+        )));
+    }
+    let mut value = vec![0u8; size as usize];
+    let read = unsafe {
+        if follow {
+            libc::getxattr(
+                path_c.as_ptr(),
+                name_c.as_ptr(),
+                value.as_mut_ptr() as *mut libc::c_void,
+                value.len(),
+            )
+        } else {
+            libc::lgetxattr(
+                path_c.as_ptr(),
+                name_c.as_ptr(),
+                value.as_mut_ptr() as *mut libc::c_void,
+                value.len(),
+            )
+        }
+    };
+    if read < 0 {
+        return Err(image_error(format!(
+            "Failed to read xattr {:?} for {:?}: {}",
+            String::from_utf8_lossy(name),
+            path,
+            std::io::Error::last_os_error()
+        )));
+    }
+    value.truncate(read as usize);
+    Ok(Some(value))
+}
+
+fn set_xattr(path: &Path, name: &[u8], value: &[u8], follow: bool) -> Result<()> {
+    let path_c = path_cstring(path)?;
+    let name_c = bytes_cstring(name, "xattr name")?;
+    let rc = unsafe {
+        if follow {
+            libc::setxattr(
+                path_c.as_ptr(),
+                name_c.as_ptr(),
+                value.as_ptr() as *const libc::c_void,
+                value.len(),
+                0,
+            )
+        } else {
+            libc::lsetxattr(
+                path_c.as_ptr(),
+                name_c.as_ptr(),
+                value.as_ptr() as *const libc::c_void,
+                value.len(),
+                0,
+            )
+        }
+    };
+    if rc != 0 {
+        return Err(image_error(format!(
+            "Failed to preserve xattr {:?} for {:?}: {}",
+            String::from_utf8_lossy(name),
+            path,
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(())
+}
+
+fn is_xattr_unsupported(err: &std::io::Error) -> bool {
+    let raw = err.raw_os_error();
+    raw == Some(libc::ENOTSUP) || raw == Some(libc::EOPNOTSUPP)
 }
 
 fn copy_base_sidecars(rootfs_path: &Path, output_dir: &Path) -> Result<()> {
@@ -489,6 +684,21 @@ fn path_to_string(path: &Path) -> Result<String> {
         }
     }
     Ok(parts.join("/"))
+}
+
+fn path_cstring(path: &Path) -> Result<CString> {
+    CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| image_error(format!("Path {:?} contains an interior NUL", path)))
+}
+
+fn bytes_cstring(bytes: &[u8], label: &str) -> Result<CString> {
+    CString::new(bytes).map_err(|_| {
+        image_error(format!(
+            "{} {:?} contains an interior NUL",
+            label,
+            String::from_utf8_lossy(bytes)
+        ))
+    })
 }
 
 fn validate_manifest_relative_path(path: &str) -> Result<PathBuf> {
@@ -751,17 +961,20 @@ fn update_image_hmac_inner(hasher: &mut Sha256, root: &Path, dir: &Path) -> Resu
             hasher.update(b"L\0");
             hasher.update(relative.as_bytes());
             hasher.update(b"\0");
+            update_metadata_hmac(hasher, &path, &metadata, false)?;
             hasher.update(target.as_os_str().as_encoded_bytes());
             hasher.update(b"\0");
         } else if metadata.is_dir() {
             hasher.update(b"D\0");
             hasher.update(relative.as_bytes());
             hasher.update(b"\0");
+            update_metadata_hmac(hasher, &path, &metadata, true)?;
             update_image_hmac_inner(hasher, root, &path)?;
         } else if metadata.is_file() {
             hasher.update(b"F\0");
             hasher.update(relative.as_bytes());
             hasher.update(b"\0");
+            update_metadata_hmac(hasher, &path, &metadata, true)?;
             hasher.update(metadata.len().to_le_bytes());
             let mut file = OpenOptions::new()
                 .read(true)
@@ -785,6 +998,36 @@ fn update_image_hmac_inner(hasher: &mut Sha256, root: &Path, dir: &Path) -> Resu
             )));
         }
     }
+    Ok(())
+}
+
+fn update_metadata_hmac(
+    hasher: &mut Sha256,
+    path: &Path,
+    metadata: &fs::Metadata,
+    follow: bool,
+) -> Result<()> {
+    hasher.update(metadata.uid().to_le_bytes());
+    hasher.update(metadata.gid().to_le_bytes());
+    hasher.update(metadata.permissions().mode().to_le_bytes());
+    hasher.update(metadata.mtime().to_le_bytes());
+    hasher.update(metadata.mtime_nsec().to_le_bytes());
+
+    let mut xattrs = Vec::new();
+    for name in list_xattrs(path, follow)? {
+        if let Some(value) = get_xattr(path, &name, follow)? {
+            xattrs.push((name, value));
+        }
+    }
+    xattrs.sort_by(|(a, _), (b, _)| a.cmp(b));
+    for (name, value) in xattrs {
+        hasher.update(b"X\0");
+        hasher.update((name.len() as u64).to_le_bytes());
+        hasher.update(&name);
+        hasher.update((value.len() as u64).to_le_bytes());
+        hasher.update(&value);
+    }
+
     Ok(())
 }
 
@@ -1013,6 +1256,10 @@ mod tests {
             process_gid: 1000,
             additional_gids: vec![27],
         });
+        state
+            .environment
+            .insert("APP_ENV".to_string(), "snapshot".to_string());
+        state.workdir = "/srv/app".to_string();
         state.rootfs_path = Some(rootfs.display().to_string());
         state.rootfs_mode = RootfsMode::Overlay;
         state.rootfs_upperdir = Some(upper.display().to_string());
@@ -1035,7 +1282,7 @@ mod tests {
             gid: 0,
             additional_gids: Vec::new(),
         };
-        let manifest = NucleusImageManifest::new(base, None, config, None).unwrap();
+        let manifest = NucleusImageManifest::new(base, None, config).unwrap();
         assert_eq!(manifest.compute_image_id().unwrap(), manifest.image_id);
         manifest.validate_identity().unwrap();
     }
@@ -1055,7 +1302,7 @@ mod tests {
             gid: 0,
             additional_gids: Vec::new(),
         };
-        let mut manifest = NucleusImageManifest::new(base, None, config, None).unwrap();
+        let mut manifest = NucleusImageManifest::new(base, None, config).unwrap();
         manifest.config.command = vec!["/bin/false".to_string()];
         assert!(manifest.validate_identity().is_err());
     }
@@ -1092,6 +1339,14 @@ mod tests {
         fs::create_dir(&upper).unwrap();
         fs::create_dir(upper.join("etc")).unwrap();
         fs::write(upper.join("etc/config"), "changed").unwrap();
+        fs::set_permissions(upper.join("etc/config"), fs::Permissions::from_mode(0o754)).unwrap();
+        let xattr_supported = set_xattr(
+            &upper.join("etc/config"),
+            b"user.nucleus.test",
+            b"preserved",
+            true,
+        )
+        .is_ok();
         fs::create_dir(upper.join("dev")).unwrap();
         fs::write(upper.join("dev/runtime-node"), "skip").unwrap();
         symlink("config", upper.join("etc/config-link")).unwrap();
@@ -1105,12 +1360,36 @@ mod tests {
         .unwrap();
 
         assert_eq!(manifest.schema_version, IMAGE_SCHEMA_VERSION);
+        assert_eq!(manifest.config.env["APP_ENV"], "snapshot");
+        assert_eq!(manifest.config.workdir, "/srv/app");
         assert!(image_dir.join(IMAGE_MANIFEST_FILE).exists());
         assert!(image_dir.join(IMAGE_SIGNATURE_FILE).exists());
         assert!(image_dir.join(IMAGE_ROOTFS_ATTESTATION_FILE).exists());
         assert!(image_dir.join(IMAGE_STORE_PATHS_FILE).exists());
         assert!(image_dir.join("diff/etc/config").exists());
         assert!(!image_dir.join("diff/dev/runtime-node").exists());
+        let source_meta = fs::symlink_metadata(upper.join("etc/config")).unwrap();
+        let copied_meta = fs::symlink_metadata(image_dir.join("diff/etc/config")).unwrap();
+        assert_eq!(
+            copied_meta.permissions().mode() & 0o7777,
+            source_meta.permissions().mode() & 0o7777
+        );
+        assert_eq!(copied_meta.uid(), source_meta.uid());
+        assert_eq!(copied_meta.gid(), source_meta.gid());
+        assert_eq!(copied_meta.mtime(), source_meta.mtime());
+        assert_eq!(copied_meta.mtime_nsec(), source_meta.mtime_nsec());
+        if xattr_supported {
+            assert_eq!(
+                get_xattr(
+                    &image_dir.join("diff/etc/config"),
+                    b"user.nucleus.test",
+                    true
+                )
+                .unwrap()
+                .as_deref(),
+                Some(&b"preserved"[..])
+            );
+        }
 
         let loaded = load_image(&image_dir).unwrap();
         assert_eq!(loaded.image_id, manifest.image_id);
@@ -1148,6 +1427,36 @@ mod tests {
     }
 
     #[test]
+    fn test_image_hmac_detects_metadata_tampering() {
+        let _lock = image_key_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let key_dir = temp.path().join("keys");
+        fs::create_dir(&key_dir).unwrap();
+        fs::set_permissions(&key_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let _guard = ImageKeyEnvGuard::set(&key_dir.join("image.key"));
+
+        let rootfs = sample_rootfs(temp.path());
+        let upper = temp.path().join("upper");
+        fs::create_dir(&upper).unwrap();
+        fs::write(upper.join("file"), "one").unwrap();
+        let image_dir = temp.path().join("image");
+        commit_container_image(
+            &sample_state(&rootfs, &upper),
+            &image_dir,
+            &ImageCommitOptions::default(),
+        )
+        .unwrap();
+
+        fs::set_permissions(
+            image_dir.join("diff/file"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let err = load_image(&image_dir).unwrap_err();
+        assert!(err.to_string().contains("HMAC mismatch"));
+    }
+
+    #[test]
     fn test_whiteout_replay_rejects_manifest_path_escape() {
         let temp = TempDir::new().unwrap();
         let upper = temp.path().join("upper");
@@ -1155,5 +1464,115 @@ mod tests {
 
         let err = replay_deleted_paths(&upper, &["../escape".to_string()]).unwrap_err();
         assert!(err.to_string().contains("Invalid image manifest path"));
+    }
+
+    // Cross-cutting regression: a credential-brokered sandbox must not bake
+    // its broker endpoint or per-container identity env into a committed image
+    // manifest. Those values are host/container specific; baking them in would
+    // make the image non-portable and would leak per-container tokens. The
+    // contract is that `config.environment` is the capture surface for image
+    // commit, while `config.derived_environment` carries launch-derived values
+    // that reach the workload but stay out of committed artifacts.
+    #[test]
+    fn test_image_commit_excludes_credential_broker_derived_env() {
+        use crate::container::ContainerConfig;
+        use crate::network::{BridgeConfig, CredentialBrokerConfig, NatBackend, NetworkMode};
+
+        let broker =
+            CredentialBrokerConfig::parse_endpoint("10.0.42.1:8080").unwrap();
+        let mut config = ContainerConfig::try_new_with_id(
+            Some("0123456789abcdef0123456789abcdef".to_string()),
+            None,
+            vec!["/bin/sh".to_string()],
+        )
+        .unwrap()
+        .with_network(NetworkMode::Bridge(
+            BridgeConfig::default().with_nat_backend(NatBackend::Kernel),
+        ))
+        // User env is the capture surface; it must round-trip into the image.
+        .with_env("APP_PORT".to_string(), "8080".to_string())
+        // `with_credential_broker` already routes identity env through
+        // `derived_environment`. Mimic the CLI's broker-proxy-env step here
+        // to assert the same derived path is used for proxy env.
+        .with_credential_broker(broker.clone())
+        .with_egress_policy(broker.egress_policy());
+        for (key, value) in broker.proxy_environment() {
+            config = config.with_derived_env(key, value);
+        }
+
+        // Sanity: user env stays clean of every broker-derived var.
+        let broker_keys = [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "NUCLEUS_CONTAINER_ID",
+            "NUCLEUS_CREDENTIAL_BROKER_TOKEN",
+        ];
+        for key in broker_keys {
+            assert!(
+                !config.environment.iter().any(|(k, _)| k == key),
+                "broker-derived env `{key}` leaked into user environment"
+            );
+        }
+        // And the broker vars land in derived env where they belong.
+        assert!(config
+            .derived_environment
+            .iter()
+            .any(|(k, _)| k == "HTTPS_PROXY"));
+        assert!(config
+            .derived_environment
+            .iter()
+            .any(|(k, _)| k == "NUCLEUS_CONTAINER_ID"));
+        assert!(config
+            .derived_environment
+            .iter()
+            .any(|(k, _)| k == "NUCLEUS_CREDENTIAL_BROKER_TOKEN"));
+
+        // Mirror what the runtime captures into ContainerState. Only user env
+        // is captured; derived env is intentionally dropped here.
+        let mut state = ContainerState::new(ContainerStateParams {
+            id: config.id.clone(),
+            name: config.name.clone(),
+            pid: 123,
+            command: config.command.clone(),
+            memory_limit: None,
+            cpu_limit: None,
+            using_gvisor: false,
+            rootless: false,
+            cgroup_path: None,
+            process_uid: config.process_identity.uid,
+            process_gid: config.process_identity.gid,
+            additional_gids: config.process_identity.additional_gids.clone(),
+        });
+        state.environment = config.environment.iter().cloned().collect();
+        state.workdir = config.workdir.display().to_string();
+
+        let temp = TempDir::new().unwrap();
+        let rootfs = sample_rootfs(temp.path());
+        let upper = temp.path().join("upper");
+        fs::create_dir(&upper).unwrap();
+        state.rootfs_path = Some(rootfs.display().to_string());
+        state.rootfs_mode = RootfsMode::Overlay;
+        state.rootfs_upperdir = Some(upper.display().to_string());
+        state.rootfs_workdir = Some(upper.parent().unwrap().join("work").display().to_string());
+
+        let image_dir = temp.path().join("image");
+        let manifest =
+            commit_container_image(&state, &image_dir, &ImageCommitOptions::default()).unwrap();
+
+        // User env survives the round trip.
+        assert_eq!(
+            manifest.config.env.get("APP_PORT").map(String::as_str),
+            Some("8080"),
+            "user-supplied env must survive image commit"
+        );
+        // Broker-derived env must not.
+        for key in broker_keys {
+            assert!(
+                !manifest.config.env.contains_key(key),
+                "broker-derived env `{key}` was baked into the committed image"
+            );
+        }
     }
 }

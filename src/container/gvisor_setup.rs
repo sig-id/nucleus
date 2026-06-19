@@ -110,6 +110,28 @@ impl Container {
             oci_config = oci_config.with_env(&self.config.environment);
         }
 
+        // Inject launch-derived environment variables (credential-broker
+        // proxy/identity, etc.). These reach the workload but are excluded
+        // from image commit manifests. User env wins on collision.
+        if !self.config.derived_environment.is_empty() {
+            let user_keys: std::collections::HashSet<&String> = self
+                .config
+                .environment
+                .iter()
+                .map(|(key, _)| key)
+                .collect();
+            let derived: Vec<(String, String)> = self
+                .config
+                .derived_environment
+                .iter()
+                .filter(|(key, _)| !user_keys.contains(key))
+                .cloned()
+                .collect();
+            if !derived.is_empty() {
+                oci_config = oci_config.with_env(&derived);
+            }
+        }
+
         // Pass through sd_notify socket
         if self.config.sd_notify {
             oci_config = oci_config.with_sd_notify();

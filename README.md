@@ -356,7 +356,7 @@ nucleus create -d \
   -- /bin/sh -c 'echo committed > /tmp/result; sleep 3600'
 
 # Commit the overlay upperdir as a signed thin image
-nucleus image commit worker -o ./worker.nucleus-image
+nucleus image commit worker -o ./worker.nucleus-image --freeze
 
 # Verify/load and inspect the image
 nucleus image load ./worker.nucleus-image
@@ -369,11 +369,32 @@ nucleus image run ./worker.nucleus-image -- /bin/cat /tmp/result
 `nucleus image commit` requires a container launched with `--rootfs-mode
 overlay`; overlay rootfs mode is currently native-runtime only and production
 mode rejects it. Runtime-committed images are signed with a host-local HMAC key.
-Set `NUCLEUS_IMAGE_HMAC_KEY_FILE` to pin that key path; otherwise Nucleus creates
-an owner-only key under `/var/lib/nucleus` for root or the user's data directory
-for non-root runs. Nix-built images from `nucleus.lib.mkImage` live in
-`/nix/store` and omit `image.sig` because Nix store/substituter trust is the
-integrity root.
+Use `--image-key-file PATH` or set `NUCLEUS_IMAGE_HMAC_KEY_FILE` to pin that key
+path; otherwise Nucleus creates an owner-only key under `/var/lib/nucleus` for
+root or the user's data directory for non-root runs. Use the same key path when
+one uid commits an image and another uid, such as root, runs or inspects it.
+Nix-built images from `nucleus.lib.mkImage` live in `/nix/store` and omit
+`image.sig` because Nix store/substituter trust is the integrity root.
+
+Runtime commits record the original command, explicit environment variables,
+workdir, uid/gid, supplementary groups, and an overlay diff. The diff exporter
+preserves uid/gid, mode bits, mtimes, symlinks, xattrs, POSIX ACL xattrs, and
+Linux file-capability xattrs; commit fails if the caller cannot preserve
+metadata. Local image signatures cover both content and preserved metadata.
+
+`nucleus image commit` reads the container's live overlay upperdir. Use
+`--freeze` to freeze the recorded cgroup while the diff is copied; without it,
+concurrent writes can be captured in a torn state. Freezing requires the
+container to have a recorded cgroup path. Runtime-committed images are a
+development/CLI workflow: the NixOS production module consumes build-time
+`mkImage` images only and intentionally rejects images with overlay diffs. Image
+run also constrains `base.rootfs_path` to a canonical `/nix/store` rootfs before
+mounting it as the overlay lowerdir.
+
+Image v2 is a single-rootfs plus optional single-diff directory format. There is
+no layer chain, image store, registry push/pull, or `ls/rm/cp` image management
+surface; operators manage image directories directly or use Nix store paths for
+declarative production deployments.
 
 ### Detached Mode
 
@@ -917,7 +938,7 @@ the CLI `nucleus image commit` workflow.
 
 **Do not pass secrets via `-e` / `--env`.** Environment variables are visible in `/proc/<pid>/environ` to any process that can read it (mitigated by `hidepid=2` in production mode, but not in agent mode). Use `--secret` instead when a file works. If a provider CLI requires sensitive environment variables, use `--env-fd FD`; the fd carries a JSON object such as `{"OPENAI_API_KEY":"..."}` or a JSON array of `KEY=VALUE` strings so the values are not exposed through Nucleus argv.
 
-**Prefer credential brokers for bearer-token APIs.** If untrusted code can drive a provider CLI, do not place the bearer token in the sandbox environment. Run a host-side broker that holds the credential, injects it into approved upstream requests, rate-limits and audits usage, and start Nucleus with `--credential-broker IP:PORT` so the sandbox can only reach that broker endpoint.
+**Prefer credential brokers for bearer-token APIs.** If untrusted code can drive a provider CLI, do not place the bearer token in the sandbox environment. Run a host-side broker that holds the credential, injects it into approved upstream requests, rate-limits and audits usage, and start Nucleus with `--credential-broker IP:PORT` so the sandbox can only reach that broker endpoint. Proxy environment variables are client hints, not the security boundary: Nucleus enforces the boundary with namespace-local egress rules, and non-HTTP clients that ignore proxy variables are denied unless they speak to the broker endpoint.
 
 **Protect the local image signing key.** Runtime-committed image directories are verified with the host-local HMAC key selected by `NUCLEUS_IMAGE_HMAC_KEY_FILE` or the default owner-only key path. Treat that file like deployment signing material: do not share it across trust domains unless those hosts should be able to trust and produce each other's local image snapshots.
 
@@ -934,7 +955,7 @@ the CLI `nucleus image commit` workflow.
 | Chroot fallback | Allowed with flag | Forbidden | Forbidden |
 | Host networking | Allowed with flag | Native `host` forbidden; `gvisor-host` allowed with gVisor + explicit opt-in | Native `host` forbidden; `gvisor-host` allowed with gVisor + explicit opt-in |
 | Cgroup limits | Best-effort | Required (fatal on create/apply failure) | Required (fatal on create/apply failure) |
-| Bridge DNS | Defaults to 8.8.8.8/8.8.4.4 | Must be configured explicitly | Must be configured explicitly |
+| Bridge DNS | Defaults to 8.8.8.8/8.8.4.4 | Must be configured explicitly unless credential broker mode disables DNS | Must be configured explicitly unless credential broker mode disables DNS |
 | Rootfs | Host bind mounts unless `--rootfs` (optionally with `--rootfs-mode overlay`) or `--agent-toolchain-rootfs` is supplied | Host bind mounts unless `--rootfs` (optionally with `--rootfs-mode overlay`) or `--agent-toolchain-rootfs` is supplied | Pre-built Nix closure (`--rootfs`) or build-time `mkImage` image without an overlay diff |
 | Workspace | Optional `/workspace`; bind/copy-in-out for agents | Optional `/workspace`; bind/copy-in-out for agents | Optional, non-executable unless read-only or policy-specific |
 | Egress policy | Optional | Optional | Deny-all default where enforceable; unavailable with `gvisor-host` |
@@ -949,6 +970,12 @@ the CLI `nucleus image commit` workflow.
 | Health checks | Optional | Optional | Optional |
 | sd_notify | Optional | Optional | Optional |
 | Security policies | Optional | Optional | Optional (recommended) |
+
+Overlay rootfs mode is a writable development snapshot mode, not the strict
+production posture. To support overlayfs copy-up, Nucleus retains
+`CAP_DAC_OVERRIDE` and `CAP_FOWNER` in the workload and grants native Landlock
+read/write/execute access to `/`. Use bind rootfs mode for the default-deny
+Landlock and all-capabilities-dropped posture.
 
 ## Egress Policy
 
@@ -998,7 +1025,17 @@ nucleus run --network bridge --credential-broker 10.0.42.1:8080 \
   -- ./provider-client
 ```
 
-Broker mode is mutually exclusive with `--egress-allow`, `--egress-domain`, `--egress-tcp-port`, and `--egress-udp-port`; adding direct routes would defeat the broker boundary. The broker endpoint must be an IPv4 bridge address, not `127.0.0.1`, because loopback is local to the container namespace.
+Broker mode is mutually exclusive with `--egress-allow`, `--egress-domain`, `--egress-tcp-port`, and `--egress-udp-port`; adding direct routes would defeat the broker boundary. The broker endpoint must be an IPv4 address inside the bridge subnet, not `127.0.0.1`, because loopback is local to the container namespace. The default host-side bridge gateway is `10.0.42.1`; Nucleus warns if the broker IP is in the subnet but is not the configured bridge gateway, because the host must actually own that address.
+
+Credential broker mode currently requires the kernel bridge/veth/iptables NAT backend. It rejects explicit `--nat-backend userspace`, and `--nat-backend auto` is rejected when it would resolve to userspace NAT for rootless/native containers. `slirp4netns` does not expose the host-side bridge gateway as a host-bound address for the broker.
+
+At startup, Nucleus performs a short TCP pre-connect to the broker endpoint after bridge setup and before releasing the workload. A missing or unreachable broker fails the sandbox start immediately instead of letting the first outbound request hang.
+
+When broker mode is enabled, Nucleus injects `NUCLEUS_CONTAINER_ID` and `NUCLEUS_CREDENTIAL_BROKER_TOKEN` into the workload. The token is an independent random per-container value, so a broker or provider-specific wrapper can authenticate and attribute requests by sandbox. User-provided values for those keys are overwritten in broker mode.
+
+`--credential-broker-no-proxy-env` disables automatic `HTTP_PROXY`/`HTTPS_PROXY` injection. The shorter alias `--no-broker-proxy-env` is also accepted.
+
+A dependency-free reference broker is available at `examples/credential_broker.rs`. It audits CONNECT requests and forwards them as opaque tunnels, and it injects a static `Authorization: Bearer ...` header for plain HTTP absolute-form proxy requests. CONNECT over TLS cannot have upstream bearer headers injected unless the broker terminates TLS or the client uses a provider-specific base URL/protocol that lets the broker see the HTTP request.
 
 ## Native Bridge Backends
 

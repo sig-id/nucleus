@@ -14,7 +14,8 @@ use nucleus::error::{NucleusError, Result};
 use nucleus::filesystem::{
     normalize_container_destination, normalize_provider_config_destination,
     normalize_volume_destination, validate_agent_toolchain_rootfs_path, validate_bind_mount_source,
-    validate_provider_config_source, validate_workspace_host_path, ContextMode,
+    validate_production_rootfs_path, validate_provider_config_source, validate_workspace_host_path,
+    ContextMode,
 };
 use nucleus::image::{self, ImageCommitOptions};
 use nucleus::isolation::{ContainerAttach, NamespaceConfig};
@@ -27,6 +28,7 @@ use nucleus::topology::{
     execute_reconcile, plan_reconcile, DependencyGraph, ReconcileAction, TopologyConfig,
 };
 use serde::{Deserialize, Serialize};
+use std::ffi::OsString;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -34,6 +36,7 @@ use tracing::info;
 
 const SAFE_PRIVILEGED_HELPER_PATH: &str =
     "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+const IMAGE_HMAC_KEY_ENV: &str = "NUCLEUS_IMAGE_HMAC_KEY_FILE";
 
 const DANGEROUS_ENV_VARS: &[&str] = &[
     "LD_PRELOAD",
@@ -42,6 +45,48 @@ const DANGEROUS_ENV_VARS: &[&str] = &[
     "LD_DEBUG",
     "LD_PROFILE",
 ];
+
+struct ScopedEnvVar {
+    key: &'static str,
+    previous: Option<OsString>,
+}
+
+impl ScopedEnvVar {
+    fn set_path(key: &'static str, path: Option<&Path>) -> Option<Self> {
+        let path = path?;
+        let previous = std::env::var_os(key);
+        std::env::set_var(key, path);
+        Some(Self { key, previous })
+    }
+}
+
+impl Drop for ScopedEnvVar {
+    fn drop(&mut self) {
+        match &self.previous {
+            Some(value) => std::env::set_var(self.key, value),
+            None => std::env::remove_var(self.key),
+        }
+    }
+}
+
+struct ImageRunOverlayGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl ImageRunOverlayGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+}
+
+impl Drop for ImageRunOverlayGuard {
+    fn drop(&mut self) {
+        if self.armed && self.path.exists() {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+}
 
 fn validate_privileged_helper(path: &Path, name: &str) -> Result<PathBuf> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -968,7 +1013,7 @@ enum Commands {
         credential_broker: Option<String>,
 
         /// Do not inject HTTP_PROXY/HTTPS_PROXY variables for --credential-broker.
-        #[arg(long = "credential-broker-no-proxy-env")]
+        #[arg(long = "credential-broker-no-proxy-env", alias = "no-broker-proxy-env")]
         credential_broker_no_proxy_env: bool,
 
         /// DNS servers (repeatable). Required for bridge mode in production.
@@ -1263,23 +1308,23 @@ enum ImageCommands {
         #[arg(short, long)]
         output: String,
 
-        /// Embed a closure export for air-gapped transfer
+        /// Temporarily freeze the container's cgroup while copying the overlay diff
         #[arg(long)]
-        fat: bool,
+        freeze: bool,
 
-        /// Include a CRIU checkpoint for a live snapshot
-        #[arg(long)]
-        live: bool,
-
-        /// External signing key path
-        #[arg(long)]
-        sign: Option<PathBuf>,
+        /// HMAC key file used to sign or verify local runtime images
+        #[arg(long = "image-key-file", value_name = "PATH")]
+        image_key_file: Option<PathBuf>,
     },
 
     /// Run a cold image snapshot
     Run {
         /// Image directory
         image: String,
+
+        /// HMAC key file used to verify local runtime images
+        #[arg(long = "image-key-file", value_name = "PATH")]
+        image_key_file: Option<PathBuf>,
 
         /// Override the manifest command
         #[arg(last = true)]
@@ -1290,12 +1335,20 @@ enum ImageCommands {
     Inspect {
         /// Image directory
         image: String,
+
+        /// HMAC key file used to verify local runtime images
+        #[arg(long = "image-key-file", value_name = "PATH")]
+        image_key_file: Option<PathBuf>,
     },
 
     /// Verify/load an image artifact
     Load {
         /// Image directory
         image: String,
+
+        /// HMAC key file used to verify local runtime images
+        #[arg(long = "image-key-file", value_name = "PATH")]
+        image_key_file: Option<PathBuf>,
     },
 }
 
@@ -1552,6 +1605,14 @@ fn resolve_service_mode(service_mode: ServiceMode, strict_agent: bool) -> Result
             "--strict-agent cannot be combined with --service-mode production".to_string(),
         )),
     }
+}
+
+fn requires_explicit_bridge_dns_for_create(
+    service_mode: ServiceMode,
+    dns: &[String],
+    credential_broker: &Option<String>,
+) -> bool {
+    service_mode.requires_explicit_bridge_dns() && dns.is_empty() && credential_broker.is_none()
 }
 
 fn resolve_rootfs_argument(
@@ -1883,25 +1944,28 @@ fn try_main() -> Result<i32> {
             ImageCommands::Commit {
                 container,
                 output,
-                fat,
-                live,
-                sign,
+                freeze,
+                image_key_file,
             } => {
+                let _image_key_env =
+                    ScopedEnvVar::set_path(IMAGE_HMAC_KEY_ENV, image_key_file.as_deref());
                 let state_mgr = ContainerStateManager::new_with_root(state_root.clone())?;
                 let state = state_mgr.resolve_container(&container)?;
                 let manifest = image::commit_container_image(
                     &state,
                     &PathBuf::from(&output),
-                    &ImageCommitOptions {
-                        fat,
-                        live,
-                        sign_key: sign,
-                    },
+                    &ImageCommitOptions { freeze },
                 )?;
                 println!("{}", manifest.image_id);
                 Ok(0)
             }
-            ImageCommands::Run { image, args } => {
+            ImageCommands::Run {
+                image,
+                image_key_file,
+                args,
+            } => {
+                let _image_key_env =
+                    ScopedEnvVar::set_path(IMAGE_HMAC_KEY_ENV, image_key_file.as_deref());
                 let image_dir = PathBuf::from(&image);
                 let manifest = image::load_image(&image_dir)?;
                 let command = if args.is_empty() {
@@ -1914,11 +1978,13 @@ fn try_main() -> Result<i32> {
                         "Image manifest has no command; pass one after --".to_string(),
                     ));
                 }
+                let rootfs_path =
+                    validate_production_rootfs_path(Path::new(&manifest.base.rootfs_path))?;
 
                 let mut config = ContainerConfig::try_new(None, command)?
                     .with_gvisor(false)
                     .with_trust_level(TrustLevel::Trusted)
-                    .with_rootfs_path(PathBuf::from(&manifest.base.rootfs_path))
+                    .with_rootfs_path(rootfs_path)
                     .with_rootfs_mode(RootfsMode::Overlay)
                     .with_workdir(normalize_container_destination(Path::new(
                         &manifest.config.workdir,
@@ -1949,6 +2015,7 @@ fn try_main() -> Result<i32> {
                         overlay_dir, e
                     ))
                 })?;
+                let _overlay_guard = ImageRunOverlayGuard::new(overlay_dir.clone());
                 std::fs::set_permissions(&overlay_dir, std::fs::Permissions::from_mode(0o700))
                     .map_err(|e| {
                         NucleusError::FilesystemError(format!(
@@ -1979,12 +2046,22 @@ fn try_main() -> Result<i32> {
                 let container = Container::new(config).with_event_sink(event_sink);
                 container.run()
             }
-            ImageCommands::Inspect { image } => {
+            ImageCommands::Inspect {
+                image,
+                image_key_file,
+            } => {
+                let _image_key_env =
+                    ScopedEnvVar::set_path(IMAGE_HMAC_KEY_ENV, image_key_file.as_deref());
                 let manifest = image::load_image(&PathBuf::from(&image))?;
                 println!("{}", serde_json::to_string_pretty(&manifest)?);
                 Ok(0)
             }
-            ImageCommands::Load { image } => {
+            ImageCommands::Load {
+                image,
+                image_key_file,
+            } => {
+                let _image_key_env =
+                    ScopedEnvVar::set_path(IMAGE_HMAC_KEY_ENV, image_key_file.as_deref());
                 let manifest = image::load_image(&PathBuf::from(&image))?;
                 println!("Image {} verified", manifest.image_id);
                 Ok(0)
@@ -2434,7 +2511,11 @@ fn try_main() -> Result<i32> {
                 NetworkModeArg::GVisorHost => NetworkMode::GVisorHost,
                 NetworkModeArg::Bridge => {
                     // Strict modes require explicit DNS to avoid public resolver defaults.
-                    if service_mode.requires_explicit_bridge_dns() && dns.is_empty() {
+                    if requires_explicit_bridge_dns_for_create(
+                        service_mode,
+                        &dns,
+                        &credential_broker,
+                    ) {
                         return Err(NucleusError::ConfigError(format!(
                             "{} with bridge networking requires explicit --dns servers",
                             service_mode.label()
@@ -2855,15 +2936,22 @@ fn try_main() -> Result<i32> {
                 config = config.with_env(key, value);
             }
             if let Some(broker) = config.credential_broker.clone() {
+                // Broker proxy env and per-container identity env are launch-
+                // derived state: the broker endpoint and the per-container
+                // token are not portable across hosts or containers, so they
+                // must never be baked into a committed image manifest. Route
+                // them through `with_derived_env` so they reach the workload
+                // but stay out of `state.environment` capture.
                 for (key, value) in broker.proxy_environment() {
-                    if !config
+                    let user_overrode = config
                         .environment
                         .iter()
-                        .any(|(existing_key, _)| existing_key == &key)
-                    {
-                        config = config.with_env(key, value);
+                        .any(|(existing_key, _)| existing_key == &key);
+                    if !user_overrode {
+                        config = config.with_derived_env(key, value);
                     }
                 }
+                config = config.with_credential_broker_identity_env();
             }
 
             // OCI lifecycle hooks
@@ -3488,6 +3576,25 @@ service_mode = "strict-agent"
     }
 
     #[test]
+    fn test_strict_bridge_dns_not_required_for_credential_broker_mode() {
+        assert!(requires_explicit_bridge_dns_for_create(
+            ServiceMode::Production,
+            &[],
+            &None
+        ));
+        assert!(!requires_explicit_bridge_dns_for_create(
+            ServiceMode::Production,
+            &[],
+            &Some("10.0.42.1:8080".to_string())
+        ));
+        assert!(!requires_explicit_bridge_dns_for_create(
+            ServiceMode::StrictAgent,
+            &["10.0.0.1".to_string()],
+            &None
+        ));
+    }
+
+    #[test]
     fn test_service_mode_strict_agent_and_mitos_agent_parse() {
         let strict = Cli::try_parse_from([
             "nucleus",
@@ -3526,6 +3633,28 @@ service_mode = "strict-agent"
             Commands::Create { strict_agent, .. } => {
                 assert!(strict_agent);
             }
+            _ => panic!("expected create command"),
+        }
+    }
+
+    #[test]
+    fn test_no_broker_proxy_env_alias_parses() {
+        let cli = Cli::try_parse_from([
+            "nucleus",
+            "create",
+            "--credential-broker",
+            "10.0.42.1:8080",
+            "--no-broker-proxy-env",
+            "--",
+            "/bin/true",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Create {
+                credential_broker_no_proxy_env,
+                ..
+            } => assert!(credential_broker_no_proxy_env),
             _ => panic!("expected create command"),
         }
     }
@@ -3620,15 +3749,44 @@ service_mode = "strict-agent"
             Commands::Image(ImageCommands::Commit {
                 container,
                 output,
-                fat,
-                live,
-                sign,
+                freeze,
+                image_key_file,
             }) => {
                 assert_eq!(container, "worker");
                 assert_eq!(output, "/tmp/worker.nucleus-image");
-                assert!(!fat);
-                assert!(!live);
-                assert!(sign.is_none());
+                assert!(!freeze);
+                assert!(image_key_file.is_none());
+            }
+            _ => panic!("expected image commit command"),
+        }
+    }
+
+    #[test]
+    fn test_image_commit_cli_parses_freeze_and_key_file() {
+        let cli = Cli::try_parse_from([
+            "nucleus",
+            "image",
+            "commit",
+            "worker",
+            "--output",
+            "/tmp/worker.nucleus-image",
+            "--freeze",
+            "--image-key-file",
+            "/tmp/nucleus-image.key",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Image(ImageCommands::Commit {
+                freeze,
+                image_key_file,
+                ..
+            }) => {
+                assert!(freeze);
+                assert_eq!(
+                    image_key_file,
+                    Some(PathBuf::from("/tmp/nucleus-image.key"))
+                );
             }
             _ => panic!("expected image commit command"),
         }
@@ -3648,8 +3806,13 @@ service_mode = "strict-agent"
         .unwrap();
 
         match cli.command {
-            Commands::Image(ImageCommands::Run { image, args }) => {
+            Commands::Image(ImageCommands::Run {
+                image,
+                image_key_file,
+                args,
+            }) => {
                 assert_eq!(image, "/tmp/worker.nucleus-image");
+                assert!(image_key_file.is_none());
                 assert_eq!(args, vec!["/bin/echo".to_string(), "ok".to_string()]);
             }
             _ => panic!("expected image run command"),

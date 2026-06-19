@@ -4,13 +4,17 @@
 /// egress policies, and port forwarding without requiring root privileges.
 #[cfg(test)]
 mod tests {
-    use nucleus::container::ContainerConfig;
+    use nucleus::container::{Container, ContainerConfig, TrustLevel};
     use nucleus::error::NucleusError;
     use nucleus::isolation::NamespaceConfig;
     use nucleus::network::{
         BridgeConfig, CredentialBrokerConfig, EgressPolicy, NatBackend, NetworkMode, PortForward,
         Protocol,
     };
+    use std::env;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
 
     // --- BridgeConfig validation ---
 
@@ -165,6 +169,21 @@ mod tests {
     }
 
     #[test]
+    fn test_bridge_config_gateway_and_subnet_membership() {
+        let config = BridgeConfig {
+            subnet: "10.0.42.0/24".to_string(),
+            ..BridgeConfig::default()
+        };
+
+        assert_eq!(config.gateway_ipv4().unwrap().to_string(), "10.0.42.1");
+        assert!(config.contains_ipv4("10.0.42.1".parse().unwrap()).unwrap());
+        assert!(config
+            .contains_ipv4("10.0.42.254".parse().unwrap())
+            .unwrap());
+        assert!(!config.contains_ipv4("8.8.8.8".parse().unwrap()).unwrap());
+    }
+
+    #[test]
     fn test_bridge_config_invalid_container_ip() {
         let config = BridgeConfig {
             container_ip: Some("not-an-ip".to_string()),
@@ -290,6 +309,52 @@ mod tests {
         assert!(policy.allowed_udp_ports.is_empty());
         assert!(!policy.allow_dns);
         assert!(policy.is_credential_broker_only(&broker));
+    }
+
+    #[test]
+    #[ignore = "set NUCLEUS_RUN_PRIVILEGED_E2E=1; requires root, kernel bridge networking, iptables, bash, and coreutils timeout"]
+    fn test_credential_broker_e2e_allows_only_broker_endpoint() {
+        if env::var_os("NUCLEUS_RUN_PRIVILEGED_E2E").is_none() {
+            eprintln!("set NUCLEUS_RUN_PRIVILEGED_E2E=1 to run privileged broker e2e");
+            return;
+        }
+
+        let listener = TcpListener::bind(("0.0.0.0", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let broker = CredentialBrokerConfig::parse_endpoint(&format!("10.0.42.1:{port}")).unwrap();
+
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 512];
+            let _ = stream.read(&mut buf);
+            stream
+                .write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 9\r\n\r\nbroker-ok")
+                .unwrap();
+        });
+
+        let script = format!(
+            "exec 3<>/dev/tcp/10.0.42.1/{port}; \
+             printf 'GET / HTTP/1.0\\r\\n\\r\\n' >&3; \
+             grep -q broker-ok <&3; \
+             if timeout 1 bash -c 'exec 4<>/dev/tcp/1.1.1.1/80' 2>/dev/null; then exit 1; fi"
+        );
+        let config = ContainerConfig::try_new(
+            Some("broker-e2e".to_string()),
+            vec!["/bin/bash".to_string(), "-ceu".to_string(), script],
+        )
+        .unwrap()
+        .with_gvisor(false)
+        .with_trust_level(TrustLevel::Trusted)
+        .with_namespaces(NamespaceConfig::all())
+        .with_network(NetworkMode::Bridge(
+            BridgeConfig::default().with_nat_backend(NatBackend::Kernel),
+        ))
+        .with_credential_broker(broker.clone())
+        .with_egress_policy(broker.egress_policy());
+
+        let exit = Container::new(config).run().unwrap();
+        assert_eq!(exit, 0);
+        server.join().unwrap();
     }
 
     // --- CIDR validation ---

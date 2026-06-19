@@ -28,9 +28,11 @@ let
         type = types.nullOr types.package;
         default = null;
         description = ''
-          Nix-built Nucleus image derivation produced by nucleus.lib.mkImage.
+          Build-time Nucleus image derivation produced by nucleus.lib.mkImage.
           Mutually exclusive with rootfs. The module uses the image manifest's
-          base rootfs and command unless command is set explicitly.
+          base rootfs and command unless command is set explicitly. Runtime
+          images created by `nucleus image commit` contain overlay diffs and are
+          a CLI/development workflow; production services reject those diffs.
         '';
       };
 
