@@ -543,6 +543,34 @@ impl Cgroup {
         })
     }
 
+    /// Install a cgroup v2 device allowlist (`BPF_PROG_TYPE_CGROUP_DEVICE`).
+    ///
+    /// When GPU passthrough is enabled, this restricts device access to the
+    /// base `/dev` nodes plus the bound GPU devices, so a compromised workload
+    /// cannot reach other host devices even if it creates a device node.
+    ///
+    /// `best_effort` matches `--allow-degraded-security`: when `true`, a kernel
+    /// or capability limitation degrades to a warning rather than failing the
+    /// launch, because the filesystem layer (only bound device nodes exist in
+    /// `/dev`) remains the primary gate.
+    pub fn install_gpu_device_allowlist(
+        &self,
+        gpu_specs: &[crate::filesystem::DeviceNodeSpec],
+        include_tty: bool,
+        best_effort: bool,
+    ) -> Result<bool> {
+        use crate::resources::{base_device_specs, install_device_allowlist, DeviceAllowSpec};
+        let mut specs: Vec<DeviceAllowSpec> = base_device_specs(include_tty);
+        for dev in gpu_specs {
+            specs.push(DeviceAllowSpec {
+                is_block: dev.is_block,
+                major: dev.major,
+                minor: dev.minor,
+            });
+        }
+        install_device_allowlist(&self.path, &specs, best_effort)
+    }
+
     /// Get cgroup path
     pub fn path(&self) -> &Path {
         &self.path

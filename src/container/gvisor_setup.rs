@@ -211,6 +211,32 @@ impl Container {
             oci_config = oci_config.with_hooks(hooks.clone());
         }
 
+        // GPU passthrough (gVisor): emit OCI device entries + driver support
+        // binds + NVIDIA env. runsc owns device node creation and the cgroup
+        // device rules inside its sandbox.
+        if let Some(ref gpu_config) = self.config.gpu {
+            match crate::filesystem::resolve_gpu_devices(gpu_config) {
+                Ok(Some(set)) => {
+                    oci_config = oci_config.with_gpu_passthrough(
+                        gpu_config,
+                        &set,
+                        &self.config.process_identity,
+                    )?;
+                }
+                Ok(None) => {
+                    tracing::warn!(
+                        "--gpu requested but no GPU devices discovered; gVisor launch continues without GPU"
+                    );
+                }
+                Err(e) => {
+                    return Err(crate::error::NucleusError::FilesystemError(format!(
+                        "GPU device resolution failed: {}",
+                        e
+                    )))
+                }
+            }
+        }
+
         // Use --bundle path if provided, otherwise default
         let bundle_path = self
             .config

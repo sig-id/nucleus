@@ -203,6 +203,23 @@ impl Container {
             })?);
         }
 
+        // GPU passthrough environment. These are launch-derived (depend on
+        // the GPU config) and are not part of user env. NVIDIA stacks read
+        // NVIDIA_VISIBLE_DEVICES / NVIDIA_DRIVER_CAPABILITIES; the EGL vendor
+        // manifest redirects Mesa/EGL to the bound host driver JSON.
+        if let Some(gpu) = &self.config.gpu {
+            for (key, value) in crate::container::gpu_environment(gpu) {
+                if BLOCKED_ENV_VARS.contains(&key) {
+                    debug!("Blocking dangerous GPU environment variable: {}", key);
+                    continue;
+                }
+                env.push(
+                    CString::new(format!("{}={}", key, value))
+                        .map_err(|e| NucleusError::ExecError(format!("Invalid GPU env {}: {}", key, e)))?,
+                );
+            }
+        }
+
         nix::unistd::execve(&program, &args, &env)?;
 
         Ok(())

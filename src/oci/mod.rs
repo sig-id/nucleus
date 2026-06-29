@@ -1170,6 +1170,58 @@ impl OciConfig {
         Ok(self)
     }
 
+    /// Add GPU passthrough: OCI device entries for each GPU device plus
+    /// read-only bind mounts for driver support files, and inject the NVIDIA
+    /// environment variables. runsc creates the device nodes and installs the
+    /// matching cgroup device rules inside its sandbox.
+    pub fn with_gpu_passthrough(
+        mut self,
+        gpu: &crate::container::GpuPassthroughConfig,
+        set: &crate::filesystem::GpuDeviceSet,
+        identity: &crate::container::ProcessIdentity,
+    ) -> Result<Self> {
+        use crate::container::gpu_environment;
+
+        // Device entries: runsc mknod's these and applies cgroup device rules.
+        if let Some(linux) = self.linux.as_mut() {
+            for (host_node, spec) in set.node_specs_with_paths() {
+                let rel = host_node.strip_prefix("/").unwrap_or(host_node.as_path());
+                let container_path = format!("/dev/{}", rel.to_string_lossy());
+                linux.devices.push(OciDevice {
+                    device_type: if spec.is_block { "b" } else { "c" }.to_string(),
+                    path: container_path,
+                    major: Some(spec.major as i64),
+                    minor: Some(spec.minor as i64),
+                    file_mode: Some(0o660),
+                    uid: Some(identity.uid),
+                    gid: Some(identity.gid),
+                });
+            }
+        }
+
+        // Driver support files (NVIDIA /proc, lib dirs, ICD JSON; ROCm /opt).
+        for support in crate::filesystem::support_paths(set, gpu.bind_driver_libraries) {
+            let dest = support.to_string_lossy().to_string();
+            self.mounts.push(OciMount {
+                destination: dest,
+                source: support.to_string_lossy().to_string(),
+                mount_type: "bind".to_string(),
+                options: vec![
+                    "bind".to_string(),
+                    "ro".to_string(),
+                    "nosuid".to_string(),
+                    "nodev".to_string(),
+                ],
+            });
+        }
+
+        // NVIDIA environment variables.
+        let env: Vec<(String, String)> =
+            gpu_environment(gpu).into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+        self = self.with_env(&env);
+        Ok(self)
+    }
+
     /// Add explicit provider CLI config bind mounts under the sandbox home.
     pub fn with_provider_config_mounts(
         mut self,
@@ -1802,6 +1854,37 @@ mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
     use tempfile::TempDir;
+
+    #[test]
+    fn gpu_passthrough_injects_env_even_with_no_devices() {
+        // An empty device set (e.g. discovery found nothing on the host) still
+        // injects the NVIDIA environment variables; device entries and support
+        // binds are simply absent.
+        let gpu = crate::container::GpuPassthroughConfig {
+            vendor: crate::container::GpuVendor::Nvidia,
+            ..crate::container::GpuPassthroughConfig::default()
+        };
+        let set = crate::filesystem::GpuDeviceSet::default();
+        let identity = crate::container::ProcessIdentity::default();
+
+        let config = OciConfig::new(vec!["/bin/sh".to_string()], None)
+            .with_gpu_passthrough(&gpu, &set, &identity)
+            .expect("gpu passthrough config builds");
+
+        // No devices discovered -> no device entries beyond the base set.
+        assert!(config.linux.as_ref().unwrap().devices.len() >= 1);
+        // NVIDIA env vars are present.
+        assert!(config
+            .process
+            .env
+            .iter()
+            .any(|e| e.starts_with("NVIDIA_VISIBLE_DEVICES=")));
+        assert!(config
+            .process
+            .env
+            .iter()
+            .any(|e| e.starts_with("NVIDIA_DRIVER_CAPABILITIES=")));
+    }
 
     #[test]
     fn test_oci_config_new() {

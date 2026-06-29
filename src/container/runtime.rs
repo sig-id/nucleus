@@ -6,11 +6,11 @@ use crate::container::{
 use crate::error::{NucleusError, Result, StateTransition};
 use crate::filesystem::{
     audit_mounts, bind_mount_host_paths, bind_mount_rootfs, copy_workspace_in, create_dev_nodes,
-    create_minimal_fs, mask_proc_paths, mount_home_tmpfs, mount_procfs, mount_provider_configs,
-    mount_secrets_inmemory, mount_volumes, mount_workspace, overlay_mount_rootfs,
-    snapshot_context_dir, switch_root, sync_workspace_out, validate_production_rootfs_path,
-    verify_context_manifest, verify_rootfs_attestation, FilesystemState, LazyContextPopulator,
-    TmpfsMount,
+    create_minimal_fs, mask_proc_paths, mount_gpu_passthrough, mount_home_tmpfs, mount_procfs,
+    mount_provider_configs, mount_secrets_inmemory, mount_volumes, mount_workspace,
+    overlay_mount_rootfs, resolve_gpu_devices, snapshot_context_dir, switch_root,
+    sync_workspace_out, validate_production_rootfs_path, verify_context_manifest,
+    verify_rootfs_attestation, FilesystemState, GpuDeviceSet, LazyContextPopulator, TmpfsMount,
 };
 use crate::isolation::{NamespaceManager, UserNamespaceMapper};
 use crate::network::{BridgeDriver, BridgeNetwork, NatBackend, NetworkMode, UserspaceNetwork};
@@ -741,6 +741,34 @@ impl Container {
             }
         };
 
+        // GPU passthrough (parent side): resolve devices while still
+        // unprivileged and install a cgroup device allowlist so the workload
+        // can only reach the base + GPU devices. Best-effort: the filesystem
+        // layer (only bound device nodes exist in /dev) remains the primary
+        // gate, and rootless launches cannot load BPF.
+        if let Some(gpu_config) = config.gpu.as_ref() {
+            match resolve_gpu_devices(gpu_config) {
+                Ok(Some(set)) => {
+                    if let Some(ref cgroup) = cgroup_opt {
+                        let specs = set.device_specs();
+                        if let Err(e) = cgroup.install_gpu_device_allowlist(
+                            &specs,
+                            config.terminal,
+                            /* best_effort */ true,
+                        ) {
+                            warn!("Failed to install GPU cgroup device allowlist: {}", e);
+                        }
+                    }
+                }
+                Ok(None) => {
+                    warn!(
+                        "--gpu requested but no GPU devices were discovered; continuing without GPU"
+                    );
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
         // Resolve runsc path before fork, while still unprivileged.
         let runsc_path = if config.use_gvisor {
             Some(GVisorRuntime::resolve_path().map_err(|e| {
@@ -1283,6 +1311,37 @@ impl Container {
         let dev_path = container_root.join("dev");
         create_dev_nodes(&dev_path, self.config.terminal)?;
 
+        // 5a. GPU passthrough: bind host device nodes + driver support files.
+        // Resolved again in the child (idempotent host /dev scan) so the same
+        // device set drives both the parent cgroup allowlist and these binds.
+        let gpu_device_set: Option<GpuDeviceSet> = match self.config.gpu.as_ref() {
+            Some(gpu_config) => match resolve_gpu_devices(gpu_config) {
+                Ok(Some(set)) => Some(set),
+                Ok(None) => {
+                    warn!(
+                        "--gpu requested but no GPU devices discovered in child; skipping mounts"
+                    );
+                    None
+                }
+                Err(e) => {
+                    return Err(NucleusError::FilesystemError(format!(
+                        "GPU device resolution failed: {}",
+                        e
+                    )))
+                }
+            },
+            None => None,
+        };
+        if let Some(ref set) = gpu_device_set {
+            let gpu_config = self.config.gpu.as_ref().expect("gpu config present");
+            mount_gpu_passthrough(
+                &container_root,
+                set,
+                gpu_config,
+                &self.config.process_identity,
+            )?;
+        }
+
         // /dev/shm – POSIX shared memory (shm_open). Required by PostgreSQL,
         // Redis, and other programs that use POSIX shared memory segments.
         let shm_path = dev_path.join("shm");
@@ -1594,11 +1653,13 @@ impl Container {
                         self.config.seccomp_log_denied,
                     )?
                 } else {
-                    seccomp_mgr.apply_filter_for_network_mode(
+                    let gpu_mode = self.config.gpu.is_some();
+                    seccomp_mgr.apply_filter_with_options(
                         allow_network,
                         allow_degraded_security,
                         self.config.seccomp_log_denied,
                         &self.config.seccomp_allow_syscalls,
+                        gpu_mode,
                     )?
                 }
             }
@@ -1655,6 +1716,13 @@ impl Container {
                     landlock_mgr.add_ro_path(&vol.dest.to_string_lossy());
                 } else {
                     landlock_mgr.add_rw_path(&vol.dest.to_string_lossy());
+                }
+            }
+            // GPU device nodes must be reachable (read+write) by the workload.
+            // Driver support files are read-only inputs.
+            if let Some(ref set) = gpu_device_set {
+                for node in &set.nodes {
+                    landlock_mgr.add_rw_path(&node.to_string_lossy());
                 }
             }
             landlock_mgr.apply_container_policy_with_mode(allow_degraded_security)?

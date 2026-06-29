@@ -528,6 +528,136 @@ pub enum ReadinessProbe {
     SdNotify,
 }
 
+/// GPU vendor to expose to the container.
+///
+/// `Auto` scans the host and exposes whatever is present. The explicit
+/// variants restrict passthrough to a single stack. `All` binds every
+/// recognized GPU device node on the host regardless of vendor.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    clap::ValueEnum,
+    serde::Serialize,
+    serde::Deserialize,
+)]#[serde(rename_all = "kebab-case")]
+pub enum GpuVendor {
+    /// Discover and bind whatever GPU devices are present on the host.
+    #[default]
+    Auto,
+    /// NVIDIA (CUDA): `/dev/nvidia*`, `/dev/nvidia-uvm*`, `/dev/nvidiactl`.
+    Nvidia,
+    /// AMD ROCm: `/dev/kfd` plus DRI render nodes.
+    Amd,
+    /// Intel / Mesa: DRI render and card nodes.
+    Intel,
+    /// Bind every recognized GPU device node on the host.
+    All,
+}
+
+impl GpuVendor {
+    /// Returns `true` when this selection can bind NVIDIA device nodes.
+    pub fn includes_nvidia(self) -> bool {
+        matches!(self, Self::Auto | Self::Nvidia | Self::All)
+    }
+
+    /// Returns `true` when this selection can bind AMD (ROCm) device nodes.
+    pub fn includes_amd(self) -> bool {
+        matches!(self, Self::Auto | Self::Amd | Self::All)
+    }
+
+    /// Returns `true` when this selection can bind Intel/Mesa DRI nodes.
+    pub fn includes_intel(self) -> bool {
+        matches!(self, Self::Auto | Self::Intel | Self::All)
+    }
+}
+
+/// Default NVIDIA driver capability set exposed to the workload.
+///
+/// Matches the NVIDIA Container Toolkit default: compute + utility is enough
+/// for `nvidia-smi` and CUDA compute workloads without pulling in display,
+/// video, or graphics stacks that widen the device surface.
+pub const DEFAULT_GPU_DRIVER_CAPABILITIES: &str = "compute,utility";
+
+/// Default value for `NVIDIA_VISIBLE_DEVICES` when passthrough is enabled.
+pub const DEFAULT_GPU_VISIBLE_DEVICES: &str = "all";
+
+/// GPU passthrough configuration.
+///
+/// When present on a `ContainerConfig`, the runtime binds the selected GPU
+/// device nodes (and the minimal driver support files they need) into the
+/// container, installs a cgroup device allowlist, and relaxes the seccomp
+/// `ioctl` filter so vendor driver ioctls reach the hardware.
+///
+/// See `spec/gpu-passthrough.md` for the full design.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct GpuPassthroughConfig {
+    /// Vendor selection controlling device discovery.
+    #[serde(default)]
+    pub vendor: GpuVendor,
+    /// Explicit device node overrides. When non-empty, discovery is skipped
+    /// and exactly these host paths are bound (after validation).
+    #[serde(default)]
+    pub devices: Vec<PathBuf>,
+    /// Value for `NVIDIA_DRIVER_CAPABILITIES`. Defaults to
+    /// [`DEFAULT_GPU_DRIVER_CAPABILITIES`].
+    pub driver_capabilities: String,
+    /// Value for `NVIDIA_VISIBLE_DEVICES`. Defaults to
+    /// [`DEFAULT_GPU_VISIBLE_DEVICES`].
+    pub visible_devices: String,
+    /// Attempt to bind host driver userspace libraries (NVIDIA toolkit /
+    /// ROCm). Set `false` when the container rootfs ships its own stack.
+    #[serde(default = "default_bind_driver_libraries")]
+    pub bind_driver_libraries: bool,
+}
+
+fn default_bind_driver_libraries() -> bool {
+    true
+}
+
+impl Default for GpuPassthroughConfig {
+    fn default() -> Self {
+        Self {
+            vendor: GpuVendor::Auto,
+            devices: Vec::new(),
+            driver_capabilities: DEFAULT_GPU_DRIVER_CAPABILITIES.to_string(),
+            visible_devices: DEFAULT_GPU_VISIBLE_DEVICES.to_string(),
+            bind_driver_libraries: true,
+        }
+    }
+}
+
+impl GpuPassthroughConfig {
+    /// Returns `true` if passthrough is active (always true for this type;
+    /// presence of the `Option<GpuPassthroughConfig>` is the real switch).
+    pub fn is_enabled(&self) -> bool {
+        true
+    }
+}
+
+/// Environment variables a GPU-enabled workload expects.
+///
+/// These are launch-derived from [`GpuPassthroughConfig`] and injected at
+/// exec time (and into the gVisor OCI process env). They are intentionally
+/// minimal: `NVIDIA_VISIBLE_DEVICES`, `NVIDIA_DRIVER_CAPABILITIES`, and the
+/// EGL vendor manifest pointer that lets Mesa find the bound host driver.
+pub fn gpu_environment(gpu: &GpuPassthroughConfig) -> Vec<(&'static str, String)> {
+    let mut env = vec![
+        ("NVIDIA_VISIBLE_DEVICES", gpu.visible_devices.clone()),
+        ("NVIDIA_DRIVER_CAPABILITIES", gpu.driver_capabilities.clone()),
+    ];
+    if gpu.vendor.includes_nvidia() {
+        env.push((
+            "__EGL_VENDOR_LIBRARY_FILENAMES",
+            "/usr/share/glvnd/egl_vendor.d/10_nvidia.json".to_string(),
+        ));
+    }
+    env
+}
+
 /// Container configuration
 #[derive(Debug, Clone)]
 pub struct ContainerConfig {
@@ -715,6 +845,12 @@ pub struct ContainerConfig {
     /// Override root directory for state storage (--root).
     /// When set, ContainerStateManager uses this instead of the default.
     pub state_root: Option<PathBuf>,
+
+    /// GPU passthrough configuration. When set, selected host GPU device nodes
+    /// and their minimal driver support files are bound into the container,
+    /// a cgroup device allowlist is installed, and the seccomp `ioctl` filter
+    /// is relaxed for vendor driver ioctls. See `spec/gpu-passthrough.md`.
+    pub gpu: Option<GpuPassthroughConfig>,
 }
 
 /// Seccomp operating mode.
@@ -831,6 +967,7 @@ impl ContainerConfig {
             console_size: ConsoleSize::default(),
             bundle_dir: None,
             state_root: None,
+            gpu: None,
         })
     }
 
@@ -1196,6 +1333,16 @@ impl ContainerConfig {
         self
     }
 
+    /// Enable GPU passthrough with the given configuration.
+    ///
+    /// This is the programmatic equivalent of `--gpu`. See
+    /// `spec/gpu-passthrough.md` for the security model.
+    #[must_use]
+    pub fn with_gpu(mut self, gpu: GpuPassthroughConfig) -> Self {
+        self.gpu = Some(gpu);
+        self
+    }
+
     fn validate_credential_broker(&self) -> crate::error::Result<()> {
         let Some(broker) = &self.credential_broker else {
             return Ok(());
@@ -1334,6 +1481,14 @@ impl ContainerConfig {
         }
 
         self.validate_fail_closed_isolation()?;
+
+        if self.gpu.is_some() {
+            return Err(crate::error::NucleusError::ConfigError(
+                "Production mode forbids --gpu host device passthrough; production services must \
+                 declare GPU needs through an attested rootfs"
+                    .to_string(),
+            ));
+        }
 
         if self.workspace.allow_execute && self.workspace.is_writable() {
             return Err(crate::error::NucleusError::ConfigError(
@@ -2740,5 +2895,65 @@ mod tests {
             "container ID must be valid hex: {}",
             id
         );
+    }
+
+    #[test]
+    fn gpu_defaults_match_nvidia_toolkit() {
+        let cfg = GpuPassthroughConfig::default();
+        assert_eq!(cfg.vendor, GpuVendor::Auto);
+        assert!(cfg.devices.is_empty());
+        assert_eq!(cfg.driver_capabilities, DEFAULT_GPU_DRIVER_CAPABILITIES);
+        assert_eq!(cfg.visible_devices, DEFAULT_GPU_VISIBLE_DEVICES);
+        assert!(cfg.bind_driver_libraries);
+    }
+
+    #[test]
+    fn production_mode_rejects_gpu_passthrough() {
+        let mut cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
+            .with_gpu(GpuPassthroughConfig::default());
+        cfg.service_mode = ServiceMode::Production;
+        cfg.rootfs_path = Some(std::path::PathBuf::from("/nix/some/rootfs"));
+        let err = cfg.validate_production_mode().unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("Production mode forbids --gpu"),
+            "unexpected error: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn agent_mode_allows_gpu_passthrough() {
+        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
+            .with_gpu(GpuPassthroughConfig::default());
+        // Agent is the default service mode and must permit GPU.
+        assert_eq!(cfg.service_mode, ServiceMode::Agent);
+        assert!(cfg.gpu.is_some());
+        cfg.validate_production_mode().expect("agent mode permits gpu");
+    }
+
+    #[test]
+    fn gpu_environment_includes_nvidia_vars() {
+        let gpu = GpuPassthroughConfig {
+            vendor: GpuVendor::Nvidia,
+            ..GpuPassthroughConfig::default()
+        };
+        let env = gpu_environment(&gpu);
+        let keys: Vec<&str> = env.iter().map(|(k, _)| *k).collect();
+        assert!(keys.contains(&"NVIDIA_VISIBLE_DEVICES"));
+        assert!(keys.contains(&"NVIDIA_DRIVER_CAPABILITIES"));
+        assert!(keys.contains(&"__EGL_VENDOR_LIBRARY_FILENAMES"));
+    }
+
+    #[test]
+    fn gpu_environment_omits_egl_when_not_nvidia() {
+        let gpu = GpuPassthroughConfig {
+            vendor: GpuVendor::Amd,
+            ..GpuPassthroughConfig::default()
+        };
+        let env = gpu_environment(&gpu);
+        assert!(!env.iter().any(|(k, _)| *k == "__EGL_VENDOR_LIBRARY_FILENAMES"));
     }
 }

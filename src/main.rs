@@ -5,10 +5,10 @@ use nucleus::checkpoint::{CheckpointMetadata, CriuRuntime};
 use nucleus::container::{
     parse_signal, validate_container_name, validate_hostname, ConsoleSize, Container,
     ContainerConfig, ContainerLifecycle, ContainerState, ContainerStateManager,
-    ContainerStateParams, HealthCheck, KernelLockdownMode, NetworkModeArg, OciStatus,
-    ProcessIdentity, ProviderConfigMount, ReadinessProbe, RootfsMode, RuntimeSelection,
-    SeccompMode, SecretMount, ServiceMode, TrustLevel, VolumeMount, VolumeSource, WorkspaceConfig,
-    WorkspaceMode, DEFAULT_HOME_PATH,
+    ContainerStateParams, GpuPassthroughConfig, GpuVendor, HealthCheck, KernelLockdownMode,
+    NetworkModeArg, OciStatus, ProcessIdentity, ProviderConfigMount, ReadinessProbe, RootfsMode,
+    RuntimeSelection, SeccompMode, SecretMount, ServiceMode, TrustLevel, VolumeMount,
+    VolumeSource, WorkspaceConfig, WorkspaceMode, DEFAULT_HOME_PATH,
 };
 use nucleus::error::{NucleusError, Result};
 use nucleus::filesystem::{
@@ -801,6 +801,11 @@ const RUN_CONFIG_FD_CONFLICTS: &[&str] = &[
     "disable_cgroup_namespace",
     "hooks",
     "topology_config_hash",
+    "gpu",
+    "gpu_device",
+    "gpu_driver_capabilities",
+    "gpu_visible_devices",
+    "no_gpu_driver_libs",
     "command",
 ];
 
@@ -1166,6 +1171,30 @@ enum Commands {
         #[arg(long = "topology-config-hash", hide = true)]
         topology_config_hash: Option<u64>,
 
+        /// Expose host GPU(s) to the container (auto/nvidia/amd/intel/all).
+        ///
+        /// Binds the selected GPU device nodes into /dev, installs a cgroup
+        /// device allowlist, and relaxes the seccomp ioctl filter so vendor
+        /// driver ioctls reach the hardware. See `spec/gpu-passthrough.md`.
+        #[arg(long)]
+        gpu: Option<GpuVendor>,
+
+        /// Explicit GPU device node to bind (repeatable). Overrides discovery.
+        #[arg(long = "gpu-device")]
+        gpu_device: Vec<String>,
+
+        /// NVIDIA_DRIVER_CAPABILITIES value (default: compute,utility)
+        #[arg(long = "gpu-driver-capabilities")]
+        gpu_driver_capabilities: Option<String>,
+
+        /// NVIDIA_VISIBLE_DEVICES value (default: all)
+        #[arg(long = "gpu-visible-devices")]
+        gpu_visible_devices: Option<String>,
+
+        /// Do not bind host driver userspace libraries; the rootfs ships its own
+        #[arg(long = "no-gpu-driver-libs")]
+        no_gpu_driver_libs: bool,
+
         /// Command to run in container
         #[arg(
             last = true,
@@ -1491,6 +1520,11 @@ struct RunConfig {
     disable_cgroup_namespace: bool,
     hooks: Option<String>,
     topology_config_hash: Option<u64>,
+    gpu: Option<GpuVendor>,
+    gpu_device: Vec<String>,
+    gpu_driver_capabilities: Option<String>,
+    gpu_visible_devices: Option<String>,
+    no_gpu_driver_libs: bool,
     command: Vec<String>,
 }
 
@@ -1580,6 +1614,11 @@ impl Default for RunConfig {
             disable_cgroup_namespace: false,
             hooks: None,
             topology_config_hash: None,
+            gpu: None,
+            gpu_device: Vec::new(),
+            gpu_driver_capabilities: None,
+            gpu_visible_devices: None,
+            no_gpu_driver_libs: false,
             command: Vec::new(),
         }
     }
@@ -2155,6 +2194,11 @@ fn try_main() -> Result<i32> {
             disable_cgroup_namespace,
             hooks,
             topology_config_hash,
+            gpu,
+            gpu_device,
+            gpu_driver_capabilities,
+            gpu_visible_devices,
+            no_gpu_driver_libs,
             command,
         } => {
             let create_request = match (detached_config_json, config, config_fd) {
@@ -2259,6 +2303,11 @@ fn try_main() -> Result<i32> {
                     disable_cgroup_namespace,
                     hooks,
                     topology_config_hash,
+                    gpu,
+                    gpu_device,
+                    gpu_driver_capabilities,
+                    gpu_visible_devices,
+                    no_gpu_driver_libs,
                     command,
                 },
                 _ => {
@@ -2453,6 +2502,11 @@ fn try_main() -> Result<i32> {
                 disable_cgroup_namespace,
                 hooks,
                 topology_config_hash,
+                gpu,
+                gpu_device,
+                gpu_driver_capabilities,
+                gpu_visible_devices,
+                no_gpu_driver_libs,
                 command,
             } = create_request;
 
@@ -2569,6 +2623,24 @@ fn try_main() -> Result<i32> {
 
             if let Some(hash) = topology_config_hash {
                 config = config.with_config_hash(hash);
+            }
+
+            // GPU passthrough (CLI -> GpuPassthroughConfig).
+            if gpu.is_some() || !gpu_device.is_empty() {
+                let mut devices: Vec<std::path::PathBuf> = Vec::new();
+                for dev in &gpu_device {
+                    devices.push(std::path::PathBuf::from(dev));
+                }
+                let gpu_config = GpuPassthroughConfig {
+                    vendor: gpu.unwrap_or_default(),
+                    devices,
+                    driver_capabilities: gpu_driver_capabilities
+                        .unwrap_or_else(|| nucleus::container::DEFAULT_GPU_DRIVER_CAPABILITIES.to_string()),
+                    visible_devices: gpu_visible_devices
+                        .unwrap_or_else(|| nucleus::container::DEFAULT_GPU_VISIBLE_DEVICES.to_string()),
+                    bind_driver_libraries: !no_gpu_driver_libs,
+                };
+                config = config.with_gpu(gpu_config);
             }
 
             if let Some(ctx) = context {
@@ -3317,6 +3389,11 @@ mod tests {
             disable_cgroup_namespace: true,
             hooks: Some("/tmp/hooks.json".to_string()),
             topology_config_hash: Some(42),
+            gpu: None,
+            gpu_device: Vec::new(),
+            gpu_driver_capabilities: None,
+            gpu_visible_devices: None,
+            no_gpu_driver_libs: false,
             command: vec![
                 "/bin/sh".to_string(),
                 "-ceu".to_string(),
@@ -3426,6 +3503,11 @@ mod tests {
             disable_cgroup_namespace: false,
             hooks: None,
             topology_config_hash: None,
+            gpu: None,
+            gpu_device: Vec::new(),
+            gpu_driver_capabilities: None,
+            gpu_visible_devices: None,
+            no_gpu_driver_libs: false,
             command: vec!["/bin/true".to_string()],
         })
         .unwrap();

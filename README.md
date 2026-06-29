@@ -151,6 +151,7 @@ The Cargo package name is `nucleus-container`; it installs the `nucleus` binary.
 
 ## Recent Features
 
+- **GPU passthrough** – `--gpu auto|nvidia|amd|intel|all` binds host GPU device nodes into `/dev`, installs a cgroup v2 device allowlist (`BPF_PROG_TYPE_CGROUP_DEVICE`), relaxes the seccomp `ioctl` filter for vendor driver ioctls, and bind-mounts driver support files. Explicit device selection, NVIDIA env vars, and a programmatic `gpu` config document field are supported. See [spec/gpu-passthrough.md](spec/gpu-passthrough.md).
 - **Local signed image snapshots** – Native overlay-backed containers can be committed, verified, inspected, loaded, and run as thin image directories over a Nix rootfs base.
 - **Privilege drop for services** – `--user`, `--group`, and `--additional-group` now apply a real post-setup workload identity in both the native runtime and gVisor.
 - **Ownership-aware secrets and writable paths** – Production secret staging and NixOS `createHostPath = true` defaults now align file ownership with the configured workload user/group.
@@ -337,6 +338,71 @@ The repository also exposes `packages.${system}.agent-toolchain-rootfs` as a
 default shell/Git/compiler/package-manager rootfs. Integrations that need exact
 provider CLIs should call `mkAgentToolchainRootfs` with pinned provider package
 derivations and pass the resulting store path to `--agent-toolchain-rootfs`.
+
+### Image Snapshots
+
+### GPU Passthrough
+
+Expose host GPUs to a container for CUDA, ROCm, or Mesa/Vulkan compute workloads.
+GPU access is an explicit, audited privilege grant — Nucleus preserves its
+full defense-in-depth stack (namespaces, capabilities, Landlock, cgroups)
+while binding only the requested device nodes and relaxing only the `ioctl`
+seccomp rule.
+
+```bash
+# Auto-detect and bind whatever GPU is present on the host
+nucleus create --gpu auto --rootfs /nix/.../cuda-rootfs -- python train.py
+
+# Pin a vendor and explicit devices (overrides discovery)
+nucleus create --gpu nvidia \
+  --gpu-device /dev/nvidia0 \
+  --gpu-device /dev/nvidiactl \
+  --rootfs /nix/.../cuda-rootfs -- nvidia-smi
+
+# AMD ROCm
+nucleus create --gpu amd --rootfs /nix/.../rocm-rootfs -- rocminfo
+
+# Bind only the devices; the rootfs ships its own driver stack
+nucleus create --gpu auto --no-gpu-driver-libs --rootfs /nix/.../rootfs -- ./workload
+```
+
+What happens when `--gpu` is set:
+
+- **Device nodes** — the resolved `/dev/nvidia*`, `/dev/dri/renderD*`, `/dev/kfd`,
+  `/dev/nvidia-uvm*`, etc. are bind-mounted into the container `/dev` at their
+  host paths and chown'd to the workload identity.
+- **cgroup device allowlist** — a `BPF_PROG_TYPE_CGROUP_DEVICE` program is
+  attached to the container cgroup, allow-listing only the base `/dev` nodes
+  plus the bound GPU devices (deny-by-default). This is best-effort: rootless
+  launches and kernels without `bpf(2)` degrade to a warning, leaving the
+  filesystem layer (only bound device nodes exist in `/dev`) as the gate.
+- **Seccomp** — the restrictive terminal-only `ioctl` rule is replaced with an
+  unconditional allow, since vendor driver ioctl request codes cannot be
+  enumerated. All other seccomp restrictions remain.
+- **Driver support files** — NVIDIA `/proc/driver/nvidia`, driver userspace
+  library directories, and Vulkan/ICD/EGL manifests are bind-mounted read-only
+  when present (`--no-gpu-driver-libs` skips this).
+- **Environment** — `NVIDIA_VISIBLE_DEVICES`, `NVIDIA_DRIVER_CAPABILITIES`, and
+  the EGL vendor manifest pointer are injected at exec time.
+- **gVisor** — runsc receives OCI `linux.devices` entries (major/minor/type) so
+  it creates the device nodes and installs the matching cgroup rules inside its
+  sandbox, plus bind mounts for the driver support files.
+- **Auditing** — the `container_started` event stream reports the vendor,
+  visible devices, driver capabilities, and the relaxed-seccomp flag.
+
+CLI flags:
+
+| Flag | Purpose |
+|---|---|
+| `--gpu <auto\|nvidia\|amd\|intel\|all>` | Enable GPU passthrough and select vendor(s) |
+| `--gpu-device <path>` | Explicit device node (repeatable; overrides discovery) |
+| `--gpu-driver-capabilities <s>` | `NVIDIA_DRIVER_CAPABILITIES` (default `compute,utility`) |
+| `--gpu-visible-devices <s>` | `NVIDIA_VISIBLE_DEVICES` (default `all`) |
+| `--no-gpu-driver-libs` | Do not bind host driver userspace libraries |
+
+`--gpu` is rejected in `--service-mode production` (declare GPU needs through an
+attested rootfs instead). The same configuration is available programmatically
+via the `gpu` field of the launch config document (`--config`/`--config-fd`).
 
 ### Image Snapshots
 

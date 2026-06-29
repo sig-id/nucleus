@@ -715,14 +715,38 @@ impl SeccompManager {
         log_denied: bool,
         extra_syscalls: &[String],
     ) -> Result<bool> {
+        self.apply_filter_with_options(
+            allow_network,
+            best_effort,
+            log_denied,
+            extra_syscalls,
+            /* gpu_mode */ false,
+        )
+    }
+
+    /// Apply the seccomp filter with an optional GPU relaxation.
+    ///
+    /// When `gpu_mode` is `true`, the restrictive terminal-only `ioctl`
+    /// allowlist is replaced with an unconditional allow. GPU drivers issue
+    /// dozens of vendor-specific ioctl request codes (DRM, NV_ESC_RM, KFD)
+    /// that cannot be enumerated, so the narrow allowlist is incompatible with
+    /// GPU passthrough. This is an audited, opt-in relaxation.
+    pub fn apply_filter_with_options(
+        &mut self,
+        allow_network: bool,
+        best_effort: bool,
+        log_denied: bool,
+        extra_syscalls: &[String],
+        gpu_mode: bool,
+    ) -> Result<bool> {
         if self.applied {
             debug!("Seccomp filter already applied, skipping");
             return Ok(true);
         }
 
-        info!(allow_network, "Applying seccomp filter");
+        info!(allow_network, gpu_mode, "Applying seccomp filter");
 
-        let rules = match Self::minimal_filter(allow_network, extra_syscalls) {
+        let mut rules = match Self::minimal_filter(allow_network, extra_syscalls) {
             Ok(r) => r,
             Err(e) => {
                 if best_effort {
@@ -735,6 +759,14 @@ impl SeccompManager {
                 return Err(e);
             }
         };
+
+        // GPU relaxation: replace the terminal-only ioctl allowlist with an
+        // unconditional allow. Vendor driver ioctl request codes are not
+        // enumerable, so the narrow filter would kill GPU workloads.
+        if gpu_mode {
+            rules.insert(libc::SYS_ioctl, Vec::new());
+            info!("GPU mode: relaxing seccomp ioctl filter to allow-all");
+        }
 
         let target_arch = match std::env::consts::ARCH.try_into() {
             Ok(a) => a,

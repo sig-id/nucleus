@@ -326,16 +326,37 @@ pub struct SecurityEventMetadata {
     pub capabilities_status: String,
     pub rootless: bool,
     pub allow_degraded_security: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu: Option<GpuEventSummary>,
+}
+
+/// GPU passthrough summary emitted in the container started/summary events.
+#[derive(Debug, Clone, Serialize)]
+pub struct GpuEventSummary {
+    pub vendor: String,
+    pub visible_devices: String,
+    pub driver_capabilities: String,
+    pub bind_driver_libraries: bool,
+    /// Whether the seccomp ioctl filter was relaxed for GPU driver ioctls.
+    pub relaxed_seccomp_ioctl: bool,
 }
 
 impl SecurityEventMetadata {
     fn from_config(config: &ContainerConfig) -> Self {
+        let gpu = config.gpu.as_ref().map(|g| GpuEventSummary {
+            vendor: format!("{:?}", g.vendor).to_lowercase(),
+            visible_devices: g.visible_devices.clone(),
+            driver_capabilities: g.driver_capabilities.clone(),
+            bind_driver_libraries: g.bind_driver_libraries,
+            relaxed_seccomp_ioctl: true,
+        });
         Self {
             seccomp_mode: seccomp_mode_label(config),
             landlock_status: landlock_status_label(config),
             capabilities_status: capabilities_status_label(config),
             rootless: config.user_ns_config.is_some(),
             allow_degraded_security: config.allow_degraded_security,
+            gpu,
         }
     }
 }
