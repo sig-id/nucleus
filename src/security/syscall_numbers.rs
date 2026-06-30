@@ -22,6 +22,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn generic_file_syscalls_have_current_arch_numbers() {
         assert!(SYS_FADVISE64 > 0);
         assert!(SYS_SENDFILE > 0);

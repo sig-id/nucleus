@@ -144,6 +144,9 @@ mod tests {
     }
 }
 
+// The NativePty impl lives after the test module by historical file layout;
+// reordering carries risk for no behavioral gain.
+#[allow(clippy::items_after_test_module)]
 impl NativePty {
     pub(super) fn open(size: ConsoleSize) -> Result<Self> {
         let winsize = Winsize {

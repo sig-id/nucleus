@@ -1046,13 +1046,12 @@ impl Container {
                     })
                 };
 
-                parent_setup().map_err(|e| {
+                parent_setup().inspect_err(|_| {
                     if let Some(target_pid) = target_pid_for_cleanup {
                         let _ = kill(Pid::from_raw(target_pid as i32), Signal::SIGKILL);
                     }
                     let _ = kill(child, Signal::SIGKILL);
                     let _ = waitpid(child, None);
-                    e
                 })
             }
             ForkResult::Child => {
@@ -1130,6 +1129,7 @@ impl Container {
     ///
     /// This runs in the child process after fork.
     /// Tracks FilesystemState and SecurityState machines to enforce correct ordering.
+    #[allow(clippy::too_many_arguments)]
     fn setup_and_exec(
         &self,
         ready_pipe: Option<OwnedFd>,

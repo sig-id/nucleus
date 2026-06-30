@@ -160,12 +160,11 @@ fn authorized(request: &str, expected: Option<&str>) -> bool {
         };
         let name = name.trim();
         let value = value.trim();
-        if name.eq_ignore_ascii_case("Proxy-Authorization")
-            || name.eq_ignore_ascii_case("Authorization")
+        if (name.eq_ignore_ascii_case("Proxy-Authorization")
+            || name.eq_ignore_ascii_case("Authorization"))
+            && value == format!("Bearer {}", expected)
         {
-            if value == format!("Bearer {}", expected) {
-                return true;
-            }
+            return true;
         }
         if name.eq_ignore_ascii_case("X-Nucleus-Credential-Broker-Token") && value == expected {
             return true;
@@ -175,7 +174,7 @@ fn authorized(request: &str, expected: Option<&str>) -> bool {
 }
 
 fn host_allowed(host: &str, allowed_host: Option<&str>) -> bool {
-    allowed_host.map_or(true, |allowed| host.eq_ignore_ascii_case(allowed))
+    allowed_host.is_none_or(|allowed| host.eq_ignore_ascii_case(allowed))
 }
 
 fn parse_absolute_http_target(target: &str) -> Option<(String, String)> {
@@ -243,16 +242,10 @@ fn tunnel(left: TcpStream, right: TcpStream) -> io::Result<()> {
     let download = thread::spawn(move || copy_and_shutdown(&mut right_reader, &mut left_writer));
 
     let upload_result = upload.join().unwrap_or_else(|_| {
-        Err(io::Error::new(
-            io::ErrorKind::Other,
-            "upload thread panicked",
-        ))
+        Err(io::Error::other("upload thread panicked"))
     });
     let download_result = download.join().unwrap_or_else(|_| {
-        Err(io::Error::new(
-            io::ErrorKind::Other,
-            "download thread panicked",
-        ))
+        Err(io::Error::other("download thread panicked"))
     });
 
     upload_result?;

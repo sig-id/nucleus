@@ -198,6 +198,7 @@ pub enum NetworkModeArg {
     Bridge,
 }
 
+#[allow(clippy::derivable_impls)]
 impl Default for NetworkModeArg {
     fn default() -> Self {
         Self::None
@@ -229,6 +230,7 @@ pub enum UsernsModeArg {
     Auto,
 }
 
+#[allow(clippy::derivable_impls)]
 impl Default for UsernsModeArg {
     fn default() -> Self {
         Self::NoMap
@@ -1633,7 +1635,7 @@ impl ContainerConfig {
 
         normalize_container_destination(&self.workdir)?;
         let workspace_path = normalize_container_destination(&self.workspace.container_path)?;
-        if workspace_path != PathBuf::from("/workspace") {
+        if workspace_path != std::path::Path::new("/workspace") {
             return Err(crate::error::NucleusError::ConfigError(
                 "Workspace destination is fixed at /workspace".to_string(),
             ));
