@@ -9,7 +9,7 @@ use crate::security::{
     load_json_policy, GVisorNetworkMode, GVisorOciRunOptions, GVisorRuntime, OciBundle, OciConfig,
     OciMount, OciSeccomp,
 };
-use nix::unistd::Uid;
+use nix::unistd::{Gid, Uid};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use tracing::info;
 
@@ -435,10 +435,30 @@ impl Container {
         let owner = metadata.uid();
         let euid = Uid::effective().as_raw();
         if owner != euid {
-            return Err(NucleusError::FilesystemError(format!(
-                "{} {:?} is owned by uid {} (expected {})",
-                label, path, owner, euid
-            )));
+            // Under a non-trivial user namespace (keep-id / auto), our own
+            // files appear under a non-root container uid. Reclaim a stale
+            // artifact dir owned by a mapped uid by chowning it to container
+            // root; reject anything owned by an unmapped (foreign) uid.
+            if crate::isolation::uid_is_mapped_in_current_userns(owner)
+                && Uid::effective().is_root()
+            {
+                nix::unistd::chown(
+                    path,
+                    Some(Uid::from_raw(0)),
+                    Some(Gid::from_raw(0)),
+                )
+                .map_err(|e| {
+                    NucleusError::FilesystemError(format!(
+                        "Failed to reclaim {} {:?}: {}",
+                        label, path, e
+                    ))
+                })?;
+            } else {
+                return Err(NucleusError::FilesystemError(format!(
+                    "{} {:?} is owned by uid {} (expected {})",
+                    label, path, owner, euid
+                )));
+            }
         }
         if mode & 0o077 != 0 {
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(

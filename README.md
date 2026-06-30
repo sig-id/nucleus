@@ -28,34 +28,49 @@ Production deployments are built to be:
 | **Nucleus** | **12 ms** |
 | Docker | ~500 ms |
 
-### PostgreSQL 18 (pgbench, 8 clients, 60s, scale 50)
+### PostgreSQL 18 (pgbench, 8 clients, 30s, scale 50, 3 runs)
 
-In the native runtime, PostgreSQL stays near bare-metal performance under Nucleus
-isolation. In this harness, occasional wins over bare metal should be treated as
-benchmark noise rather than a guaranteed speedup.
+The native runtime stays within run-to-run noise of bare metal, while the gVisor
+runtime pays a consistent ~62% tax from the Sentry's per-syscall user-space
+emulation. Occasional wins over bare metal should be treated as benchmark
+noise rather than a guaranteed speedup.
 
 **SELECT-only (read-heavy)**
 
-| Environment | I/O Method | Avg TPS | Avg Latency |
-|---|---|---|---|
-| Baremetal | worker | 100,222 | 0.080 ms |
-| Baremetal | io_uring | 84,895 | 0.096 ms |
-| **Nucleus** | **worker** | **105,965** | **0.075 ms** |
-| **Nucleus** | **io_uring** | **107,039** | **0.074 ms** |
+| Environment | I/O Method | Avg TPS | Avg Latency | vs Baremetal |
+|---|---|---|---|---|
+| Baremetal | worker | 170,411 | 0.047 ms | baseline |
+| Baremetal | io_uring | 174,026 | 0.046 ms | +2.1% |
+| **Nucleus** | **worker** | **169,577** | **0.047 ms** | **−0.5%** |
+| **Nucleus** | **io_uring** | **172,482** | **0.046 ms** | **+1.2%** |
+| gVisor | worker | 65,683 | 0.122 ms | −61.5% |
 
 **TPC-B (mixed read/write)**
 
-| Environment | I/O Method | Avg TPS | Avg Latency |
-|---|---|---|---|
-| Baremetal | worker | 1,490 | 5.38 ms |
-| Baremetal | io_uring | 1,382 | 5.79 ms |
-| **Nucleus** | **worker** | **1,757** | **4.55 ms** |
-| **Nucleus** | **io_uring** | **1,585** | **5.05 ms** |
+| Environment | I/O Method | Avg TPS | Avg Latency | vs Baremetal |
+|---|---|---|---|---|
+| Baremetal | worker | 4,341 | 1.845 ms | baseline |
+| Baremetal | io_uring | 4,516 | 1.772 ms | +4.0% |
+| **Nucleus** | **worker** | **4,583** | **1.746 ms** | **+5.6%** |
+| **Nucleus** | **io_uring** | **4,607** | **1.736 ms** | **+6.1%** |
+| gVisor | worker | 1,655 | 4.834 ms | −61.9% |
 
-> Measured on Linux 6.18 x86_64. This benchmark uses the native runtime with a
-> bind-mounted host `pgdata` directory and `--network host`, so it measures the
-> steady-state cost of Nucleus isolation rather than VM or gVisor emulation
-> overhead. Full results: [`benches/pg18_io/results/`](benches/pg18_io/results/)
+> Measured on Linux 6.18 x86_64 with PostgreSQL 18.4. All three environments run
+> **fully unprivileged** (Nucleus rootless with `--userns keep-id`, no `sudo`);
+> the harness bind-mounts a host `pgdata` and uses host networking, so it
+> measures the steady-state cost of each isolation layer rather than image
+> unpacking or cold start. gVisor's Sentry does not implement `io_uring`, so it
+> is measured with `io_method=worker` only. Full results:
+> [`benches/pg18_io/results/`](benches/pg18_io/results/)
+>
+> Run it yourself (rootless):
+> ```bash
+> nix shell nixpkgs#postgresql_18 -c \
+>   env ROOTLESS=1 SCALE=50 CLIENTS=8 DURATION=30 RUNS=3 \
+>   bash benches/pg18_io/bench.sh
+> ```
+> Add `GVISOR_PLATFORM=systrap` if `/dev/kvm` is unavailable, or `SKIP_GVISOR=1`
+> to measure baremetal + native only.
 
 ## Why Nucleus?
 
@@ -178,6 +193,16 @@ nucleus run --runtime gvisor --context ./ctx/ -- ./agent
 
 # Rootless mode
 nucleus run --rootless -- /bin/sh
+
+# Rootless system services (e.g. PostgreSQL) that refuse euid 0:
+# --userns keep-id maps your uid to itself so host-owned bind mounts just work
+# (requires /etc/subuid + /etc/subgid, exactly like Docker/Podman rootless).
+nucleus create --userns keep-id --user "$(id -u)" --group "$(id -g)" \
+  -v ./pgdata:/pgdata -- postgres -D /pgdata
+# --user <non-zero> alone auto-selects keep-id when /etc/subuid is configured.
+# --userns auto     Podman/Docker default (workload uid in the subuid range)
+# --userns nomap    historic (only container root usable)
+# --uidmap/--gidmap explicit container:host:size mappings (Podman syntax)
 
 # Optional networking
 nucleus run --network host --allow-host-network -- curl https://example.com
@@ -1271,7 +1296,10 @@ All state machines are formally verified using TLA+ and the Apalache model check
 - context-heavy file scans with both bind-mounted and copied context
 - a constrained profile that applies the same cgroup limits to the direct host process and the containerized process
 
-Because the benchmark creates namespaces and cgroups, it must run as root:
+Because the benchmark creates namespaces and cgroups, it must run as root
+(`sudo -E cargo bench --bench container_runtime`). The system-level `pg18_io`
+benchmark additionally supports an unprivileged path — see
+[`benches/pg18_io/`](benches/pg18_io/) (`ROOTLESS=1`).
 
 ```bash
 sudo -E cargo bench --bench container_runtime
