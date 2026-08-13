@@ -54,7 +54,6 @@ fn nvidia_discovery_binds_card_and_control_nodes() {
     assert!(names.iter().any(|n| n == "nvidia-cap1"));
     assert!(!names.contains(&"nvidiafoo".to_string()));
     assert!(!names.contains(&"nvidia".to_string()));
-    // sorted
     let mut sorted = set.nodes.clone();
     sorted.sort();
     assert_eq!(set.nodes, sorted);
@@ -142,7 +141,12 @@ fn explicit_devices_resolve_and_classify() {
     let kfd = PathBuf::from("/dev/kfd");
     let render = PathBuf::from("/dev/dri/renderD128");
     let set = build_explicit_set(
-        &[nvidia0.clone(), nvidia0.clone(), kfd.clone(), render.clone()],
+        &[
+            nvidia0.clone(),
+            nvidia0.clone(),
+            kfd.clone(),
+            render.clone(),
+        ],
         GpuVendor::Auto,
     )
     .expect("explicit device set");
@@ -151,7 +155,6 @@ fn explicit_devices_resolve_and_classify() {
     assert!(set.nvidia);
     assert!(set.amd); // kfd + render classify as amd
     assert!(set.intel); // render also classifies as intel
-    // sorted
     let mut sorted = set.nodes.clone();
     sorted.sort();
     assert_eq!(set.nodes, sorted);
@@ -160,6 +163,26 @@ fn explicit_devices_resolve_and_classify() {
 #[test]
 fn build_explicit_set_empty_is_none() {
     assert!(build_explicit_set(&[], GpuVendor::Auto).is_none());
+}
+
+#[test]
+fn explicit_device_path_allowlist_rejects_non_gpu_devices() {
+    assert!(is_allowed_gpu_device_path(Path::new("/dev/nvidia0")));
+    assert!(is_allowed_gpu_device_path(Path::new("/dev/nvidiactl")));
+    assert!(is_allowed_gpu_device_path(Path::new(
+        "/dev/nvidia-caps/nvidia-cap1"
+    )));
+    assert!(is_allowed_gpu_device_path(Path::new("/dev/kfd")));
+    assert!(is_allowed_gpu_device_path(Path::new("/dev/dri/renderD128")));
+    assert!(is_allowed_gpu_device_path(Path::new("/dev/dri/card0")));
+
+    assert!(!is_allowed_gpu_device_path(Path::new("/dev/null")));
+    assert!(!is_allowed_gpu_device_path(Path::new("/dev/zero")));
+    assert!(!is_allowed_gpu_device_path(Path::new("/dev/sda")));
+    assert!(!is_allowed_gpu_device_path(Path::new(
+        "/dev/dri/controlD64"
+    )));
+    assert!(!is_allowed_gpu_device_path(Path::new("/tmp/dev/nvidia0")));
 }
 
 #[test]
