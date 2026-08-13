@@ -20,6 +20,7 @@ RESULTS_DIR="${RESULTS_DIR:-./results/$(date +%Y%m%d_%H%M%S)}"
 SKIP_INIT="${SKIP_INIT:-0}"
 GVISOR_PLATFORM="${GVISOR_PLATFORM:-kvm}"   # runsc backend: kvm (fastest, needs /dev/kvm), systrap, or ptrace
 SKIP_GVISOR="${SKIP_GVISOR:-0}"             # set to 1 to skip the gVisor variant
+ROOTLESS="${ROOTLESS:-0}"                   # set to 1 to run without sudo
 
 for arg in "$@"; do
   case "$arg" in
@@ -212,8 +213,6 @@ extract_latency() {
 # with --userns keep-id). Requires /etc/subuid + /etc/subgid + cgroup v2
 # delegation, exactly like Docker/Podman rootless. Default (ROOTLESS unset)
 # keeps the historic sudo path.
-ROOTLESS="${ROOTLESS:-0}"
-
 if [ "$ROOTLESS" != "1" ]; then
   if [ "$(id -u)" -ne 0 ]; then
     echo "ERROR: must run as root (set ROOTLESS=1 for the unprivileged path)" >&2
