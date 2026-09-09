@@ -8,6 +8,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 - No unreleased changes.
 
+## [0.4.0] - 2026-09-09
+
+### Security
+- Restrict explicit GPU passthrough to recognized GPU character devices under
+  `/dev`, rejecting arbitrary character and block devices.
+- Create independent container GPU device nodes with workload ownership and
+  mode `0660`, preserving non-root GPU access without changing host ownership
+  or permissions. Native setup now fails if device creation or ownership
+  assignment is unavailable, or a target inode already exists.
+
+### Changed
+- Upgrade Rust dependencies, including `dirs` 7, and refresh all transitive
+  dependency versions. Adopt the current Landlock `no_new_privs` API.
+- Refresh Nix inputs and the PostgreSQL benchmark lockfile.
+
+### Fixed
+- Place native GPU devices at their expected `/dev/...` paths instead of
+  `/dev/dev/...`.
+- Isolate image-signing keys in unit and integration tests to prevent parallel
+  key-creation races on clean systems.
+- Satisfy the current stable Clippy byte-string lint.
+
+### Tests
+- Add a privileged CI regression test verifying root and non-root access to
+  private device nodes while preserving the source inode's metadata.
+
 ## [0.3.9] - 2026-06-30
 
 ### Added
