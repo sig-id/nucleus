@@ -141,9 +141,8 @@ impl UserspaceNetwork {
                     &api_socket_path,
                     false,
                 )
-                .map_err(|retry_err| {
+                .inspect_err(|_| {
                     let _ = std::fs::remove_dir_all(&runtime_dir);
-                    retry_err
                 })?
             }
         };

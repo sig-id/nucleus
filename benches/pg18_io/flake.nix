@@ -1,5 +1,5 @@
 {
-  description = "PostgreSQL 18 benchmark: default I/O vs io_uring, baremetal vs Nucleus";
+  description = "PostgreSQL 18 benchmark: default I/O vs io_uring, baremetal vs Nucleus (native) vs Nucleus (gVisor)";
 
   inputs = {
     # Use the same nixpkgs revision as the main nucleus flake so gvisor

@@ -1,7 +1,7 @@
 use super::landlock::LandlockManager;
 use crate::error::{NucleusError, Result};
 use crate::oci::OciBundle;
-use nix::unistd::Uid;
+use nix::unistd::{Gid, Uid};
 use sha2::{Digest, Sha256};
 use std::ffi::CString;
 use std::fs::{self, DirBuilder, OpenOptions};
@@ -859,10 +859,32 @@ impl GVisorRuntime {
         let owner = metadata.uid();
         let expected = Uid::effective().as_raw();
         if owner != expected {
-            return Err(NucleusError::GVisorError(format!(
-                "{} {:?} is owned by uid {} (expected {})",
-                label, path, owner, expected
-            )));
+            // Under a non-trivial user namespace (keep-id / auto), files we
+            // legitimately own can appear under a non-root container uid
+            // (e.g. host uid 1000 -> container uid 1000). If the owner is still
+            // a uid mapped into our namespace, reclaim the directory by
+            // chowning it to container root (the trusted owner) rather than
+            // failing. This handles stale dirs left by a prior rootless mode.
+            if crate::isolation::uid_is_mapped_in_current_userns(owner)
+                && Uid::effective().is_root()
+            {
+                debug!(
+                    "Reclaiming {} {:?} from mapped uid {} to container root",
+                    label, path, owner
+                );
+                nix::unistd::chown(path, Some(Uid::from_raw(0)), Some(Gid::from_raw(0)))
+                    .map_err(|e| {
+                        NucleusError::GVisorError(format!(
+                            "Failed to reclaim {} {:?}: {}",
+                            label, path, e
+                        ))
+                    })?;
+            } else {
+                return Err(NucleusError::GVisorError(format!(
+                    "{} {:?} is owned by uid {} (expected {})",
+                    label, path, owner, expected
+                )));
+            }
         }
 
         let mode = metadata.permissions().mode() & 0o777;
@@ -901,7 +923,13 @@ impl GVisorRuntime {
 
         let owner = metadata.uid();
         let current = Uid::effective().as_raw();
-        let owner_trusted = owner == current || owner == 0;
+        // A parent is trusted if it is owned by us, by container root, or by any
+        // uid mapped into our (non-trivial) user namespace. The last clause is
+        // required for keep-id / auto rootless, where our own runtime dir
+        // (e.g. $XDG_RUNTIME_DIR) appears under a non-root container uid.
+        let owner_trusted = owner == current
+            || owner == 0
+            || crate::isolation::uid_is_mapped_in_current_userns(owner);
         let mode = metadata.permissions().mode();
         let unsafe_writable = mode & 0o022 != 0 && mode & 0o1000 == 0;
         if !owner_trusted || unsafe_writable {

@@ -198,9 +198,42 @@ pub enum NetworkModeArg {
     Bridge,
 }
 
+#[allow(clippy::derivable_impls)]
 impl Default for NetworkModeArg {
     fn default() -> Self {
         Self::None
+    }
+}
+
+/// Rootless user-namespace mapping strategy (`--userns`).
+///
+/// Docker/Podman-compatible names for the mapping written via `/etc/subuid`.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, serde::Serialize, serde::Deserialize,
+)]
+pub enum UsernsModeArg {
+    /// Map container root (0) to the calling user only. Historic Nucleus
+    /// behavior; workloads that refuse euid 0 (e.g. PostgreSQL) cannot run.
+    #[value(name = "nomap")]
+    #[serde(rename = "nomap")]
+    NoMap,
+    /// Map the calling user's uid/gid to itself; container root maps into the
+    /// delegated subuid range (Podman `--userns=keep-id`). Recommended for
+    /// bind-mounted host files owned by the user.
+    #[value(name = "keep-id")]
+    #[serde(rename = "keep-id")]
+    KeepId,
+    /// Map container root to the calling user and 1..N into the subuid range
+    /// (Podman/Docker rootless default). Workloads run as their image uid.
+    #[value(name = "auto")]
+    #[serde(rename = "auto")]
+    Auto,
+}
+
+#[allow(clippy::derivable_impls)]
+impl Default for UsernsModeArg {
+    fn default() -> Self {
+        Self::NoMap
     }
 }
 
@@ -1602,7 +1635,7 @@ impl ContainerConfig {
 
         normalize_container_destination(&self.workdir)?;
         let workspace_path = normalize_container_destination(&self.workspace.container_path)?;
-        if workspace_path != PathBuf::from("/workspace") {
+        if workspace_path != std::path::Path::new("/workspace") {
             return Err(crate::error::NucleusError::ConfigError(
                 "Workspace destination is fixed at /workspace".to_string(),
             ));

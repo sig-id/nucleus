@@ -598,7 +598,18 @@ impl Container {
         if !is_root && config.user_ns_config.is_none() {
             info!("Not running as root, automatically enabling rootless mode");
             config.namespaces.user = true;
-            config.user_ns_config = Some(crate::isolation::UserNamespaceConfig::rootless());
+            // If the workload requested a non-zero uid, prefer a keep-id mapping
+            // (when /etc/subuid is configured) so that uid is mappable; otherwise
+            // fall back to the historic trivial rootless mapping.
+            let workload_uid = if config.process_identity.uid != 0 {
+                Some(config.process_identity.uid)
+            } else {
+                None
+            };
+            config.user_ns_config =
+                Some(crate::isolation::UserNamespaceConfig::for_unprivileged_rootless(
+                    workload_uid,
+                ));
         }
 
         // C2: When running as root without user namespace, enable UID remapping
@@ -1035,13 +1046,12 @@ impl Container {
                     })
                 };
 
-                parent_setup().map_err(|e| {
+                parent_setup().inspect_err(|_| {
                     if let Some(target_pid) = target_pid_for_cleanup {
                         let _ = kill(Pid::from_raw(target_pid as i32), Signal::SIGKILL);
                     }
                     let _ = kill(child, Signal::SIGKILL);
                     let _ = waitpid(child, None);
-                    e
                 })
             }
             ForkResult::Child => {
@@ -1119,6 +1129,7 @@ impl Container {
     ///
     /// This runs in the child process after fork.
     /// Tracks FilesystemState and SecurityState machines to enforce correct ordering.
+    #[allow(clippy::too_many_arguments)]
     fn setup_and_exec(
         &self,
         ready_pipe: Option<OwnedFd>,

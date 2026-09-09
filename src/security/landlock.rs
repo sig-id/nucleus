@@ -18,6 +18,7 @@ const TARGET_ABI: ABI = ABI::V5;
 const MINIMUM_PRODUCTION_ABI: ABI = ABI::V3;
 
 #[derive(Debug, Clone, Copy)]
+#[allow(clippy::enum_variant_names)]
 enum PathAccessMode {
     ReadOnly,
     ReadExecute,

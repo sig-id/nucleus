@@ -1872,7 +1872,7 @@ mod tests {
             .expect("gpu passthrough config builds");
 
         // No devices discovered -> no device entries beyond the base set.
-        assert!(config.linux.as_ref().unwrap().devices.len() >= 1);
+        assert!(!config.linux.as_ref().unwrap().devices.is_empty());
         // NVIDIA env vars are present.
         assert!(config
             .process
@@ -2163,8 +2163,10 @@ mod tests {
     #[test]
     fn test_without_user_namespace_removes_namespace_and_mappings() {
         let user_ns = UserNamespaceConfig::rootless();
-        let mut namespaces = NamespaceConfig::default();
-        namespaces.user = true;
+        let namespaces = NamespaceConfig {
+            user: true,
+            ..Default::default()
+        };
 
         let config = OciConfig::new(vec!["/bin/sh".to_string()], None)
             .with_namespace_config(&namespaces)

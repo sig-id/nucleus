@@ -7,7 +7,7 @@ use nucleus::container::{
     ContainerConfig, ContainerLifecycle, ContainerState, ContainerStateManager,
     ContainerStateParams, GpuPassthroughConfig, GpuVendor, HealthCheck, KernelLockdownMode,
     NetworkModeArg, OciStatus, ProcessIdentity, ProviderConfigMount, ReadinessProbe, RootfsMode,
-    RuntimeSelection, SeccompMode, SecretMount, ServiceMode, TrustLevel, VolumeMount,
+    RuntimeSelection, SeccompMode, SecretMount, ServiceMode, TrustLevel, UsernsModeArg, VolumeMount,
     VolumeSource, WorkspaceConfig, WorkspaceMode, DEFAULT_HOME_PATH,
 };
 use nucleus::error::{NucleusError, Result};
@@ -556,6 +556,52 @@ fn resolve_process_identity(
     }))
 }
 
+fn apply_userns(
+    config: ContainerConfig,
+    userns: UsernsModeArg,
+    uidmap: &[String],
+    gidmap: &[String],
+    user: Option<&str>,
+) -> Result<ContainerConfig> {
+    use nucleus::isolation::UserNamespaceConfig;
+
+    // Explicit --uidmap/--gidmap take precedence (Podman/Docker syntax).
+    if !uidmap.is_empty() || !gidmap.is_empty() {
+        let mapping = UserNamespaceConfig::from_map_specs(uidmap, gidmap)?;
+        return Ok(config.with_user_namespace(mapping));
+    }
+
+    // Auto-upgrade: under historic rootless (nomap) only container uid 0 is
+    // mapped, so `--user N` (N != 0) is rejected by validate_runtime_support.
+    // If /etc/subuid is configured, transparently switch to keep-id so the
+    // requested workload uid maps to the caller's own uid and host-owned bind
+    // mounts keep working. This turns a hard failure into success (no
+    // regression for the nomap + run-as-container-root path).
+    let mapping = match userns {
+        UsernsModeArg::KeepId => UserNamespaceConfig::keep_id()
+            .map_err(|e| NucleusError::ConfigError(format!("--userns=keep-id: {e}")))?,
+        UsernsModeArg::Auto => UserNamespaceConfig::subuid_auto()
+            .map_err(|e| NucleusError::ConfigError(format!("--userns=auto: {e}")))?,
+        UsernsModeArg::NoMap => {
+            let requested = requested_nonzero_workload_uid(user);
+            UserNamespaceConfig::for_unprivileged_rootless(requested)
+        }
+    };
+    Ok(config.with_user_namespace(mapping))
+}
+
+/// If `user` resolves to a numeric uid, return it (used for the nomap->keep-id
+/// auto-upgrade check). Named users are resolved to their uid.
+fn requested_nonzero_workload_uid(user: Option<&str>) -> Option<u32> {
+    let spec = user?;
+    if let Ok(n) = spec.parse::<u32>() {
+        return Some(n);
+    }
+    // Named user: resolve via libc; otherwise treat as unknown and let keep-id
+    // apply (it maps the caller's own uid regardless of the requested name).
+    nix::unistd::User::from_name(spec).ok().flatten().map(|u| u.uid.as_raw())
+}
+
 fn exit_code_from_i32(code: i32) -> ExitCode {
     u8::try_from(code)
         .map(ExitCode::from)
@@ -651,6 +697,9 @@ const RUN_CONFIG_PATH_CONFLICTS: &[&str] = &[
     "preset_id",
     "detached_config_json",
     "rootless",
+    "userns",
+    "uidmap",
+    "gidmap",
     "user",
     "group",
     "additional_groups",
@@ -740,6 +789,9 @@ const RUN_CONFIG_FD_CONFLICTS: &[&str] = &[
     "preset_id",
     "detached_config_json",
     "rootless",
+    "userns",
+    "uidmap",
+    "gidmap",
     "user",
     "group",
     "additional_groups",
@@ -915,6 +967,24 @@ enum Commands {
         /// Run in rootless mode with user namespace
         #[arg(long)]
         rootless: bool,
+
+        /// Rootless user-namespace mapping strategy (implies --rootless):
+        /// keep-id (recommended; workload keeps your uid, host files just work),
+        /// auto (Podman/Docker default; workload uses image uid in subuid range),
+        /// or nomap (historic; only container root is usable). Requires
+        /// /etc/subuid + /etc/subgid for keep-id/auto.
+        #[arg(long, default_value = "nomap")]
+        userns: UsernsModeArg,
+
+        /// Explicit UID mapping `container:host:size` (repeatable; Podman syntax).
+        /// Overrides --userns. Requires /etc/subuid authorization when rootless.
+        #[arg(long = "uidmap", value_name = "CONTAINER:HOST:SIZE")]
+        uidmap: Vec<String>,
+
+        /// Explicit GID mapping `container:host:size` (repeatable; Podman syntax).
+        /// Overrides --userns.
+        #[arg(long = "gidmap", value_name = "CONTAINER:HOST:SIZE")]
+        gidmap: Vec<String>,
 
         /// User name or numeric UID to run the workload as after setup
         #[arg(long)]
@@ -1450,6 +1520,9 @@ struct RunConfig {
     quiet_id: bool,
     preset_id: Option<String>,
     rootless: bool,
+    userns: UsernsModeArg,
+    uidmap: Vec<String>,
+    gidmap: Vec<String>,
     user: Option<String>,
     group: Option<String>,
     additional_groups: Vec<String>,
@@ -1551,6 +1624,9 @@ impl Default for RunConfig {
             quiet_id: false,
             preset_id: None,
             rootless: false,
+            userns: UsernsModeArg::NoMap,
+            uidmap: Vec::new(),
+            gidmap: Vec::new(),
             user: None,
             group: None,
             additional_groups: Vec::new(),
@@ -2131,6 +2207,9 @@ fn try_main() -> Result<i32> {
             preset_id,
             detached_config_json,
             rootless,
+            userns,
+            uidmap,
+            gidmap,
             user,
             group,
             additional_groups,
@@ -2240,6 +2319,9 @@ fn try_main() -> Result<i32> {
                     quiet_id,
                     preset_id,
                     rootless,
+                    userns,
+                    uidmap,
+                    gidmap,
                     user,
                     group,
                     additional_groups,
@@ -2439,6 +2521,9 @@ fn try_main() -> Result<i32> {
                 quiet_id,
                 preset_id,
                 rootless,
+                userns,
+                uidmap,
+                gidmap,
                 user,
                 group,
                 additional_groups,
@@ -2701,9 +2786,19 @@ fn try_main() -> Result<i32> {
                 config = config.with_terminal(ConsoleSize::detect());
             }
 
-            if rootless {
-                info!("Enabling rootless mode");
-                config = config.with_rootless();
+            if rootless || userns != UsernsModeArg::NoMap || !uidmap.is_empty() {
+                if !rootless {
+                    info!("Enabling rootless mode (--userns/--uidmap implies --rootless)");
+                } else {
+                    info!("Enabling rootless mode");
+                }
+                config = apply_userns(
+                    config,
+                    userns,
+                    &uidmap,
+                    &gidmap,
+                    user.as_deref(),
+                )?;
             }
 
             if let Some(identity) =
@@ -3326,6 +3421,9 @@ mod tests {
             quiet_id: true,
             preset_id: Some("0123456789abcdef0123456789abcdef".to_string()),
             rootless: true,
+            userns: UsernsModeArg::NoMap,
+            uidmap: Vec::new(),
+            gidmap: Vec::new(),
             user: Some("1000".to_string()),
             group: Some("1000".to_string()),
             additional_groups: vec!["27".to_string()],
@@ -3440,6 +3538,9 @@ mod tests {
             quiet_id: false,
             preset_id: None,
             rootless: false,
+            userns: UsernsModeArg::NoMap,
+            uidmap: Vec::new(),
+            gidmap: Vec::new(),
             user: None,
             group: None,
             additional_groups: Vec::new(),
