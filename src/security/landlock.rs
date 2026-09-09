@@ -442,7 +442,7 @@ impl LandlockManager {
             // installed. Do not silently reintroduce no_new_privs here; callers
             // that need this host-side allowlist must already be in a context
             // where Landlock can be restricted without it.
-            .set_no_new_privs(false);
+            .no_new_privs(false);
 
         let mut added_rules = 0usize;
         for root in allowed_roots {
@@ -615,7 +615,7 @@ mod tests {
         let source = include_str!("landlock.rs");
         let fn_body = extract_fn_body(source, "fn build_execute_allowlist_and_restrict");
         assert!(
-            fn_body.contains(".set_no_new_privs(false)"),
+            fn_body.contains(".no_new_privs(false)"),
             "gVisor supervisor execute allowlist must not force no_new_privs"
         );
     }
@@ -625,7 +625,7 @@ mod tests {
         let source = include_str!("landlock.rs");
         let fn_body = extract_fn_body(source, "fn build_and_restrict");
         assert!(
-            !fn_body.contains(".set_no_new_privs(false)"),
+            !fn_body.contains(".no_new_privs(false)"),
             "container Landlock policy must retain the landlock crate default no_new_privs setting"
         );
     }
