@@ -199,6 +199,96 @@ fn explicit_non_device_path_is_rejected() {
 }
 
 #[test]
+fn gpu_targets_preserve_host_paths_under_container_dev() {
+    let root = Path::new("/container");
+    for device in [
+        "/dev/nvidia0",
+        "/dev/kfd",
+        "/dev/dri/renderD128",
+        "/dev/nvidia-caps/nvidia-cap1",
+    ] {
+        assert_eq!(
+            gpu_device_target(root, Path::new(device)).unwrap(),
+            PathBuf::from(format!("/container{device}"))
+        );
+    }
+    assert!(gpu_device_target(root, Path::new("/tmp/nvidia0")).is_err());
+}
+
+#[test]
+fn gpu_node_creation_rejects_existing_target_without_changing_it() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("existing");
+    fs::write(&target, b"existing inode").unwrap();
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o640)).unwrap();
+    let before = fs::metadata(&target).unwrap();
+    assert!(
+        create_gpu_device_node(Path::new("/dev/null"), &target, &ProcessIdentity::root()).is_err()
+    );
+    let after = fs::metadata(&target).unwrap();
+    assert_eq!(
+        (after.ino(), after.uid(), after.gid(), after.mode()),
+        (before.ino(), before.uid(), before.gid(), before.mode())
+    );
+    assert_eq!(fs::read(&target).unwrap(), b"existing inode");
+}
+
+#[test]
+#[ignore = "requires root with CAP_MKNOD and CAP_CHOWN; uses only temporary null devices"]
+fn gpu_node_ownership_preserves_host_and_allows_non_root_access() {
+    use nix::sys::stat::{mknod, Mode, SFlag};
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::CommandExt;
+    use std::process::Command;
+
+    let dir = tempfile::tempdir().unwrap();
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+    // A private null device exercises device inode permissions without a GPU
+    // or any changes to the machine's /dev nodes.
+    let host = dir.path().join("host");
+    let rdev = fs::metadata("/dev/null").unwrap().rdev();
+    mknod(&host, SFlag::S_IFCHR, Mode::from_bits_truncate(0o660), rdev).unwrap();
+    fs::set_permissions(&host, fs::Permissions::from_mode(0o660)).unwrap();
+    let before = fs::metadata(&host).unwrap();
+    assert_eq!((before.uid(), before.gid()), (0, 0));
+
+    for identity in [
+        ProcessIdentity::root(),
+        ProcessIdentity {
+            uid: 65534,
+            gid: 65534,
+            additional_gids: vec![],
+        },
+    ] {
+        let target = dir.path().join(format!("container-{}", identity.uid));
+        create_gpu_device_node(&host, &target, &identity).unwrap();
+        let node = fs::metadata(&target).unwrap();
+        assert!(node.file_type().is_char_device());
+        assert_eq!(node.rdev(), before.rdev());
+        assert_ne!(node.ino(), before.ino());
+        assert_eq!(
+            (node.uid(), node.gid(), node.mode() & 0o7777),
+            (identity.uid, identity.gid, 0o660)
+        );
+        let status = Command::new("/bin/sh")
+            .args(["-c", "exec 3<> \"$1\"", "gpu-access-test"])
+            .arg(&target)
+            .uid(identity.uid)
+            .gid(identity.gid)
+            .status()
+            .unwrap();
+        assert!(status.success(), "workload must be able to open its device");
+    }
+    let after = fs::metadata(&host).unwrap();
+    assert_eq!(
+        (after.ino(), after.uid(), after.gid(), after.mode()),
+        (before.ino(), before.uid(), before.gid(), before.mode())
+    );
+}
+
+#[test]
 fn config_serde_round_trip_kebab_case() {
     let json = r#"{
         "vendor": "nvidia",

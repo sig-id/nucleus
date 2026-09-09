@@ -394,8 +394,10 @@ nucleus create --gpu auto --no-gpu-driver-libs --rootfs /nix/.../rootfs -- ./wor
 What happens when `--gpu` is set:
 
 - **Device nodes** — the resolved `/dev/nvidia*`, `/dev/dri/renderD*`, `/dev/kfd`,
-  `/dev/nvidia-uvm*`, etc. are bind-mounted into the container `/dev` at their
-  host paths and chown'd to the workload identity.
+  `/dev/nvidia-uvm*`, etc. are recreated in the container `/dev` at their host
+  paths, using the same device numbers and workload UID/GID with mode `0660`.
+  Host device ownership and permissions remain unchanged. Native setup requires
+  permission to create device nodes and fails if this is unavailable.
 - **cgroup device allowlist** — a `BPF_PROG_TYPE_CGROUP_DEVICE` program is
   attached to the container cgroup, allow-listing only the base `/dev` nodes
   plus the bound GPU devices (deny-by-default). This is best-effort: rootless

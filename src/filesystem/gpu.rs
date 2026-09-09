@@ -1,10 +1,10 @@
-//! GPU passthrough device discovery and filesystem binding.
+//! GPU passthrough device discovery and filesystem setup.
 //!
 //! This module resolves which host GPU device nodes (and the minimal driver
-//! support files they require) should be exposed to a container, and performs
-//! the bind mounts that expose them. The cgroup device allowlist and seccomp
+//! support files they require) should be exposed to a container, and creates
+//! private device nodes and support-file bind mounts. The cgroup device allowlist and seccomp
 //! relaxation live in [`crate::resources::cgroup`] and [`crate::security`]
-//! respectively; this module only owns the *which devices* and *mount them*
+//! respectively; this module only owns the *which devices* and *expose them*
 //! concerns.
 //!
 //! See `spec/gpu-passthrough.md` for the full design.
@@ -30,7 +30,7 @@ const NVIDIA_CAPS_DIR: &str = "nvidia-caps";
 /// rest of the runtime (env vars, support-file selection).
 #[derive(Debug, Clone, Default)]
 pub struct GpuDeviceSet {
-    /// Canonical host device node paths to bind into the container `/dev`.
+    /// Canonical host device node paths to expose in the container `/dev`.
     pub nodes: Vec<PathBuf>,
     pub nvidia: bool,
     pub amd: bool,
@@ -510,10 +510,10 @@ fn dir_contains_json(dir: &Path) -> bool {
         .any(|e| e.file_name().to_string_lossy().ends_with(".json"))
 }
 
-/// Result of binding GPU devices into a container root.
+/// Result of exposing GPU devices in a container root.
 #[derive(Debug, Clone, Default)]
 pub struct GpuMountResult {
-    /// Device nodes bound (host -> container-relative under /dev).
+    /// Device nodes exposed (host -> container-relative under /dev).
     pub bound_devices: Vec<(PathBuf, PathBuf)>,
     /// Support files/dirs bound.
     pub bound_support: Vec<PathBuf>,
@@ -523,19 +523,18 @@ pub struct GpuMountResult {
     pub intel: bool,
 }
 
-/// Bind-mount the resolved GPU devices and support files into `root`.
+/// Create the resolved GPU devices and bind support files into `root`.
 ///
-/// Device nodes are bound under `root/dev/...` preserving their host path so
-/// libraries that hardcode `/dev/nvidia0` continue to work. Each node is
-/// left with host-provided ownership and mode; callers must not mutate a
-/// bind-mounted device node because that would change the host inode.
+/// Device nodes are created under `root/dev/...` with the host device numbers
+/// and workload ownership. These independent inodes allow non-root workloads
+/// to open the devices without changing host ownership or permissions.
 ///
 /// This runs in the child after `create_dev_nodes` and before `pivot_root`.
 pub fn mount_gpu_passthrough(
     root: &Path,
     set: &GpuDeviceSet,
     config: &GpuPassthroughConfig,
-    _identity: &ProcessIdentity,
+    identity: &ProcessIdentity,
 ) -> Result<GpuMountResult> {
     use nix::mount::{mount, MsFlags};
 
@@ -555,8 +554,9 @@ pub fn mount_gpu_passthrough(
 
     for host_node in &set.nodes {
         // Mirror the host path under the container /dev.
-        let rel = host_node.strip_prefix("/").unwrap_or(host_node.as_path());
-        let target = dev_path.join(rel);
+        let host_node = validate_host_device(host_node)?;
+        let rel = host_node.strip_prefix("/dev").expect("validated GPU path");
+        let target = gpu_device_target(root, &host_node)?;
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
                 NucleusError::FilesystemError(format!(
@@ -566,33 +566,17 @@ pub fn mount_gpu_passthrough(
             })?;
         }
 
-        // Create a placeholder node so the bind mount has a mountpoint. Use
-        // mknod of a char device (best effort; rootful path).
-        let _ = create_placeholder_char_node(&target);
-
-        mount(
-            Some(host_node),
-            &target,
-            None::<&str>,
-            bind_flags,
-            None::<&str>,
-        )
-        .map_err(|e| {
-            NucleusError::FilesystemError(format!(
-                "Failed to bind GPU device {:?} -> {:?}: {}",
-                host_node, target, e
-            ))
-        })?;
-
-        // Do not chown/chmod after the bind mount: the target is the same
-        // device inode as the host node, so metadata changes would persist on
-        // the host. Access must come from the host device permissions/cgroup.
+        create_gpu_device_node(&host_node, &target, identity)?;
 
         result.bound_devices.push((
             host_node.clone(),
             target.strip_prefix(root).unwrap_or(&target).to_path_buf(),
         ));
-        info!("Bound GPU device {:?} -> /dev/{}", host_node, rel.display());
+        info!(
+            "Created GPU device {:?} -> /dev/{}",
+            host_node,
+            rel.display()
+        );
     }
 
     // Driver support files (NVIDIA /proc, lib dirs, ICD JSON; ROCm /opt/rocm).
@@ -655,20 +639,64 @@ pub fn mount_gpu_passthrough(
     Ok(result)
 }
 
-fn create_placeholder_char_node(target: &Path) -> Result<()> {
-    use nix::sys::stat::{makedev, mknod, Mode, SFlag};
-    let dev = makedev(0, 0);
-    match mknod(target, SFlag::S_IFCHR, Mode::from_bits_truncate(0o600), dev) {
-        Ok(_) => Ok(()),
-        Err(nix::Error::EEXIST) => Ok(()),
-        Err(e) => {
-            debug!(
-                "placeholder mknod for {:?} failed (continuing): {}",
-                target, e
-            );
-            Ok(())
-        }
+fn gpu_device_target(root: &Path, host_node: &Path) -> Result<PathBuf> {
+    if !is_allowed_gpu_device_path(host_node) {
+        return Err(NucleusError::FilesystemError(format!(
+            "GPU device {:?} is not a recognized GPU device under /dev",
+            host_node
+        )));
     }
+    Ok(root.join(host_node.strip_prefix("/").expect("absolute GPU path")))
+}
+
+fn create_gpu_device_node(
+    host_node: &Path,
+    target: &Path,
+    identity: &ProcessIdentity,
+) -> Result<()> {
+    use nix::sys::stat::{mknod, Mode, SFlag};
+    use nix::unistd::{chown, Gid, Uid};
+    use std::os::unix::fs::PermissionsExt;
+
+    let meta = fs::symlink_metadata(host_node).map_err(|e| {
+        NucleusError::FilesystemError(format!("Failed to stat GPU device {:?}: {}", host_node, e))
+    })?;
+    if !meta.file_type().is_char_device() {
+        return Err(NucleusError::FilesystemError(format!(
+            "GPU device {:?} is not a character device node",
+            host_node
+        )));
+    }
+
+    // Never reuse an existing inode: it could refer to a host bind mount.
+    // Propagate creation failures rather than silently losing GPU access.
+    mknod(
+        target,
+        SFlag::S_IFCHR,
+        Mode::S_IRUSR | Mode::S_IWUSR,
+        meta.rdev(),
+    )
+    .map_err(|e| {
+        NucleusError::FilesystemError(format!("Failed to create GPU device {:?}: {}", target, e))
+    })?;
+    chown(
+        target,
+        Some(Uid::from_raw(identity.uid)),
+        Some(Gid::from_raw(identity.gid)),
+    )
+    .map_err(|e| {
+        NucleusError::FilesystemError(format!(
+            "Failed to set GPU device ownership {:?}: {}",
+            target, e
+        ))
+    })?;
+    fs::set_permissions(target, fs::Permissions::from_mode(0o660)).map_err(|e| {
+        NucleusError::FilesystemError(format!(
+            "Failed to set GPU device permissions {:?}: {}",
+            target, e
+        ))
+    })?;
+    Ok(())
 }
 
 #[cfg(test)]
