@@ -283,7 +283,7 @@ impl UserspaceNetwork {
         let mut ready = std::fs::File::from(ready_read);
         let mut buf = [0u8; 1];
         match ready.read_exact(&mut buf) {
-            Ok(()) if buf == [b'1'] => Ok(()),
+            Ok(()) if buf == *b"1" => Ok(()),
             Ok(()) => Err(NucleusError::NetworkError(format!(
                 "slirp4netns ready-fd returned unexpected byte {:?}",
                 buf
