@@ -1322,9 +1322,9 @@ impl Container {
         let dev_path = container_root.join("dev");
         create_dev_nodes(&dev_path, self.config.terminal)?;
 
-        // 5a. GPU passthrough: bind host device nodes + driver support files.
+        // 5a. GPU passthrough: create private device nodes + bind driver support files.
         // Resolved again in the child (idempotent host /dev scan) so the same
-        // device set drives both the parent cgroup allowlist and these binds.
+        // device set drives both the parent cgroup allowlist and these nodes.
         let gpu_device_set: Option<GpuDeviceSet> = match self.config.gpu.as_ref() {
             Some(gpu_config) => match resolve_gpu_devices(gpu_config) {
                 Ok(Some(set)) => Some(set),

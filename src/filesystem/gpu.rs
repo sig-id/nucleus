@@ -1,10 +1,10 @@
-//! GPU passthrough device discovery and filesystem binding.
+//! GPU passthrough device discovery and filesystem setup.
 //!
 //! This module resolves which host GPU device nodes (and the minimal driver
-//! support files they require) should be exposed to a container, and performs
-//! the bind mounts that expose them. The cgroup device allowlist and seccomp
+//! support files they require) should be exposed to a container, and creates
+//! private device nodes and support-file bind mounts. The cgroup device allowlist and seccomp
 //! relaxation live in [`crate::resources::cgroup`] and [`crate::security`]
-//! respectively; this module only owns the *which devices* and *mount them*
+//! respectively; this module only owns the *which devices* and *expose them*
 //! concerns.
 //!
 //! See `spec/gpu-passthrough.md` for the full design.
@@ -13,7 +13,6 @@ use std::collections::HashSet;
 use std::fs;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::fs::MetadataExt;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use tracing::{debug, info, warn};
@@ -22,11 +21,7 @@ use crate::container::{GpuPassthroughConfig, GpuVendor, ProcessIdentity};
 use crate::error::{NucleusError, Result};
 
 /// NVIDIA device-node glob patterns (regex-free) scanned under the host `/dev`.
-const NVIDIA_DEVICE_NAMES: &[&str] = &[
-    "nvidiactl",
-    "nvidia-uvm",
-    "nvidia-uvm-tools",
-];
+const NVIDIA_DEVICE_NAMES: &[&str] = &["nvidiactl", "nvidia-uvm", "nvidia-uvm-tools"];
 
 /// Directory holding NVIDIA capability device nodes on newer drivers.
 const NVIDIA_CAPS_DIR: &str = "nvidia-caps";
@@ -35,7 +30,7 @@ const NVIDIA_CAPS_DIR: &str = "nvidia-caps";
 /// rest of the runtime (env vars, support-file selection).
 #[derive(Debug, Clone, Default)]
 pub struct GpuDeviceSet {
-    /// Canonical host device node paths to bind into the container `/dev`.
+    /// Canonical host device node paths to expose in the container `/dev`.
     pub nodes: Vec<PathBuf>,
     pub nvidia: bool,
     pub amd: bool,
@@ -59,7 +54,10 @@ impl GpuDeviceSet {
     /// allowlist is best-effort and the filesystem layer remains the primary
     /// gate.
     pub fn device_specs(&self) -> Vec<DeviceNodeSpec> {
-        self.node_specs_with_paths().iter().map(|(_, s)| *s).collect()
+        self.node_specs_with_paths()
+            .iter()
+            .map(|(_, s)| *s)
+            .collect()
     }
 
     /// Each node paired with its host path, for OCI device entries and the
@@ -153,7 +151,7 @@ pub(crate) fn build_explicit_set(canonical: &[PathBuf], vendor: GpuVendor) -> Op
     }
 }
 
-/// Validate that `path` is an existing, non-symlink device node on the host.
+/// Validate that `path` is an existing, non-symlink GPU character device on the host.
 fn validate_host_device(path: &Path) -> Result<PathBuf> {
     // Reject obvious traversal before canonicalizing.
     let canonical = fs::canonicalize(path).map_err(|e| {
@@ -163,21 +161,76 @@ fn validate_host_device(path: &Path) -> Result<PathBuf> {
             e
         ))
     })?;
-    let meta = fs::symlink_metadata(&canonical)
-        .map_err(|e| NucleusError::ConfigError(format!("Failed to stat GPU device '{}': {}", canonical.display(), e)))?;
+    let meta = fs::symlink_metadata(&canonical).map_err(|e| {
+        NucleusError::ConfigError(format!(
+            "Failed to stat GPU device '{}': {}",
+            canonical.display(),
+            e
+        ))
+    })?;
     if meta.file_type().is_symlink() {
         return Err(NucleusError::ConfigError(format!(
             "GPU device '{}' must not be a symlink",
             canonical.display()
         )));
     }
-    if !meta.file_type().is_char_device() && !meta.file_type().is_block_device() {
+    if !meta.file_type().is_char_device() {
         return Err(NucleusError::ConfigError(format!(
-            "GPU device '{}' is not a device node",
+            "GPU device '{}' is not a character device node",
+            canonical.display()
+        )));
+    }
+    if !is_allowed_gpu_device_path(&canonical) {
+        return Err(NucleusError::ConfigError(format!(
+            "GPU device '{}' is not a recognized GPU device under /dev",
             canonical.display()
         )));
     }
     Ok(canonical)
+}
+
+fn is_allowed_gpu_device_path(path: &Path) -> bool {
+    let rel = match path.strip_prefix("/dev") {
+        Ok(rel) => rel,
+        Err(_) => return false,
+    };
+    let components: Vec<_> = rel
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(part) => Some(part.to_string_lossy()),
+            _ => None,
+        })
+        .collect();
+
+    match components.as_slice() {
+        [name] if is_nvidia_device_name(name) || *name == "kfd" => true,
+        [dir, name] if *dir == "dri" => is_dri_gpu_device_name(name),
+        [dir, name] if *dir == NVIDIA_CAPS_DIR => is_nvidia_cap_device_name(name),
+        _ => false,
+    }
+}
+
+fn is_nvidia_device_name(name: &str) -> bool {
+    if NVIDIA_DEVICE_NAMES.contains(&name) {
+        return true;
+    }
+    name.strip_prefix("nvidia")
+        .map(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()))
+        .unwrap_or(false)
+}
+
+fn is_dri_gpu_device_name(name: &str) -> bool {
+    ["renderD", "card"].iter().any(|prefix| {
+        name.strip_prefix(prefix)
+            .map(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()))
+            .unwrap_or(false)
+    })
+}
+
+fn is_nvidia_cap_device_name(name: &str) -> bool {
+    name.strip_prefix("nvidia-cap")
+        .map(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()))
+        .unwrap_or(false)
 }
 
 /// Discover GPU device nodes under `dev_root` (normally `/dev`).
@@ -214,7 +267,12 @@ pub(crate) fn discover_gpu_with(
     }
 
     // Dedup (render nodes are shared between AMD/Intel) and sort for determinism.
-    let mut deduped: Vec<PathBuf> = set.nodes.into_iter().collect::<HashSet<_>>().into_iter().collect();
+    let mut deduped: Vec<PathBuf> = set
+        .nodes
+        .into_iter()
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
     deduped.sort();
     set.nodes = deduped;
     Ok(Some(set))
@@ -265,14 +323,20 @@ fn collect_nvidia(
 
     set.nvidia = vendor.includes_nvidia()
         && (found
-            || set
-                .nodes
-                .iter()
-                .any(|p| p.file_name().map(|f| f.to_string_lossy().starts_with("nvidia")).unwrap_or(false)));
+            || set.nodes.iter().any(|p| {
+                p.file_name()
+                    .map(|f| f.to_string_lossy().starts_with("nvidia"))
+                    .unwrap_or(false)
+            }));
     Ok(())
 }
 
-fn collect_amd(dev_root: &Path, vendor: GpuVendor, set: &mut GpuDeviceSet, is_dev: &impl Fn(&Path) -> bool) {
+fn collect_amd(
+    dev_root: &Path,
+    vendor: GpuVendor,
+    set: &mut GpuDeviceSet,
+    is_dev: &impl Fn(&Path) -> bool,
+) {
     let had_before = set.nodes.len();
     push_existing(dev_root, "kfd", set, is_dev);
     collect_render_nodes(dev_root, set, is_dev);
@@ -281,7 +345,12 @@ fn collect_amd(dev_root: &Path, vendor: GpuVendor, set: &mut GpuDeviceSet, is_de
     }
 }
 
-fn collect_intel(dev_root: &Path, vendor: GpuVendor, set: &mut GpuDeviceSet, is_dev: &impl Fn(&Path) -> bool) {
+fn collect_intel(
+    dev_root: &Path,
+    vendor: GpuVendor,
+    set: &mut GpuDeviceSet,
+    is_dev: &impl Fn(&Path) -> bool,
+) {
     let had_before = set.nodes.len();
     collect_render_nodes(dev_root, set, is_dev);
     // /dev/dri/card[0-9]+ are the kernel KMS nodes; bind them so Mesa/DRI works.
@@ -317,7 +386,12 @@ fn collect_render_nodes(dev_root: &Path, set: &mut GpuDeviceSet, is_dev: &impl F
     }
 }
 
-fn push_existing(dev_root: &Path, name: &str, set: &mut GpuDeviceSet, is_dev: &impl Fn(&Path) -> bool) {
+fn push_existing(
+    dev_root: &Path,
+    name: &str,
+    set: &mut GpuDeviceSet,
+    is_dev: &impl Fn(&Path) -> bool,
+) {
     let path = dev_root.join(name);
     if is_dev(&path) {
         if let Ok(canonical) = fs::canonicalize(&path) {
@@ -431,14 +505,15 @@ fn dir_contains_json(dir: &Path) -> bool {
     let Ok(entries) = fs::read_dir(dir) else {
         return false;
     };
-    entries.flatten()
+    entries
+        .flatten()
         .any(|e| e.file_name().to_string_lossy().ends_with(".json"))
 }
 
-/// Result of binding GPU devices into a container root.
+/// Result of exposing GPU devices in a container root.
 #[derive(Debug, Clone, Default)]
 pub struct GpuMountResult {
-    /// Device nodes bound (host -> container-relative under /dev).
+    /// Device nodes exposed (host -> container-relative under /dev).
     pub bound_devices: Vec<(PathBuf, PathBuf)>,
     /// Support files/dirs bound.
     pub bound_support: Vec<PathBuf>,
@@ -448,12 +523,11 @@ pub struct GpuMountResult {
     pub intel: bool,
 }
 
-/// Bind-mount the resolved GPU devices and support files into `root`.
+/// Create the resolved GPU devices and bind support files into `root`.
 ///
-/// Device nodes are bound under `root/dev/...` preserving their host path so
-/// libraries that hardcode `/dev/nvidia0` continue to work. Each node is
-/// chown'd to the workload identity so a non-root workload can open it, and
-/// left mode 0660.
+/// Device nodes are created under `root/dev/...` with the host device numbers
+/// and workload ownership. These independent inodes allow non-root workloads
+/// to open the devices without changing host ownership or permissions.
 ///
 /// This runs in the child after `create_dev_nodes` and before `pivot_root`.
 pub fn mount_gpu_passthrough(
@@ -463,7 +537,6 @@ pub fn mount_gpu_passthrough(
     identity: &ProcessIdentity,
 ) -> Result<GpuMountResult> {
     use nix::mount::{mount, MsFlags};
-    use nix::unistd::{chown, Gid, Uid};
 
     let mut result = GpuMountResult {
         nvidia: set.nvidia,
@@ -481,10 +554,9 @@ pub fn mount_gpu_passthrough(
 
     for host_node in &set.nodes {
         // Mirror the host path under the container /dev.
-        let rel = host_node
-            .strip_prefix("/")
-            .unwrap_or(host_node.as_path());
-        let target = dev_path.join(rel);
+        let host_node = validate_host_device(host_node)?;
+        let rel = host_node.strip_prefix("/dev").expect("validated GPU path");
+        let target = gpu_device_target(root, &host_node)?;
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
                 NucleusError::FilesystemError(format!(
@@ -494,45 +566,17 @@ pub fn mount_gpu_passthrough(
             })?;
         }
 
-        // Create a placeholder node so the bind mount has a mountpoint. Use
-        // mknod of a char device (best effort; rootful path).
-        let _ = create_placeholder_char_node(&target);
+        create_gpu_device_node(&host_node, &target, identity)?;
 
-        mount(
-            Some(host_node),
-            &target,
-            None::<&str>,
-            bind_flags,
-            None::<&str>,
-        )
-        .map_err(|e| {
-            NucleusError::FilesystemError(format!(
-                "Failed to bind GPU device {:?} -> {:?}: {}",
-                host_node, target, e
-            ))
-        })?;
-
-        // Make the node usable by the (possibly non-root) workload identity.
-        let gid = if identity.gid != 0 {
-            Some(Gid::from_raw(identity.gid))
-        } else {
-            None
-        };
-        let uid = if identity.uid != 0 {
-            Some(Uid::from_raw(identity.uid))
-        } else {
-            None
-        };
-        let _ = chown(&target, uid, gid);
-        let _ = std::fs::set_permissions(
-            &target,
-            std::fs::Permissions::from_mode(0o660),
+        result.bound_devices.push((
+            host_node.clone(),
+            target.strip_prefix(root).unwrap_or(&target).to_path_buf(),
+        ));
+        info!(
+            "Created GPU device {:?} -> /dev/{}",
+            host_node,
+            rel.display()
         );
-
-        result
-            .bound_devices
-            .push((host_node.clone(), target.strip_prefix(root).unwrap_or(&target).to_path_buf()));
-        info!("Bound GPU device {:?} -> /dev/{}", host_node, rel.display());
     }
 
     // Driver support files (NVIDIA /proc, lib dirs, ICD JSON; ROCm /opt/rocm).
@@ -595,17 +639,64 @@ pub fn mount_gpu_passthrough(
     Ok(result)
 }
 
-fn create_placeholder_char_node(target: &Path) -> Result<()> {
-    use nix::sys::stat::{makedev, mknod, Mode, SFlag};
-    let dev = makedev(0, 0);
-    match mknod(target, SFlag::S_IFCHR, Mode::from_bits_truncate(0o600), dev) {
-        Ok(_) => Ok(()),
-        Err(nix::Error::EEXIST) => Ok(()),
-        Err(e) => {
-            debug!("placeholder mknod for {:?} failed (continuing): {}", target, e);
-            Ok(())
-        }
+fn gpu_device_target(root: &Path, host_node: &Path) -> Result<PathBuf> {
+    if !is_allowed_gpu_device_path(host_node) {
+        return Err(NucleusError::FilesystemError(format!(
+            "GPU device {:?} is not a recognized GPU device under /dev",
+            host_node
+        )));
     }
+    Ok(root.join(host_node.strip_prefix("/").expect("absolute GPU path")))
+}
+
+fn create_gpu_device_node(
+    host_node: &Path,
+    target: &Path,
+    identity: &ProcessIdentity,
+) -> Result<()> {
+    use nix::sys::stat::{mknod, Mode, SFlag};
+    use nix::unistd::{chown, Gid, Uid};
+    use std::os::unix::fs::PermissionsExt;
+
+    let meta = fs::symlink_metadata(host_node).map_err(|e| {
+        NucleusError::FilesystemError(format!("Failed to stat GPU device {:?}: {}", host_node, e))
+    })?;
+    if !meta.file_type().is_char_device() {
+        return Err(NucleusError::FilesystemError(format!(
+            "GPU device {:?} is not a character device node",
+            host_node
+        )));
+    }
+
+    // Never reuse an existing inode: it could refer to a host bind mount.
+    // Propagate creation failures rather than silently losing GPU access.
+    mknod(
+        target,
+        SFlag::S_IFCHR,
+        Mode::S_IRUSR | Mode::S_IWUSR,
+        meta.rdev(),
+    )
+    .map_err(|e| {
+        NucleusError::FilesystemError(format!("Failed to create GPU device {:?}: {}", target, e))
+    })?;
+    chown(
+        target,
+        Some(Uid::from_raw(identity.uid)),
+        Some(Gid::from_raw(identity.gid)),
+    )
+    .map_err(|e| {
+        NucleusError::FilesystemError(format!(
+            "Failed to set GPU device ownership {:?}: {}",
+            target, e
+        ))
+    })?;
+    fs::set_permissions(target, fs::Permissions::from_mode(0o660)).map_err(|e| {
+        NucleusError::FilesystemError(format!(
+            "Failed to set GPU device permissions {:?}: {}",
+            target, e
+        ))
+    })?;
+    Ok(())
 }
 
 #[cfg(test)]

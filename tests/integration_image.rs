@@ -29,9 +29,46 @@ mod tests {
     use nucleus::network::{BridgeConfig, CredentialBrokerConfig, NatBackend, NetworkMode};
     use std::collections::BTreeMap;
     use std::fs;
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{symlink, PermissionsExt};
     use std::path::PathBuf;
+    use std::sync::{Mutex, MutexGuard};
     use tempfile::TempDir;
+
+    // Image operations consult a process-wide key-path override. Keep each
+    // test's key private and serialize access to that environment variable.
+    struct ImageKeyGuard {
+        previous: Option<std::ffi::OsString>,
+        _key_dir: TempDir,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl ImageKeyGuard {
+        fn new() -> Self {
+            static LOCK: Mutex<()> = Mutex::new(());
+            let lock = LOCK.lock().unwrap();
+            let key_dir = TempDir::new().unwrap();
+            fs::set_permissions(key_dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+            let previous = std::env::var_os("NUCLEUS_IMAGE_HMAC_KEY_FILE");
+            std::env::set_var(
+                "NUCLEUS_IMAGE_HMAC_KEY_FILE",
+                key_dir.path().join("image.key"),
+            );
+            Self {
+                previous,
+                _key_dir: key_dir,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for ImageKeyGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var("NUCLEUS_IMAGE_HMAC_KEY_FILE", value),
+                None => std::env::remove_var("NUCLEUS_IMAGE_HMAC_KEY_FILE"),
+            }
+        }
+    }
 
     /// Build a synthetic Nix-style rootfs closure with the sidecars that
     /// `image::commit_container_image` expects to copy.
@@ -158,6 +195,7 @@ mod tests {
 
     #[test]
     fn test_image_commit_round_trips_user_env_and_workdir() {
+        let _key = ImageKeyGuard::new();
         let temp = TempDir::new().unwrap();
         let rootfs = synthetic_rootfs(temp.path());
         let overlay_dir = temp.path().join("overlay");
@@ -191,6 +229,7 @@ mod tests {
 
     #[test]
     fn test_image_commit_writes_full_manifest_layout() {
+        let _key = ImageKeyGuard::new();
         let temp = TempDir::new().unwrap();
         let rootfs = synthetic_rootfs(temp.path());
         let overlay_dir = temp.path().join("overlay");
@@ -250,6 +289,7 @@ mod tests {
 
     #[test]
     fn test_image_load_verifies_hmac_and_rejects_tampering() {
+        let _key = ImageKeyGuard::new();
         let temp = TempDir::new().unwrap();
         let rootfs = synthetic_rootfs(temp.path());
         let overlay_dir = temp.path().join("overlay");
@@ -293,6 +333,7 @@ mod tests {
     /// `state.environment` capture path.
     #[test]
     fn test_image_commit_excludes_credential_broker_env() {
+        let _key = ImageKeyGuard::new();
         let temp = TempDir::new().unwrap();
         let rootfs = synthetic_rootfs(temp.path());
         let overlay_dir = temp.path().join("overlay");
@@ -357,6 +398,7 @@ mod tests {
     /// `load_image` must accept those only when they live in `/nix/store`.
     #[test]
     fn test_image_load_rejects_unsigned_image_outside_nix_store() {
+        let _key = ImageKeyGuard::new();
         let temp = TempDir::new().unwrap();
         let rootfs = synthetic_rootfs(temp.path());
         let overlay_dir = temp.path().join("overlay");
@@ -385,6 +427,7 @@ mod tests {
     /// simplest workflow (no `-e` flags) keeps working.
     #[test]
     fn test_image_commit_handles_empty_user_env() {
+        let _key = ImageKeyGuard::new();
         let temp = TempDir::new().unwrap();
         let rootfs = synthetic_rootfs(temp.path());
         let overlay_dir = temp.path().join("overlay");

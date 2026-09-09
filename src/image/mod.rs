@@ -1478,6 +1478,11 @@ mod tests {
         use crate::container::ContainerConfig;
         use crate::network::{BridgeConfig, CredentialBrokerConfig, NatBackend, NetworkMode};
 
+        let _lock = image_key_env_lock().lock().unwrap();
+        let key_temp = TempDir::new().unwrap();
+        fs::set_permissions(key_temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let _guard = ImageKeyEnvGuard::set(&key_temp.path().join("image.key"));
+
         let broker = CredentialBrokerConfig::parse_endpoint("10.0.42.1:8080").unwrap();
         let mut config = ContainerConfig::try_new_with_id(
             Some("0123456789abcdef0123456789abcdef".to_string()),

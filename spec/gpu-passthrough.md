@@ -35,7 +35,7 @@ A container process needs all of the following to use a GPU:
 
 | Concern | Mechanism |
 |---|---|
-| Device node | `/dev/nvidia0`, `/dev/dri/renderD128`, `/dev/kfd`, … bind-mounted into the container `/dev`. |
+| Device node | `/dev/nvidia0`, `/dev/dri/renderD128`, `/dev/kfd`, … recreated in the container `/dev` with the host device numbers and workload ownership. |
 | Device cgroup allow | cgroup v2 has no `devices` controller file; access is gated by a `BPF_PROG_TYPE_CGROUP_DEVICE` classic-BPF program attached to the cgroup. Without one, the default is allow-all (today's Nucleus behavior). |
 | `ioctl` syscall | GPU drivers issue dozens of vendor-specific `ioctl` request codes (DRM, NVOS/NV_ESC_RM, KFD). Nucleus's default seccomp allowlist permits only terminal ioctls — **must be relaxed**. |
 | Driver userspace | The CUDA/ROCm/Mesa userspace libraries, Vulkan/ICD JSON, and `/proc/driver/nvidia`. Either shipped in the rootfs or bind-mounted from the host. |
@@ -109,11 +109,13 @@ CLI surface:
    cgroup. On kernels without `CAP_BPF`/bpf() it degrades to a warning
    (matching `--allow-degraded-security` semantics) because the *file-system*
    layer (only the bound device nodes exist in `/dev`) still gates access.
-3. **Child, after `create_dev_nodes`:** `mount_gpu_passthrough` bind-mounts
-   each host device node into the container `/dev` (preserving the host path
-   so libraries that hardcode `/dev/nvidia0` work), bind-mounts support
-   files, and chowns device nodes to the workload identity so a non-root
-   workload can open them.
+3. **Child, after `create_dev_nodes`:** `mount_gpu_passthrough` creates
+   independent character device nodes in the container `/dev`, preserving the
+   host path and device numbers. It assigns the workload UID/GID and mode
+   `0660` to these new inodes so non-root workloads can open them without
+   changing host ownership or permissions, then bind-mounts support files.
+   Device creation or ownership failures abort setup; native GPU setup requires
+   permission to create device nodes. Existing target inodes are never reused.
 4. **Seccomp:** built-in filter is built with `gpu_mode = true`, which replaces
    the restrictive terminal-only `ioctl` rule with an unconditional allow.
    Custom `--seccomp-profile` users own their ioctl policy.
@@ -183,7 +185,8 @@ fail-closed contract intact. `agent` and `strict-agent` modes allow `--gpu`.
 - `GpuPassthroughConfig` serde round-trip (kebab-case) and CLI mapping.
 - Validation: production rejection, gvisor-host + gpu interactions, missing
   device errors.
-- Native mount wiring: bind targets land under container `/dev` preserving
-  host paths; chown to workload identity.
+- Native device wiring: nodes land under container `/dev` preserving host paths
+  and device numbers; workload ownership permits non-root access while host
+  inode ownership and permissions remain unchanged.
 - gVisor wiring: `OciDevice` entries + support mounts emitted into the OCI
   config.
