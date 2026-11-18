@@ -91,6 +91,8 @@ mod tests {
                    test -L "/proc/$$/fd/3"
                    test ! -r "/proc/$$/fd/3"
                    test ! -r /proc/self/fd/3
+                   exec 4</bin/sh
+                   if "/proc/$$/fd/4" -c true 2>/dev/null; then exit 1; fi
                    /bin/sh -ec 'test -r "/proc/$$/status" && test ! -r "/proc/$$/fd/3"'"#,
             ])
             .output()

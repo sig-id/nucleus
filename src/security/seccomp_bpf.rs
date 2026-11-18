@@ -882,11 +882,12 @@ mod tests {
             "sendfile",
             "pidfd_getfd",
             "mknodat",
+            "kcmp",
         ]
         .map(String::from);
         let gpu = SeccompManager::compile_builtin(false, &extra, true).unwrap();
         let custom = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(custom.path(), r#"{"defaultAction":"SCMP_ACT_KILL_PROCESS","architectures":[],"syscalls":[{"names":["mmap","mprotect","pkey_mprotect","shmat","personality","prctl","ioctl"],"action":"SCMP_ACT_ALLOW"}]}"#).unwrap();
+        std::fs::write(custom.path(), r#"{"defaultAction":"SCMP_ACT_KILL_PROCESS","architectures":[],"syscalls":[{"names":["mmap","mprotect","pkey_mprotect","shmat","personality","prctl","ioctl","mknodat","kcmp"],"action":"SCMP_ACT_ALLOW"}]}"#).unwrap();
         let profile = SeccompManager::compile_profile(custom.path(), None).unwrap();
         for prog in [&gpu, &profile] {
             for nr in [libc::SYS_mmap, libc::SYS_mprotect, libc::SYS_pkey_mprotect] {
@@ -901,22 +902,42 @@ mod tests {
                     assert_eq!(action(prog, nr, [0, 4096, prot as u64, 0, 0, 0]), expected);
                 }
             }
-            assert_eq!(
-                action(
-                    prog,
-                    libc::SYS_shmat,
-                    [0, 0, libc::SHM_EXEC as u64, 0, 0, 0]
-                ),
-                RET_KILL
-            );
-            assert_eq!(
-                action(
-                    prog,
-                    libc::SYS_shmat,
-                    [0, 0, (libc::SHM_EXEC | libc::SHM_RDONLY) as u64, 0, 0, 0]
-                ),
-                RET_ALLOW
-            );
+            // A read-only executable view could alias a writable attachment.
+            for (flags, expected) in [
+                (0, RET_ALLOW),
+                (libc::SHM_RDONLY, RET_ALLOW),
+                (libc::SHM_EXEC, RET_KILL),
+                (libc::SHM_EXEC | libc::SHM_RDONLY, RET_KILL),
+            ] {
+                assert_eq!(
+                    action(prog, libc::SYS_shmat, [0, 0, flags as u64, 0, 0, 0]),
+                    expected
+                );
+            }
+            // FIFOs, sockets and regular files may be created; devices may not.
+            for (kind, expected) in [
+                (libc::S_IFIFO, RET_ALLOW),
+                (libc::S_IFSOCK, RET_ALLOW),
+                (libc::S_IFREG, RET_ALLOW),
+                (0, RET_ALLOW),
+                (libc::S_IFCHR, RET_KILL),
+                (libc::S_IFBLK, RET_KILL),
+            ] {
+                assert_eq!(
+                    action(
+                        prog,
+                        libc::SYS_mknodat,
+                        [0, 0, (kind | 0o600) as u64, 0, 0, 0]
+                    ),
+                    expected
+                );
+            }
+            for (kind, expected) in [(0, RET_ALLOW), (1, RET_KILL), (6, RET_KILL)] {
+                assert_eq!(
+                    action(prog, libc::SYS_kcmp, [1, 1, kind, 0, 0, 0]),
+                    expected
+                );
+            }
             assert_eq!(
                 action(
                     prog,
@@ -942,18 +963,33 @@ mod tests {
                     libc::SECCOMP_RET_ERRNO | libc::EPERM as u32
                 );
             }
-            for request in [libc::TIOCLINUX, libc::TIOCSTI, libc::TIOCCONS] {
+            // Terminal injection, console keyboard (KDSKBSENT, KDSETMODE) and
+            // virtual terminal (VT_ACTIVATE, VT_SETMODE) requests.
+            for request in [
+                libc::TIOCLINUX,
+                libc::TIOCSTI,
+                libc::TIOCCONS,
+                0x4b49,
+                0x4b3a,
+                0x5606,
+                0x5602,
+            ] {
                 assert_eq!(
                     action(prog, libc::SYS_ioctl, [1, (1 << 32) | request, 0, 0, 0, 0]),
                     RET_KILL
                 );
             }
         }
-        // Representative DRM request remains available to the GPU driver.
-        assert_eq!(
-            action(&gpu, libc::SYS_ioctl, [3, 0xc0406400, 0, 0, 0, 0]),
-            RET_ALLOW
-        );
+        // Representative DRM, AMD KFD and range-boundary requests remain
+        // available to the GPU driver.
+        for request in [
+            0xc0406400, 0x80084b01, 0x4aff, 0x4c00, 0x53ff, 0x5500, 0x5700,
+        ] {
+            assert_eq!(
+                action(&gpu, libc::SYS_ioctl, [3, request, 0, 0, 0, 0]),
+                RET_ALLOW
+            );
+        }
         for network in [false, true] {
             let default = SeccompManager::compile_builtin(network, &[], false).unwrap();
             for nr in [
@@ -961,13 +997,18 @@ mod tests {
                 libc::SYS_tee,
                 crate::security::syscall_numbers::SYS_SENDFILE,
             ] {
-                assert_eq!(action(&default, nr, [0; 6]), RET_KILL);
+                // Callers fall back to read/write when the syscall is absent.
+                assert_eq!(
+                    action(&default, nr, [0; 6]),
+                    libc::SECCOMP_RET_ERRNO | libc::ENOSYS as u32
+                );
                 assert_eq!(action(&gpu, nr, [0; 6]), RET_ALLOW);
             }
+            for nr in [libc::SYS_mknodat, libc::SYS_kcmp] {
+                assert_eq!(action(&default, nr, [0; 6]), RET_KILL);
+            }
         }
-        for nr in [libc::SYS_pidfd_getfd, libc::SYS_mknodat] {
-            assert_eq!(action(&gpu, nr, [0; 6]), RET_KILL);
-        }
+        assert_eq!(action(&gpu, libc::SYS_pidfd_getfd, [0; 6]), RET_KILL);
     }
 
     #[test]

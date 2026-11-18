@@ -598,16 +598,37 @@ impl SeccompManager {
             rules.insert(libc::SYS_pkey_mprotect, prot_rules.clone());
         }
         rules.insert(libc::SYS_mprotect, prot_rules);
-        // shmat defaults to writable. Executable attachments must be read-only.
+        // Deny every executable attachment. A read-only executable view can
+        // alias a writable attachment of the same segment.
         rules.insert(
             libc::SYS_shmat,
-            vec![
-                Self::int_rule(&[(2, MaskedEq(libc::SHM_EXEC as u64), 0)])?,
-                Self::int_rule(&[(2, MaskedEq(libc::SHM_RDONLY as u64), libc::SHM_RDONLY)])?,
-            ],
+            vec![Self::int_rule(&[(2, MaskedEq(libc::SHM_EXEC as u64), 0)])?],
         );
         if extra_syscalls.iter().any(|name| name == "personality") {
             rules.insert(libc::SYS_personality, vec![Self::int_rule(&[(0, Eq, -1)])?]);
+        }
+        // mknod/mknodat: FIFOs, sockets and regular files only. Device nodes
+        // stay denied. The kernel reads the mode as a 16-bit umode_t.
+        for (name, mode_arg) in [("mknod", 1), ("mknodat", 2)] {
+            let Some(nr) = syscall_name_to_number(name) else {
+                continue;
+            };
+            if extra_syscalls.iter().any(|extra| extra == name) {
+                let node_rules = [0, libc::S_IFREG, libc::S_IFIFO, libc::S_IFSOCK]
+                    .into_iter()
+                    .map(|kind| {
+                        Self::int_rule(&[(mode_arg, MaskedEq(libc::S_IFMT as u64), kind as i32)])
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                rules.insert(nr, node_rules);
+            }
+        }
+        // kcmp: file-description comparison only (used by Mesa and systemd).
+        if extra_syscalls.iter().any(|name| name == "kcmp") {
+            rules.insert(
+                libc::SYS_kcmp,
+                vec![Self::int_rule(&[(2, Eq, Self::KCMP_FILE)])?],
+            );
         }
 
         // preadv2/pwritev2: allow only flags == 0, which makes them equivalent
@@ -844,25 +865,35 @@ impl SeccompManager {
     ) -> Result<BpfProgram> {
         let mut rules = Self::minimal_filter(allow_network, extra_syscalls)?;
         if gpu_mode {
-            // Keep the normal allowlist for legacy Linux tty requests (0x54xx).
-            // Driver commands outside that range remain available. The kernel
-            // truncates the request to unsigned int on every supported ABI.
+            // Keep the normal allowlist for legacy Linux tty requests (0x54xx)
+            // and deny the legacy console keyboard (0x4Bxx) and virtual
+            // terminal (0x56xx) requests. Driver commands outside those ranges
+            // remain available: DRM, NVIDIA and KFD requests carry direction
+            // and size bits above bit 16. The kernel truncates the request to
+            // unsigned int on every supported ABI.
+            use seccompiler::SeccompCmpOp::{Gt, Lt};
             let ioctl = rules
                 .get_mut(&libc::SYS_ioctl)
                 .expect("built-in ioctl rules");
-            ioctl.push(Self::int_rule(&[(
-                1,
-                seccompiler::SeccompCmpOp::Lt,
-                0x5400,
-            )])?);
-            ioctl.push(Self::int_rule(&[(
-                1,
-                seccompiler::SeccompCmpOp::Gt,
-                0x54ff,
-            )])?);
-            info!("GPU mode: permitting driver ioctls with legacy tty filtering");
+            ioctl.push(Self::int_rule(&[(1, Lt, 0x4b00)])?);
+            ioctl.push(Self::int_rule(&[(1, Gt, 0x4bff), (1, Lt, 0x5400)])?);
+            ioctl.push(Self::int_rule(&[(1, Gt, 0x54ff), (1, Lt, 0x5600)])?);
+            ioctl.push(Self::int_rule(&[(1, Gt, 0x56ff)])?);
+            info!("GPU mode: permitting driver ioctls with legacy tty and console filtering");
         }
-        Self::compile_rules(rules)
+        // Programs probe these transfer syscalls and fall back to read/write
+        // on ENOSYS. Killing the process would break ordinary file copies.
+        let mut errno_rules = Self::errno_denied_syscalls().to_vec();
+        for nr in [libc::SYS_splice, libc::SYS_tee, SYS_SENDFILE] {
+            if !rules.contains_key(&nr) {
+                errno_rules.push(ErrnoRule {
+                    nr,
+                    arg0: None,
+                    errno: libc::ENOSYS,
+                });
+            }
+        }
+        Self::compile_rules(rules, &errno_rules)
     }
 
     /// Apply a seccomp profile loaded from a JSON file.
@@ -989,8 +1020,7 @@ impl SeccompManager {
         // Custom profiles that allow clone/ioctl/prctl/socket/mprotect by name
         // without argument-level filters would silently remove all hardening.
         // Overwrite their empty rules with the built-in argument-filtered rules.
-        let builtin_rules =
-            Self::minimal_filter(true, &["pkey_mprotect".into(), "personality".into()])?;
+        let builtin_rules = Self::minimal_filter(true, &Self::opt_in_arg_filtered())?;
         for syscall_name in Self::ARG_FILTERED_SYSCALLS {
             if let Some(nr) = syscall_name_to_number(syscall_name) {
                 if let std::collections::btree_map::Entry::Occupied(mut entry) = rules.entry(nr) {
@@ -1006,16 +1036,19 @@ impl SeccompManager {
                 }
             }
         }
-        Self::compile_rules(rules)
+        Self::compile_rules(rules, Self::errno_denied_syscalls())
     }
 
-    fn compile_rules(rules: BTreeMap<i64, Vec<SeccompRule>>) -> Result<BpfProgram> {
+    fn compile_rules(
+        rules: BTreeMap<i64, Vec<SeccompRule>>,
+        errno_rules: &[ErrnoRule],
+    ) -> Result<BpfProgram> {
         let arch = std::env::consts::ARCH.try_into().map_err(|e| {
             NucleusError::SeccompError(format!("Unsupported architecture: {:?}", e))
         })?;
         super::seccomp_bpf::compile_bitmap_bpf_with_errno_syscalls(
             rules,
-            Self::errno_denied_syscalls(),
+            errno_rules,
             SeccompAction::KillProcess,
             SeccompAction::Allow,
             arch,
@@ -1098,6 +1131,9 @@ impl SeccompManager {
         "pkey_mprotect",
         "personality",
         "shmat",
+        "mknod",
+        "mknodat",
+        "kcmp",
         "preadv2",
         "prctl",
         "pwritev2",
@@ -1105,6 +1141,15 @@ impl SeccompManager {
         "socket",
         "socketpair",
     ];
+
+    const KCMP_FILE: i32 = 0;
+
+    /// Argument-filtered syscalls that are absent unless explicitly requested.
+    fn opt_in_arg_filtered() -> Vec<String> {
+        ["pkey_mprotect", "personality", "mknod", "mknodat", "kcmp"]
+            .map(String::from)
+            .to_vec()
+    }
 
     fn arg_filtered_in_mode(name: &str, allow_network: bool) -> bool {
         Self::ARG_FILTERED_SYSCALLS.contains(&name) && (allow_network || name != "setsockopt")
@@ -1123,17 +1168,27 @@ impl SeccompManager {
         "keyctl",
     ];
 
-    // These host-facing operations are forbidden even with an explicit profile.
+    // These operations are forbidden even with an explicit profile.
     const PRIVILEGED_SYSCALLS: &'static [&'static str] = &[
-        "mknod",
-        "mknodat",
+        // Host-facing descriptors, kernel log and clocks.
         "pidfd_getfd",
         "open_by_handle_at",
-        "kcmp",
         "syslog",
         "clock_settime",
         "clock_adjtime",
         "adjtimex",
+        "settimeofday",
+        // Namespace entry and mount attribute changes can clear the procfs
+        // nosymfollow flag, which the kernel does not lock across user
+        // namespaces.
+        "unshare",
+        "setns",
+        "mount_setattr",
+        // Writable aliases of executable memory bypass the mapping checks.
+        "memfd_create",
+        "memfd_secret",
+        "ptrace",
+        "process_vm_writev",
     ];
 
     fn errno_denied_syscalls() -> &'static [ErrnoRule] {
@@ -2134,8 +2189,7 @@ mod tests {
         // Verify by inspecting the built-in filter rules that serve as the
         // merge source for apply_profile_from_file.
         let rules =
-            SeccompManager::minimal_filter(true, &["pkey_mprotect".into(), "personality".into()])
-                .unwrap();
+            SeccompManager::minimal_filter(true, &SeccompManager::opt_in_arg_filtered()).unwrap();
 
         // Every ARG_FILTERED_SYSCALLS entry must have non-empty argument-level
         // rules in the built-in filter so apply_profile_from_file can merge them.
