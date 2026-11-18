@@ -16,6 +16,7 @@ const NLMSG_DONE: u16 = 3;
 // nlmsghdr flags
 const NLM_F_REQUEST: u16 = 0x01;
 const NLM_F_ACK: u16 = 0x04;
+const NLM_F_DUMP_INTR: u16 = 0x10;
 const NLM_F_ROOT: u16 = 0x100;
 const NLM_F_MATCH: u16 = 0x200;
 const NLM_F_DUMP: u16 = NLM_F_ROOT | NLM_F_MATCH;
@@ -34,7 +35,7 @@ const RTM_NEWROUTE: u16 = 24;
 const IFLA_IFNAME: u16 = 3;
 const IFLA_MASTER: u16 = 10;
 const IFLA_LINKINFO: u16 = 18;
-const IFLA_NET_NS_PID: u16 = 19;
+const IFLA_NET_NS_FD: u16 = 28;
 
 // IFLA_INFO_* (nested under IFLA_LINKINFO)
 const IFLA_INFO_KIND: u16 = 1;
@@ -236,7 +237,7 @@ impl NlSocket {
                 self.fd.as_raw_fd(),
                 buf.as_ptr() as *const libc::c_void,
                 buf.len(),
-                0,
+                libc::MSG_TRUNC,
             )
         };
         if ret < 0 {
@@ -287,9 +288,16 @@ impl NlSocket {
             let n = self.recv_into(&mut buf)?;
             let mut off = 0;
             while off + NLMSGHDR_LEN <= n {
-                let (msg_len, msg_type, _seq) = parse_nlmsghdr(&buf[off..]);
-                if msg_len < NLMSGHDR_LEN || off + msg_len > n {
-                    break;
+                let (msg_len, msg_type, response_seq) = parse_nlmsghdr(&buf[off..]);
+                let flags = u16::from_ne_bytes([buf[off + 6], buf[off + 7]]);
+                if msg_len < NLMSGHDR_LEN
+                    || off + msg_len > n
+                    || response_seq != seq
+                    || flags & NLM_F_DUMP_INTR != 0
+                {
+                    return Err(NucleusError::NetworkError(
+                        "Incomplete netlink address dump".into(),
+                    ));
                 }
                 match msg_type {
                     NLMSG_DONE => return Ok(result),
@@ -312,7 +320,7 @@ impl NlSocket {
                 self.fd.as_raw_fd(),
                 buf.as_mut_ptr() as *mut libc::c_void,
                 buf.len(),
-                0,
+                libc::MSG_TRUNC,
             )
         };
         if n < 0 {
@@ -320,6 +328,11 @@ impl NlSocket {
                 "netlink recv: {}",
                 std::io::Error::last_os_error()
             )));
+        }
+        if n as usize > buf.len() {
+            return Err(NucleusError::NetworkError(
+                "Truncated netlink datagram".into(),
+            ));
         }
         Ok(n as usize)
     }
@@ -428,6 +441,14 @@ pub fn create_veth(host_name: &str, peer_name: &str) -> Result<()> {
     })
 }
 
+pub fn rename_link(from: &str, to: &str) -> Result<()> {
+    let mut sock = NlSocket::open()?;
+    let mut msg = NlMsg::new(RTM_NEWLINK, NLM_F_REQUEST | NLM_F_ACK);
+    msg.put_ifinfomsg(0, ifindex(from)? as i32, 0, 0);
+    msg.put_attr_str(IFLA_IFNAME, to);
+    sock.request(&mut msg)
+}
+
 /// Attach a link to a bridge (set master).
 pub fn set_link_master(link: &str, master: &str) -> Result<()> {
     let link_idx = ifindex(link)?;
@@ -451,16 +472,15 @@ pub fn set_link_up(name: &str) -> Result<()> {
         .map_err(|e| NucleusError::NetworkError(format!("set link up '{}': {}", name, e)))
 }
 
-/// Move a link into another network namespace (by PID).
-pub fn set_link_netns(name: &str, pid: u32) -> Result<()> {
+/// Move a link into another network namespace (by pinned namespace fd).
+pub fn set_link_netns(name: &str, ns: &std::fs::File) -> Result<()> {
     let idx = ifindex(name)?;
     let mut sock = NlSocket::open()?;
     let mut msg = NlMsg::new(RTM_NEWLINK, NLM_F_REQUEST | NLM_F_ACK);
     msg.put_ifinfomsg(0, idx as i32, 0, 0);
-    msg.put_attr_u32(IFLA_NET_NS_PID, pid);
-    sock.request(&mut msg).map_err(|e| {
-        NucleusError::NetworkError(format!("set link netns '{}' -> PID {}: {}", name, pid, e))
-    })
+    msg.put_attr_u32(IFLA_NET_NS_FD, std::os::fd::AsRawFd::as_raw_fd(ns) as u32);
+    sock.request(&mut msg)
+        .map_err(|e| NucleusError::NetworkError(format!("move link {name} into pinned netns: {e}")))
 }
 
 /// Add an IPv4 address to a link.
@@ -516,6 +536,13 @@ pub fn del_link(name: &str) -> Result<()> {
 
 /// Check whether an IPv4 address is assigned to any interface in this netns.
 pub fn is_addr_in_use(ip: &Ipv4Addr) -> Result<bool> {
+    has_address(ip, None)
+}
+
+pub fn has_address(ip: &Ipv4Addr, interface: Option<(&str, u8)>) -> Result<bool> {
+    let expected = interface
+        .map(|(name, prefix)| Ok::<_, NucleusError>((ifindex(name)?, prefix)))
+        .transpose()?;
     let mut sock = NlSocket::open()?;
     let mut msg = NlMsg::new(RTM_GETADDR, NLM_F_REQUEST | NLM_F_DUMP);
     msg.put_ifaddrmsg(libc::AF_INET as u8, 0, 0);
@@ -525,6 +552,12 @@ pub fn is_addr_in_use(ip: &Ipv4Addr) -> Result<bool> {
     for m in &msgs {
         if m.len() < NLMSGHDR_LEN + IFADDRMSG_LEN {
             continue;
+        }
+        if let Some((idx, prefix)) = expected {
+            let hdr = &m[NLMSGHDR_LEN..];
+            if hdr[1] != prefix || u32::from_ne_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]) != idx {
+                continue;
+            }
         }
         let mut off = NLMSGHDR_LEN + IFADDRMSG_LEN;
         while off + NLA_HDR_LEN <= m.len() {

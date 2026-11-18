@@ -175,6 +175,7 @@ mod tests {
                     group: None,
                     additional_groups: vec![],
                     secrets: vec![],
+                    egress_dns: false,
                     dns: vec![],
                     nat_backend: crate::network::NatBackend::Auto,
                     replicas: 1,

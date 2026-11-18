@@ -24,10 +24,10 @@ pub enum NetworkMode {
 )]
 #[serde(rename_all = "lowercase")]
 pub enum NatBackend {
-    /// Select kernel bridge + iptables when privileged, otherwise userspace NAT.
+    /// Select kernel bridge + nftables when privileged, otherwise userspace NAT.
     #[value(name = "auto")]
     Auto,
-    /// Require the kernel bridge/veth/iptables backend.
+    /// Require the kernel bridge/veth/nftables backend.
     #[value(name = "kernel")]
     Kernel,
     /// Require the userspace NAT backend.
@@ -97,7 +97,9 @@ impl BridgeConfig {
 
     pub fn selected_nat_backend(&self, host_is_root: bool, rootless: bool) -> NatBackend {
         match self.nat_backend {
-            NatBackend::Auto if host_is_root && !rootless => NatBackend::Kernel,
+            NatBackend::Auto if host_is_root && (!rootless || self.bridge_name != "nucleus0") => {
+                NatBackend::Kernel
+            }
             NatBackend::Auto => NatBackend::Userspace,
             explicit => explicit,
         }
@@ -122,7 +124,7 @@ impl BridgeConfig {
         Ok(Ipv4Addr::from(gateway))
     }
 
-    /// Validate all fields to prevent argument injection into ip/iptables commands.
+    /// Validate all fields to prevent argument injection into ip/nftables commands.
     pub fn validate(&self) -> crate::error::Result<()> {
         // Bridge name: alphanumeric, dash, underscore; max 15 chars (Linux IFNAMSIZ)
         if self.bridge_name.is_empty() || self.bridge_name.len() > 15 {
@@ -145,9 +147,28 @@ impl BridgeConfig {
         // Subnet: must be valid IPv4 CIDR
         validate_ipv4_cidr(&self.subnet).map_err(crate::error::NucleusError::NetworkError)?;
 
+        let (base, prefix) =
+            parse_ipv4_cidr(&self.subnet).map_err(crate::error::NucleusError::NetworkError)?;
+        if prefix > 30 || u32::from(base) & !ipv4_mask(prefix) != 0 {
+            return Err(crate::error::NucleusError::NetworkError(format!(
+                "Bridge requires an aligned IPv4 subnet with usable host addresses: {}",
+                self.subnet
+            )));
+        }
+
         // Container IP (if specified)
         if let Some(ref ip) = self.container_ip {
             validate_ipv4_addr(ip).map_err(crate::error::NucleusError::NetworkError)?;
+            let addr: Ipv4Addr = ip.parse().map_err(|e| {
+                crate::error::NucleusError::NetworkError(format!("Invalid container address: {e}"))
+            })?;
+            let offset = u32::from(addr).wrapping_sub(u32::from(base));
+            if offset < 2 || offset >= !ipv4_mask(prefix) {
+                return Err(crate::error::NucleusError::NetworkError(format!(
+                    "Container IP {addr} is not a usable guest address in {}",
+                    self.subnet
+                )));
+            }
         }
 
         // DNS servers
@@ -183,7 +204,7 @@ fn validate_ipv4_addr(s: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn parse_ipv4_cidr(s: &str) -> Result<(Ipv4Addr, u8), String> {
+pub(super) fn parse_ipv4_cidr(s: &str) -> Result<(Ipv4Addr, u8), String> {
     let (addr, prefix) = s
         .split_once('/')
         .ok_or_else(|| format!("Invalid CIDR (missing /prefix): '{}'", s))?;
@@ -200,7 +221,7 @@ fn parse_ipv4_cidr(s: &str) -> Result<(Ipv4Addr, u8), String> {
     Ok((addr, prefix))
 }
 
-fn ipv4_mask(prefix: u8) -> u32 {
+pub(super) fn ipv4_mask(prefix: u8) -> u32 {
     if prefix == 0 {
         0
     } else {
@@ -278,14 +299,14 @@ pub fn validate_egress_domain(s: &str) -> Result<(), String> {
 
 /// Egress policy for audited outbound network access.
 ///
-/// When set, iptables OUTPUT chain rules restrict which destinations the
+/// When set, nftables OUTPUT chain rules restrict which destinations the
 /// container process can connect to. Use [`EgressPolicy::deny_all`] when no
 /// outbound connections, including DNS, should be permitted.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct EgressPolicy {
     /// Allowed destination CIDRs (e.g., "10.0.0.0/8", "192.168.1.0/24").
     pub allowed_cidrs: Vec<String>,
-    /// Allowed exact DNS names. These are resolved to IPv4 /32 rules at startup.
+    /// Allowed exact DNS names. Public IPv4 grants are refreshed and expire in the kernel.
     pub allowed_domains: Vec<String>,
     /// Allowed destination TCP ports. Empty means all ports on allowed CIDRs.
     pub allowed_tcp_ports: Vec<u16>,
@@ -294,30 +315,14 @@ pub struct EgressPolicy {
     /// Whether to log denied egress attempts (rate-limited).
     pub log_denied: bool,
     /// Whether to add implicit DNS (port 53 UDP/TCP) allow rules for configured
-    /// resolvers. Defaults to `true` for explicit allowlist usability.
+    /// resolvers. Enabled only by explicit policy.
     pub allow_dns: bool,
-}
-
-impl Default for EgressPolicy {
-    fn default() -> Self {
-        Self {
-            allowed_cidrs: Vec::new(),
-            allowed_domains: Vec::new(),
-            allowed_tcp_ports: Vec::new(),
-            allowed_udp_ports: Vec::new(),
-            log_denied: true,
-            allow_dns: true,
-        }
-    }
 }
 
 impl EgressPolicy {
     /// Create a strict deny-all egress policy, including DNS.
     pub fn deny_all() -> Self {
-        Self {
-            allow_dns: false,
-            ..Self::default()
-        }
+        Self::default()
     }
 
     /// Allow egress to the given CIDRs on any port.

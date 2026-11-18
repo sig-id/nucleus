@@ -14,7 +14,7 @@ use crate::filesystem::{
     TmpfsMount,
 };
 use crate::isolation::{NamespaceManager, UserNamespaceMapper};
-use crate::network::{BridgeDriver, BridgeNetwork, NatBackend, NetworkMode, UserspaceNetwork};
+use crate::network::{BridgeDriver, BridgeNetwork, NatBackend, NetworkMode};
 use crate::resources::{Cgroup, ResourceStats};
 use crate::security::{
     CapabilityManager, GVisorRuntime, LandlockManager, NativeLandlock, NativeSeccomp,
@@ -1180,15 +1180,20 @@ impl Container {
                     )?;
 
                     if let NetworkMode::Bridge(ref bridge_config) = config.network {
-                        let net = BridgeDriver::setup_with_id(
-                            target_pid,
+                        // The direct child creates the network/user namespaces before
+                        // forking PID 1. Its PID cannot be reused before we reap it.
+                        // Pin its descriptors even when the workload is a grandchild.
+                        let namespace_owner = child.as_raw() as u32;
+                        let net = BridgeDriver::setup_with_id_and_broker(
+                            namespace_owner,
                             bridge_config,
                             &config.id,
                             is_root,
                             config.user_ns_config.is_some(),
+                            config.credential_broker.as_ref(),
                         )?;
                         net.apply_egress_policy(
-                            target_pid,
+                            namespace_owner,
                             config
                                 .egress_policy
                                 .as_ref()
@@ -1697,18 +1702,11 @@ impl Container {
         // When rootfs is mounted, /etc is read-only, so we bind-mount a writable
         // resolv.conf over the top (same technique as secrets).
         if let NetworkMode::Bridge(ref bridge_config) = self.config.network {
-            let bridge_dns = if bridge_config.selected_nat_backend(!is_rootless, is_rootless)
-                == NatBackend::Userspace
-                && bridge_config.dns.is_empty()
-            {
-                vec![UserspaceNetwork::default_dns_server(&bridge_config.subnet)?]
-            } else {
-                bridge_config.dns.clone()
-            };
+            let bridge_dns = &bridge_config.dns;
             if self.config.rootfs_path.is_some() {
-                BridgeNetwork::bind_mount_resolv_conf(&container_root, &bridge_dns)?;
+                BridgeNetwork::bind_mount_resolv_conf(&container_root, bridge_dns)?;
             } else {
-                BridgeNetwork::write_resolv_conf(&container_root, &bridge_dns)?;
+                BridgeNetwork::write_resolv_conf(&container_root, bridge_dns)?;
             }
         }
 

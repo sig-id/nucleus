@@ -489,7 +489,18 @@ fn build_service_run_command(
         args.push(dns.clone());
     }
 
-    if !svc.networks.is_empty() {
+    if let Some(network) = svc.networks.first() {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(format!("{}\0{}", config.name, network));
+        args.extend([
+            "--bridge-name".into(),
+            format!("nx{}", hex::encode(&digest[..6])),
+            "--bridge-subnet".into(),
+            config.networks[network].subnet.clone(),
+        ]);
+        if svc.egress_dns {
+            args.push("--egress-dns".into());
+        }
         args.push("--nat-backend".to_string());
         args.push(svc.nat_backend.as_str().to_string());
     }
@@ -1076,6 +1087,8 @@ command = ["/bin/web"]
 memory = "256M"
 networks = ["internal"]
 nat_backend = "userspace"
+dns = ["10.1.1.1"]
+egress_dns = true
 egress_udp_ports = [53]
 "#;
         let config = TopologyConfig::from_toml(toml).unwrap();
@@ -1084,6 +1097,13 @@ egress_udp_ports = [53]
             build_service_run_command(&config, "web", svc, "test-web", 42, None).unwrap();
         let args = run_command.args;
 
+        assert!(args
+            .windows(2)
+            .any(|p| p[0] == "--bridge-subnet" && p[1] == "10.42.0.0/24"));
+        assert!(args
+            .windows(2)
+            .any(|p| p[0] == "--bridge-name" && p[1].starts_with("nx")));
+        assert!(args.iter().any(|s| s == "--egress-dns"));
         assert!(args
             .windows(2)
             .any(|pair| pair[0] == "--nat-backend" && pair[1] == "userspace"));

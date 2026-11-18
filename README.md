@@ -111,7 +111,7 @@ not Docker/OCI images.
 | Architecture | `dockerd` daemon + socket API | Single binary, direct fork/exec; detached = systemd transient unit |
 | Networking | CNI plugins, overlay networks | `none` / `host` / `bridge` only |
 | Orchestration | Compose, Swarm | `nucleus compose` (single-host TOML DAG over systemd) |
-| Default egress | Allow-all outbound | Deny-by-default; allow per CIDR/domain via namespace iptables |
+| Default egress | Allow-all outbound | Deny-by-default; allow per CIDR/domain via namespace nftables |
 | Filesystem ACLs | AppArmor/SELinux profiles | Landlock LSM, per-service, irreversible |
 | gVisor | Optional add-on runtime | First-class integrated runtime with explicit network modes |
 | Security policies | Bundled defaults | Externalized seccomp/caps/Landlock, SHA-256 pinned + trace-generated |
@@ -541,7 +541,7 @@ nucleus run \
   --require-kernel-lockdown integrity \
   --network bridge --dns 10.0.0.1 \
   --egress-allow 10.0.0.0/8 \
-  --egress-domain api.example.com \
+  --egress-dns --egress-domain api.example.com \
   --egress-tcp-port 443 --egress-tcp-port 8443 \
   --health-cmd "curl -sf http://localhost:8080/health" \
   --health-interval 30 --health-retries 3 \
@@ -862,6 +862,7 @@ in
 
       # Egress policy – audited outbound access
       egressAllow = [ "10.0.0.0/8" ];
+      egressDns = true;
       egressDomains = [ "api.example.com" ];
       egressTcpPorts = [ 443 8443 ];
 
@@ -1044,7 +1045,7 @@ the CLI `nucleus image commit` workflow.
 
 **Workload identity.** When host root launches a default agent, Nucleus maps container UID/GID 0 to host UID/GID 100000. Host bind mounts use the mapped identity for permission checks. To run an agent with an existing unprivileged host identity, pass its nonzero `--user` and `--group`. With `--workspace-mode copy-in-out`, the workload edits a private copy owned by its mapped identity.
 
-**Agent mode is not hardened.** By design, agent mode applies several security mechanisms on a best-effort basis: seccomp and Landlock failures are warn-and-continue (with `--allow-degraded-security`), chroot fallback is available (with `--allow-chroot-fallback`), bridge DNS defaults to public resolvers (`8.8.8.8`), and cgroup creation failures are non-fatal. Operators requiring strict isolation for ephemeral workloads should use `--service-mode strict-agent`; operators deploying long-running NixOS services should use production mode.
+**Agent mode is not hardened.** By design, agent mode applies several security mechanisms on a best-effort basis: seccomp and Landlock failures are warn-and-continue (with `--allow-degraded-security`), chroot fallback is available (with `--allow-chroot-fallback`), and cgroup creation failures are non-fatal. Operators requiring strict isolation for ephemeral workloads should use `--service-mode strict-agent`; operators deploying long-running NixOS services should use production mode.
 
 ## Service Modes
 
@@ -1055,7 +1056,7 @@ the CLI `nucleus image commit` workflow.
 | Chroot fallback | Allowed with flag | Forbidden | Forbidden |
 | Host networking | Allowed with flag | Native `host` forbidden; `gvisor-host` allowed with gVisor + explicit opt-in | Native `host` forbidden; `gvisor-host` allowed with gVisor + explicit opt-in |
 | Cgroup limits | Best-effort | Required (fatal on create/apply failure) | Required (fatal on create/apply failure) |
-| Bridge DNS | Defaults to 8.8.8.8/8.8.4.4 | Must be configured explicitly unless credential broker mode disables DNS | Must be configured explicitly unless credential broker mode disables DNS |
+| Bridge DNS | No implicit resolver | Must be configured explicitly unless credential broker mode disables DNS | Must be configured explicitly unless credential broker mode disables DNS |
 | Rootfs | Host bind mounts unless `--rootfs` (optionally with `--rootfs-mode overlay`) or `--agent-toolchain-rootfs` is supplied | Host bind mounts unless `--rootfs` (optionally with `--rootfs-mode overlay`) or `--agent-toolchain-rootfs` is supplied | Pre-built Nix closure (`--rootfs`) or build-time `mkImage` image without an overlay diff |
 | Workspace | Optional `/workspace`; bind/copy-in-out for agents | Optional `/workspace`; bind/copy-in-out for agents | Optional, non-executable unless read-only or policy-specific |
 | Bridge egress policy | Deny-all by default | Deny-all by default | Deny-all by default |
@@ -1080,15 +1081,9 @@ Landlock and all-capabilities-dropped posture.
 ## Egress Policy
 
 Native bridge networking defaults to deny-all in every service mode, including DNS. IPv4 allowlists apply to IPv4 only. The IPv6 OUTPUT policy permits loopback only. Bridge setup or firewall installation failure aborts launch.
-When `--egress-allow` or `--egress-domain` is specified, Nucleus applies iptables OUTPUT chain rules inside the container's network namespace:
+The supervisor installs a dual-stack nftables OUTPUT chain in the workload network namespace. It permits loopback and IPv4 reply traffic. Use `--egress-allow` and `--egress-domain` to permit outbound destinations and restrict them with the TCP and UDP port options. DNS egress requires `--egress-dns` and explicit `--dns` resolvers. The userspace backend disables its built-in DNS proxy.
 
-1. Allow loopback traffic
-2. Allow established/related connections
-3. Allow DNS to configured resolvers
-4. Resolve permitted domains to IPv4 `/32` rules at startup
-5. Allow traffic to permitted CIDRs and resolved domain addresses (optionally restricted to specific ports)
-6. Log denied packets (rate-limited, `nucleus-egress-denied:` prefix)
-7. Drop everything else
+A counter records denied packets. For rate-limited kernel messages with the `nucleus-egress-denied:` prefix, enable `--egress-log-denied` on a host configured with `net.netfilter.nf_log_all_netns=1`. Startup fails if the requested logging facility is unavailable.
 
 ```bash
 # Allow outbound to internal network on HTTPS only
@@ -1098,7 +1093,7 @@ nucleus run --network bridge --dns 10.0.0.1 \
 
 # Allow outbound to a provider API domain on HTTPS only
 nucleus run --network bridge --dns 10.0.0.1 \
-  --egress-domain api.example.com --egress-tcp-port 443 \
+  --egress-dns --egress-domain api.example.com --egress-tcp-port 443 \
   -- ./provider-client
 
 # Production deny-all egress, including DNS
@@ -1106,7 +1101,7 @@ nucleus run --service-mode production --network bridge --dns 10.0.0.1 \
   -- ./isolated-service
 ```
 
-Domain egress entries are exact DNS names, not wildcard or suffix rules. Nucleus resolves each domain with the supervisor host resolver before installing the namespace-local iptables policy, keeps only IPv4 answers, and fails startup if a domain has no IPv4 address. Long-running services that depend on provider IP rotation should restart after DNS changes, use provider-published CIDR ranges, or route traffic through a stable internal proxy and allow that proxy CIDR instead.
+Domain entries grant access to the resolved IPv4 addresses shared by a hostname. The host resolver runs at startup and every 30 seconds. A special-use address, address on the workload subnet, or address assigned to the host causes the entire update to be rejected. A failed refresh withdraws the previous grants. The kernel expires grants after 60 seconds even if the supervisor stops. Use explicit CIDRs for intended private destinations.
 
 ### Credential Broker Egress
 
@@ -1127,7 +1122,11 @@ nucleus run --network bridge --credential-broker 10.0.42.1:8080 \
 
 Broker mode is mutually exclusive with `--egress-allow`, `--egress-domain`, `--egress-tcp-port`, and `--egress-udp-port`; adding direct routes would defeat the broker boundary. The broker endpoint must be the host-side IPv4 bridge gateway, not `127.0.0.1`, because loopback is local to the container namespace. The default host-side bridge gateway is `10.0.42.1`; Nucleus rejects broker IPs that differ from the configured bridge gateway.
 
-Credential broker mode currently requires the kernel bridge/veth/iptables NAT backend. It rejects explicit `--nat-backend userspace`, and `--nat-backend auto` is rejected when it would resolve to userspace NAT for rootless/native containers. `slirp4netns` does not expose the host-side bridge gateway as a host-bound address for the broker.
+The kernel backend requires operator-configured `net.ipv4.ip_forward=1`. It installs private nftables tables for each attachment and reclaims orphaned tables on the next kernel bridge setup. Only locally addressed traffic matches a published port. The default bridge isolates peers and restricts host input to replies, the configured credential broker, and explicitly allowed DNS. Named topology networks use their configured subnet and distinct bridge interfaces. A service may attach to one network. Members of a named kernel bridge can communicate subject to egress policy. For a named fabric, `auto` selects a kernel bridge when the supervisor runs as root. Each slirp attachment has a private network. Existing unmanaged bridges, including unmarked bridges left by older releases, must be drained and removed or a different bridge name and subnet selected before migration.
+
+Userspace NAT requires a workload user namespace mapping container UID 0 to a nonzero host UID, access to `/dev/net/tun` by that mapped identity, and slirp4netns with sandbox and seccomp support. Helper setup failure aborts launch.
+
+Credential broker mode currently requires the kernel bridge/veth/nftables NAT backend. It rejects explicit `--nat-backend userspace`, and `--nat-backend auto` is rejected when it would resolve to userspace NAT for rootless/native containers. `slirp4netns` does not expose the host-side bridge gateway as a host-bound address for the broker.
 
 At startup, Nucleus performs a short TCP pre-connect to the broker endpoint after bridge setup and before releasing the workload. A missing or unreachable broker fails the sandbox start immediately instead of letting the first outbound request hang.
 
@@ -1143,8 +1142,8 @@ For the native runtime, `--network bridge` now has two backends:
 
 | `--nat-backend` | When used | Implementation |
 |---|---|---|
-| `auto` | Default | Kernel bridge/veth/iptables when privileged, `slirp4netns` userspace NAT when rootless |
-| `kernel` | Explicit opt-in | Kernel bridge + veth + iptables MASQUERADE/DNAT |
+| `auto` | Default | Kernel bridge/veth/nftables when privileged, `slirp4netns` userspace NAT when rootless |
+| `kernel` | Explicit opt-in | Kernel bridge + veth + nftables masquerade and local-destination DNAT |
 | `userspace` | Explicit opt-in | `slirp4netns` userspace NAT + API-socket port forwarding |
 
 This changes the native rootless behavior from "degrade to `none`" to a real userspace NAT path.

@@ -1723,7 +1723,7 @@ impl ContainerConfig {
             && self.egress_policy.is_some()
         {
             return Err(crate::error::NucleusError::ConfigError(
-                "gVisor bridge netstack transmits at the link layer and cannot enforce Nucleus iptables OUTPUT egress rules".into(),
+                "gVisor bridge netstack transmits at the link layer and cannot enforce Nucleus network-namespace OUTPUT egress rules".into(),
             ));
         }
 
