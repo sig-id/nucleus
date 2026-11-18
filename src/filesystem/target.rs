@@ -97,25 +97,10 @@ pub(crate) fn bind_tree(
         return Err(std::io::Error::last_os_error().into());
     }
     let tree = unsafe { OwnedFd::from_raw_fd(raw as i32) };
-    let mut attr: libc::mount_attr = unsafe { std::mem::zeroed() };
-    attr.attr_set = attrs;
-    // SAFETY: both fds are live, the empty paths are terminated, and attr is initialized.
-    let rc = unsafe {
-        libc::syscall(
-            libc::SYS_mount_setattr,
-            tree.as_raw_fd(),
-            c"".as_ptr(),
-            libc::AT_EMPTY_PATH | rec,
-            &attr,
-            std::mem::size_of_val(&attr),
-        )
-    };
-    if rc == -1 {
-        return Err(NucleusError::FilesystemError(format!(
-            "Cannot restrict bind from {source:?}: {}",
-            std::io::Error::last_os_error()
-        )));
-    }
+    set_mount_attributes(&tree, attrs, recursive).map_err(|e| {
+        NucleusError::FilesystemError(format!("Cannot restrict bind from {source:?}: {e}"))
+    })?;
+    // SAFETY: both fds are live and the empty paths are terminated.
     let rc = unsafe {
         libc::syscall(
             libc::SYS_move_mount,
@@ -128,6 +113,33 @@ pub(crate) fn bind_tree(
     };
     if rc == -1 {
         return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+/// Add per-mount flags without clearing any existing restriction.
+pub(super) fn set_mount_attributes(
+    fd: &OwnedFd,
+    attrs: u64,
+    recursive: bool,
+) -> std::io::Result<()> {
+    // SAFETY: zero leaves all optional mount_attr fields unchanged.
+    let mut attr: libc::mount_attr = unsafe { std::mem::zeroed() };
+    attr.attr_set = attrs;
+    let flags = libc::AT_EMPTY_PATH | if recursive { libc::AT_RECURSIVE } else { 0 };
+    // SAFETY: fd pins the mount, the path is terminated and attr is initialized.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_mount_setattr,
+            fd.as_raw_fd(),
+            c"".as_ptr(),
+            flags,
+            &attr,
+            std::mem::size_of_val(&attr),
+        )
+    };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
     }
     Ok(())
 }

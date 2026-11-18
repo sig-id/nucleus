@@ -655,6 +655,10 @@ path = "/tmp"
 access = ["read", "write", "create", "remove"]
 ```
 
+Native seccomp rejects simultaneous write and execute permissions in `mmap`, `mprotect`, `pkey_mprotect`, and `shmat` requests. It returns `EPERM` for `PR_SET_MM`. The built-in policy requires explicit `--seccomp-allow` entries for `splice`, `tee`, and `sendfile` in every network mode. GPU mode still blocks `TIOCSTI` and `TIOCLINUX` on all file descriptors.
+
+Native containers mount procfs with `nosymfollow` to prevent execution through descriptor links. Programs can read ordinary files such as `/proc/<pid>/status` using a numeric PID. Programs that follow `/proc/self`, `/proc/thread-self`, or `/dev/fd/N` need a different access path. Recreate running containers to pick up the new mounts and saved seccomp program.
+
 ### Seccomp Profile Generation
 
 Profiles shouldn't be hand-written from scratch. Use trace mode to record actual syscall usage, then generate a minimal profile:

@@ -159,7 +159,7 @@ impl Container {
         // Fallback: iterate /proc/self/fd and set FD_CLOEXEC individually.
         // Collect fds first, then update – changing fds during iteration would
         // invalidate the ReadDir's own directory fd.
-        if let Ok(entries) = std::fs::read_dir("/proc/self/fd") {
+        if let Ok(entries) = std::fs::read_dir(format!("/proc/{}/fd", std::process::id())) {
             let fds: Vec<i32> = entries
                 .flatten()
                 .filter_map(|entry| entry.file_name().into_string().ok())
@@ -183,7 +183,7 @@ impl Container {
             return;
         }
 
-        if let Ok(entries) = std::fs::read_dir("/proc/self/fd") {
+        if let Ok(entries) = std::fs::read_dir(format!("/proc/{}/fd", std::process::id())) {
             let fds: Vec<i32> = entries
                 .flatten()
                 .filter_map(|entry| entry.file_name().into_string().ok())
@@ -206,7 +206,7 @@ impl Container {
     }
 
     pub(crate) fn assert_single_threaded_for_fork(context: &str) -> Result<()> {
-        let thread_count = std::fs::read_to_string("/proc/self/status")
+        let thread_count = std::fs::read_to_string(format!("/proc/{}/status", std::process::id()))
             .ok()
             .and_then(|s| {
                 s.lines()
@@ -755,6 +755,11 @@ impl Container {
             ),
         );
 
+        if !self.config.use_gvisor && !self.config.namespaces.mnt {
+            return Err(NucleusError::ConfigError(
+                "Native workloads require a private mount namespace".into(),
+            ));
+        }
         let is_root = nix::unistd::Uid::effective().is_root();
         let mut config = self.config.clone();
         Self::configure_user_namespace(&mut config, is_root)?;
@@ -1763,6 +1768,7 @@ impl Container {
         //
         // Custom cap policies (drop_except / apply_sets) do their own full drop,
         // so the two-phase approach only applies to the default drop-all path.
+        crate::filesystem::restrict_procfs_links()?;
         let mut cap_mgr = CapabilityManager::new();
         if let Some(ref policy_path) = self.config.caps_policy {
             let policy: crate::security::CapsPolicy = crate::security::load_toml_policy(
