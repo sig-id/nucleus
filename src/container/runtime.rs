@@ -5,12 +5,13 @@ use crate::container::{
 };
 use crate::error::{NucleusError, Result, StateTransition};
 use crate::filesystem::{
-    audit_mounts, bind_mount_host_paths, bind_mount_rootfs, copy_workspace_in, create_dev_nodes,
-    create_minimal_fs, device_node_spec, mask_proc_paths, mount_gpu_passthrough, mount_home_tmpfs, mount_procfs,
-    mount_provider_configs, mount_secrets_inmemory, mount_volumes, mount_workspace,
-    open_overlay_dirs, overlay_mount_rootfs_pinned, resolve_gpu_devices, snapshot_context_dir,
-    switch_root, sync_workspace_out, validate_production_rootfs_path, verify_context_manifest,
-    verify_rootfs_attestation, DeviceNodeSpec, FilesystemState, GpuDeviceSet, LazyContextPopulator, TmpfsMount,
+    audit_mounts, bind_mount_host_paths, bind_mount_rootfs, copy_workspace_in, create_minimal_fs,
+    device_node_spec, mount_home_tmpfs, mount_procfs, mount_provider_configs,
+    mount_secrets_inmemory, mount_volumes, mount_workspace, open_overlay_dirs,
+    overlay_mount_rootfs_pinned, resolve_gpu_devices, snapshot_context_dir, switch_root,
+    sync_workspace_out, validate_production_rootfs_path, verify_context_manifest,
+    verify_rootfs_attestation, DeviceNodeSpec, FilesystemState, GpuDeviceSet, LazyContextPopulator,
+    TmpfsMount,
 };
 use crate::isolation::{NamespaceManager, UserNamespaceMapper};
 use crate::network::{BridgeDriver, BridgeNetwork, NatBackend, NetworkMode, UserspaceNetwork};
@@ -225,10 +226,28 @@ impl Container {
         )))
     }
 
+    fn gvisor_needs_mount_staging(config: &ContainerConfig) -> bool {
+        (config.workspace.host_path.is_some()
+            && config.workspace.mode != super::WorkspaceMode::CopyInOut)
+            || !config.provider_configs.is_empty()
+            || !config.secrets.is_empty()
+            || config
+                .volumes
+                .iter()
+                .any(|v| matches!(v.source, super::VolumeSource::Bind { .. }))
+            || config
+                .rootfs_path
+                .as_deref()
+                .is_some_and(|p| !crate::filesystem::is_immediate_nix_store_object_path(p))
+    }
+
     fn gvisor_needs_precreated_userns(config: &ContainerConfig, host_is_root: bool) -> bool {
         config.use_gvisor
             && config.user_ns_config.is_some()
             && ((host_is_root && config.service_mode == ServiceMode::Agent)
+                || (!host_is_root
+                    && config.service_mode == ServiceMode::Agent
+                    && Self::gvisor_needs_mount_staging(config))
                 || (!host_is_root
                     && matches!(
                         config.network,
@@ -773,6 +792,12 @@ impl Container {
                 )
             })?;
             config.rootfs_path = Some(validate_production_rootfs_path(rootfs_path)?);
+        }
+        if config.verify_rootfs_attestation {
+            let root = config.rootfs_path.as_ref().ok_or_else(|| {
+                NucleusError::ConfigError("Rootfs attestation requires an explicit rootfs".into())
+            })?;
+            config.rootfs_path = Some(verify_rootfs_attestation(root)?);
         }
         Self::assert_kernel_lockdown(&config)?;
 
@@ -1342,7 +1367,9 @@ impl Container {
                 // Both the OCI bundle and runsc state must be owned by the mapped supervisor.
                 // This is the single-threaded fork child, before runsc receives its sanitized env.
                 std::env::set_var("NUCLEUS_GVISOR_ARTIFACT_BASE", base);
-                // Mount secret staging in a namespace owned by the mapped setup process.
+            }
+            if mapped_base.is_some() || Self::gvisor_needs_mount_staging(&self.config) {
+                // Staged bind mounts must be private to this launch.
                 nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNS)?;
                 nix::mount::mount(
                     None::<&str>,
@@ -1525,9 +1552,6 @@ impl Container {
                     "--rootfs-mode overlay requires a rootfs path".to_string(),
                 )
             })?;
-            if self.config.verify_rootfs_attestation {
-                verify_rootfs_attestation(rootfs_path)?;
-            }
             let (upper, work) = overlay_dirs.ok_or_else(|| {
                 NucleusError::FilesystemError(
                     "rootfs overlay mode missing prepared upper/work dirs".to_string(),
@@ -1554,29 +1578,32 @@ impl Container {
                 None::<&str>,
             )?;
         } else {
-            if rootfs_overlay_mounted {
-                nix::mount::mount(
-                    Some("tmpfs"),
-                    &crate::filesystem::fd_path(&dev_target),
-                    Some("tmpfs"),
-                    nix::mount::MsFlags::MS_NOSUID | nix::mount::MsFlags::MS_NOEXEC,
-                    Some("mode=0755,size=1m"),
-                )?;
-            }
-            create_dev_nodes(&dev_path, self.config.terminal)?;
+            nix::mount::mount(
+                Some("tmpfs"),
+                &crate::filesystem::fd_path(&dev_target),
+                Some("tmpfs"),
+                nix::mount::MsFlags::MS_NOSUID | nix::mount::MsFlags::MS_NOEXEC,
+                Some("mode=0755,size=1m"),
+            )?;
+            crate::filesystem::populate_native_dev(
+                &dev_path,
+                self.config.terminal,
+                is_rootless,
+                &self.config.process_identity,
+            )?;
         }
 
         // 5a. GPU passthrough: create private device nodes + bind driver support files.
         if let (Some(set), Some(gpu_config)) = (gpu_device_set, &self.config.gpu) {
-            if prepared_dev.is_some() {
-                crate::filesystem::mount_gpu_support(&container_root, set, gpu_config)?;
-            } else {
-                mount_gpu_passthrough(
+            if prepared_dev.is_none() {
+                crate::filesystem::create_gpu_nodes(
                     &container_root,
                     set,
-                    gpu_config,
                     &self.config.process_identity,
                 )?;
+            }
+            if self.config.rootfs_path.is_none() {
+                crate::filesystem::mount_gpu_support(&container_root, set, gpu_config)?;
             }
         }
 
@@ -1638,9 +1665,6 @@ impl Container {
             } else {
                 rootfs_path.clone()
             };
-            if self.config.verify_rootfs_attestation {
-                verify_rootfs_attestation(&rootfs_path)?;
-            }
             bind_mount_rootfs(&container_root, &rootfs_path)?;
         } else {
             bind_mount_host_paths(&container_root, is_rootless)?;
@@ -1692,24 +1716,7 @@ impl Container {
             &self.config.process_identity,
         )?;
 
-        // 8. Mount procfs (hidepid=2 in production mode to prevent PID enumeration)
-        let proc_path = container_root.join("proc");
-        let production_mode = self.config.service_mode == ServiceMode::Production;
-        let hide_pids = production_mode;
-        let procfs_best_effort = is_rootless && !production_mode && !rootfs_overlay_mounted;
-        mount_procfs(
-            &proc_path,
-            procfs_best_effort,
-            self.config.proc_readonly,
-            hide_pids,
-        )?;
-
-        // 8b. Mask sensitive /proc paths to reduce kernel info leakage
-        // SEC-06: In production mode, failures to mask critical paths are fatal.
-        mask_proc_paths(
-            &proc_path,
-            self.config.service_mode == ServiceMode::Production,
-        )?;
+        mount_procfs(&container_root.join("proc"), self.config.proc_readonly)?;
 
         // 9c. Run createRuntime hooks (after namespaces created, before pivot_root)
         if let Some(ref hooks) = self.config.hooks {
@@ -2997,7 +3004,7 @@ mod tests {
             &temp.path().join("stage"),
             &[crate::container::SecretMount {
                 source: source.clone(),
-                dest: std::path::PathBuf::from("/etc/app/secret.txt"),
+                dest: std::path::PathBuf::from("/app/secret.txt"),
                 mode: 0o400,
             }],
             &crate::container::ProcessIdentity::root(),
@@ -3026,7 +3033,7 @@ mod tests {
             &temp.path().join("stage"),
             &[crate::container::SecretMount {
                 source: link,
-                dest: std::path::PathBuf::from("/etc/app/secret.txt"),
+                dest: std::path::PathBuf::from("/app/secret.txt"),
                 mode: 0o400,
             }],
             &crate::container::ProcessIdentity::root(),
@@ -3073,29 +3080,6 @@ mod tests {
                 && !fn_body.contains("drop_bounding_set_except")
                 && !fn_body.contains("finalize_drop_except"),
             "overlay rootfs mode must use the default drop-all capability path"
-        );
-    }
-
-    #[test]
-    fn test_native_production_procfs_mount_is_not_rootless_best_effort() {
-        let source = include_str!("runtime.rs");
-        let fn_body = extract_fn_body(source, "fn setup_and_exec");
-
-        assert!(
-            fn_body.contains(
-                "let production_mode = self.config.service_mode == ServiceMode::Production;"
-            ),
-            "setup_and_exec must derive an explicit production-mode guard for procfs hardening"
-        );
-        assert!(
-            fn_body.contains("let procfs_best_effort = is_rootless && !production_mode && !rootfs_overlay_mounted;"),
-            "rootless best-effort procfs fallback must be disabled in production mode"
-        );
-        assert!(
-            fn_body.contains(
-                "mount_procfs(\n            &proc_path,\n            procfs_best_effort,"
-            ),
-            "mount_procfs must receive the production-aware best-effort flag"
         );
     }
 

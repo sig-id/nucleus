@@ -85,7 +85,7 @@ fn amd_binds_kfd_and_render_nodes() {
 }
 
 #[test]
-fn intel_binds_render_and_card_nodes() {
+fn intel_discovers_only_render_nodes() {
     let dir = tempfile::tempdir().unwrap();
     let dev = dir.path();
     touch(dev, "dri/renderD128");
@@ -102,7 +102,7 @@ fn intel_binds_render_and_card_nodes() {
         .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
         .collect();
     assert!(names.contains(&"renderD128".to_string()));
-    assert!(names.contains(&"card0".to_string()));
+    assert!(!names.contains(&"card0".to_string()));
 }
 
 #[test]
@@ -174,7 +174,7 @@ fn explicit_device_path_allowlist_rejects_non_gpu_devices() {
     )));
     assert!(is_allowed_gpu_device_path(Path::new("/dev/kfd")));
     assert!(is_allowed_gpu_device_path(Path::new("/dev/dri/renderD128")));
-    assert!(is_allowed_gpu_device_path(Path::new("/dev/dri/card0")));
+    assert!(!is_allowed_gpu_device_path(Path::new("/dev/dri/card0")));
 
     assert!(!is_allowed_gpu_device_path(Path::new("/dev/null")));
     assert!(!is_allowed_gpu_device_path(Path::new("/dev/zero")));
@@ -336,4 +336,24 @@ fn device_node_spec_rejects_missing_or_non_device_paths() {
     fs::write(&file, b"x").unwrap();
     assert_eq!(device_node_spec(&file), None);
     assert_eq!(device_node_spec(&dir.path().join("missing")), None);
+}
+
+#[test]
+fn nvidia_support_selects_driver_sonames() {
+    for name in [
+        "libcuda.so",
+        "libcuda.so.1",
+        "libnvidia-ml.so.570.32",
+        "libEGL_nvidia.so.0",
+    ] {
+        assert!(is_nvidia_library(name), "{name}");
+    }
+    for name in [
+        "libc.so.6",
+        "libcuda.so.conf",
+        "libnvidia-ml.a",
+        "libcuda.so.",
+    ] {
+        assert!(!is_nvidia_library(name), "{name}");
+    }
 }

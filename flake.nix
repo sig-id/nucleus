@@ -266,6 +266,7 @@
           inherit src;
           ${if pkgs.stdenv.hostPlatform.isLinux then "NUCLEUS_PACKAGED_RUNSC" else null} =
             "${gvisor}/bin/runsc";
+          NUCLEUS_PACKAGED_NIX_STORE = "${pkgs.nix}/bin/nix-store";
           pname = "nucleus";
           version = "0.4.0";
           strictDeps = true;

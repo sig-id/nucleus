@@ -1,8 +1,8 @@
 use crate::container::{ConsoleSize, OciStatus};
 use crate::error::{NucleusError, Result};
 use crate::filesystem::{
-    is_immediate_nix_store_object_path, normalize_container_destination,
-    normalize_provider_config_destination, normalize_volume_destination, ROOTFS_STORE_PATHS_FILE,
+    normalize_container_destination, normalize_provider_config_destination,
+    normalize_volume_destination,
 };
 use crate::isolation::{IdMapping, NamespaceConfig, UserNamespaceConfig};
 use crate::resources::ResourceLimits;
@@ -860,31 +860,16 @@ impl OciConfig {
                 resources: None,
                 uid_mappings: vec![],
                 gid_mappings: vec![],
-                // M14: Aligned with native masked paths in mount.rs (PROC_NULL_MASKED)
-                masked_paths: vec![
-                    "/proc/acpi".to_string(),
-                    "/proc/asound".to_string(),
-                    "/proc/kcore".to_string(),
-                    "/proc/keys".to_string(),
-                    "/proc/latency_stats".to_string(),
-                    "/proc/sched_debug".to_string(),
-                    "/proc/scsi".to_string(),
-                    "/proc/timer_list".to_string(),
-                    "/proc/timer_stats".to_string(),
-                    "/proc/sysrq-trigger".to_string(), // M14: null-mask, not read-only
-                    "/proc/kpagecount".to_string(),
-                    "/proc/kpageflags".to_string(),
-                    "/proc/kpagecgroup".to_string(),
-                    "/proc/config.gz".to_string(),
-                    "/proc/kallsyms".to_string(),
-                    "/sys/firmware".to_string(),
-                ],
-                readonly_paths: vec![
-                    "/proc/bus".to_string(),
-                    "/proc/fs".to_string(),
-                    "/proc/irq".to_string(),
-                    "/proc/sys".to_string(),
-                ],
+                masked_paths: crate::filesystem::PROC_NULL_MASKED
+                    .iter()
+                    .chain(crate::filesystem::PROC_TMPFS_MASKED)
+                    .map(|name| format!("/proc/{name}"))
+                    .chain(std::iter::once("/sys/firmware".to_owned()))
+                    .collect(),
+                readonly_paths: crate::filesystem::PROC_READONLY_PATHS
+                    .iter()
+                    .map(|name| format!("/proc/{name}"))
+                    .collect(),
                 devices: vec![
                     OciDevice {
                         device_type: "c".to_string(),
@@ -1052,10 +1037,12 @@ impl OciConfig {
     }
 
     /// Add bind mounts for secrets.
-    pub fn with_secret_mounts(mut self, secrets: &[crate::container::SecretMount]) -> Self {
+    pub fn with_secret_mounts(mut self, secrets: &[crate::container::SecretMount]) -> Result<Self> {
         for secret in secrets {
             self.mounts.push(OciMount {
-                destination: secret.dest.to_string_lossy().to_string(),
+                destination: crate::filesystem::normalize_secret_destination(&secret.dest)?
+                    .to_string_lossy()
+                    .to_string(),
                 source: secret.source.to_string_lossy().to_string(),
                 mount_type: "bind".to_string(),
                 options: vec![
@@ -1067,7 +1054,7 @@ impl OciConfig {
                 ],
             });
         }
-        self
+        Ok(self)
     }
 
     /// Set the process identity for the OCI workload.
@@ -1104,7 +1091,7 @@ impl OciConfig {
         });
 
         for secret in secrets {
-            let dest = normalize_container_destination(&secret.dest)?;
+            let dest = crate::filesystem::normalize_secret_destination(&secret.dest)?;
             if !secret.source.starts_with(stage_dir) {
                 return Err(NucleusError::ConfigError(format!(
                     "Staged secret source {:?} must live under {:?}",
@@ -1206,7 +1193,7 @@ impl OciConfig {
             }
         }
 
-        // Driver support files (NVIDIA /proc, lib dirs, ICD JSON; ROCm /opt).
+        // Read-only vendor support files.
         for support in crate::filesystem::support_paths(set, gpu.bind_driver_libraries) {
             let dest = support.to_string_lossy().to_string();
             self.mounts.push(OciMount {
@@ -1334,22 +1321,27 @@ impl OciConfig {
     }
 
     /// Add rootfs bind mounts from a pre-built rootfs path.
-    pub fn with_rootfs_binds(mut self, rootfs_path: &std::path::Path) -> Result<Self> {
-        let subdirs = ["bin", "sbin", "lib", "lib64", "usr", "etc", "nix"];
-        for subdir in &subdirs {
-            let source = rootfs_path.join(subdir);
-            if source.exists() {
-                let source = fs::canonicalize(&source).map_err(|e| {
-                    NucleusError::FilesystemError(format!(
-                        "Failed to canonicalize rootfs mount source {:?}: {}",
-                        source, e
-                    ))
-                })?;
+    pub fn with_rootfs_binds(self, rootfs_path: &std::path::Path) -> Result<Self> {
+        self.with_rootfs_sources(&crate::filesystem::RootfsSources::load(rootfs_path)?)
+    }
+
+    pub(crate) fn with_rootfs_sources(
+        mut self,
+        sources: &crate::filesystem::RootfsSources,
+    ) -> Result<Self> {
+        for name in ["bin", "sbin", "lib", "lib64", "usr", "etc", "nix"] {
+            if let Some(fd) = sources.open_subdir(name)? {
+                let source = fs::read_link(crate::filesystem::fd_path(&fd))?;
                 self.mounts
-                    .push(Self::readonly_bind_mount(format!("/{}", subdir), source));
+                    .push(Self::readonly_bind_mount(format!("/{name}"), source));
             }
         }
-        self.add_rootfs_store_path_binds(rootfs_path)?;
+        for source in &sources.store_paths {
+            self.mounts.push(Self::readonly_bind_mount(
+                source.to_string_lossy().into_owned(),
+                source.clone(),
+            ));
+        }
         Ok(self)
     }
 
@@ -1365,65 +1357,6 @@ impl OciConfig {
                 "nodev".to_string(),
             ],
         }
-    }
-
-    fn add_rootfs_store_path_binds(&mut self, rootfs_path: &Path) -> Result<()> {
-        let store_paths_file = rootfs_path.join(ROOTFS_STORE_PATHS_FILE);
-        if !store_paths_file.exists() {
-            return Ok(());
-        }
-
-        let content = fs::read_to_string(&store_paths_file).map_err(|e| {
-            NucleusError::FilesystemError(format!(
-                "Failed to read rootfs store paths {:?}: {}",
-                store_paths_file, e
-            ))
-        })?;
-
-        for (line_no, line) in content.lines().enumerate() {
-            let source = line.trim();
-            if source.is_empty() {
-                continue;
-            }
-            let source = Path::new(source);
-            if !is_immediate_nix_store_object_path(source) {
-                return Err(NucleusError::FilesystemError(format!(
-                    "Invalid rootfs store path on line {} in {:?}: {} (expected immediate /nix/store/<32-char-hash>-<name> object)",
-                    line_no + 1,
-                    store_paths_file,
-                    source.display()
-                )));
-            }
-            let store_name = source.file_name().ok_or_else(|| {
-                NucleusError::FilesystemError(format!(
-                    "Invalid rootfs store path on line {} in {:?}: {}",
-                    line_no + 1,
-                    store_paths_file,
-                    source.display()
-                ))
-            })?;
-            let canonical = fs::canonicalize(source).map_err(|e| {
-                NucleusError::FilesystemError(format!(
-                    "Failed to canonicalize rootfs store path {:?}: {}",
-                    source, e
-                ))
-            })?;
-            if !is_immediate_nix_store_object_path(&canonical) {
-                return Err(NucleusError::FilesystemError(format!(
-                    "Rootfs store path must resolve to an immediate /nix/store/<32-char-hash>-<name> object: {} -> {}",
-                    source.display(),
-                    canonical.display()
-                )));
-            }
-            let destination = Path::new("/nix/store")
-                .join(store_name)
-                .to_string_lossy()
-                .to_string();
-            self.mounts
-                .push(Self::readonly_bind_mount(destination, canonical));
-        }
-
-        Ok(())
     }
 
     /// Replace the default namespace list with an explicit configuration.
@@ -1884,6 +1817,7 @@ impl OciBundle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::filesystem::{is_immediate_nix_store_object_path, ROOTFS_STORE_PATHS_FILE};
     use std::os::unix::fs::symlink;
     use tempfile::TempDir;
 
@@ -1966,7 +1900,7 @@ mod tests {
     fn test_rootfs_binds_canonicalize_top_level_sources() {
         let temp_dir = TempDir::new().unwrap();
         let rootfs = temp_dir.path().join("rootfs");
-        let real_bin = temp_dir.path().join("real-bin");
+        let real_bin = rootfs.join("real-bin");
         fs::create_dir_all(&rootfs).unwrap();
         fs::create_dir_all(&real_bin).unwrap();
         symlink(&real_bin, rootfs.join("bin")).unwrap();
@@ -2217,7 +2151,7 @@ mod tests {
 
     #[test]
     fn test_volume_mounts_include_bind_and_tmpfs_options() {
-        let tmp = tempfile::TempDir::new().unwrap();
+        let tmp = crate::filesystem::volume_test_dir();
         let config = OciConfig::new(vec!["/bin/sh".to_string()], None)
             .with_volume_mounts(&[
                 crate::container::VolumeMount {
@@ -2312,7 +2246,7 @@ mod tests {
 
     #[test]
     fn test_provider_config_mounts_are_home_relative_and_noexec() {
-        let tmp = tempfile::TempDir::new().unwrap();
+        let tmp = crate::filesystem::volume_test_dir();
         let provider_dir = tmp.path().join("aws");
         fs::create_dir(&provider_dir).unwrap();
 

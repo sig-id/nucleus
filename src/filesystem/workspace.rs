@@ -6,10 +6,21 @@ use tracing::{debug, warn};
 
 const MAX_WORKSPACE_DEPTH: u32 = 256;
 
-const DENIED_WORKSPACE_SOURCES_EXACT: &[&str] = &["/"];
+const DENIED_WORKSPACE_SOURCES_EXACT: &[&str] = &["/", "/home", "/tmp"];
 
 const DENIED_WORKSPACE_SOURCE_PREFIXES: &[&str] = &[
-    "/boot", "/dev", "/etc", "/proc", "/root", "/run", "/sys", "/var/log", "/var/run",
+    "/boot",
+    "/dev",
+    "/etc",
+    "/proc",
+    "/root",
+    "/run",
+    "/sys",
+    "/var/log",
+    "/var/run",
+    "/var/lib",
+    "/var/spool",
+    "/nix/var",
 ];
 
 fn normalize_workspace_source_for_policy(source: &Path) -> Result<PathBuf> {
@@ -56,7 +67,7 @@ fn reject_denied_workspace_source(source: &Path) -> Result<()> {
 
     for denied in DENIED_WORKSPACE_SOURCE_PREFIXES {
         let denied_path = Path::new(denied);
-        if source == denied_path || source.starts_with(denied_path) {
+        if denied_path.starts_with(source) || source.starts_with(denied_path) {
             return Err(NucleusError::ConfigError(format!(
                 "Workspace source '{}' is under sensitive host path '{}' and cannot be mounted",
                 source.display(),
@@ -74,29 +85,25 @@ fn reject_denied_workspace_source(source: &Path) -> Result<()> {
 /// `/home/alice/src/app`; the broader `--volume` denylist is stricter because
 /// generic bind mounts do not carry the same first-class workspace contract.
 pub fn validate_workspace_host_path(source: &Path) -> Result<PathBuf> {
-    let normalized = normalize_workspace_source_for_policy(source)?;
-    reject_denied_workspace_source(&normalized)?;
+    let fd = pin_workspace_source(source)?;
+    Ok(fs::read_link(super::fd_path(&fd))?)
+}
 
-    let canonical = fs::canonicalize(source).map_err(|e| {
-        NucleusError::ConfigError(format!(
-            "Failed to resolve workspace source {:?}: {}",
-            source, e
-        ))
-    })?;
-    reject_denied_workspace_source(&canonical)?;
-    if !canonical.is_dir() {
-        return Err(NucleusError::ConfigError(format!(
-            "Workspace source must be a directory: {}",
-            canonical.display()
-        )));
-    }
-
-    Ok(canonical)
+pub(crate) fn pin_workspace_source(source: &Path) -> Result<std::os::fd::OwnedFd> {
+    reject_denied_workspace_source(&normalize_workspace_source_for_policy(source)?)?;
+    let fd = nix::fcntl::open(
+        source,
+        nix::fcntl::OFlag::O_PATH | nix::fcntl::OFlag::O_DIRECTORY | nix::fcntl::OFlag::O_CLOEXEC,
+        nix::sys::stat::Mode::empty(),
+    )?;
+    reject_denied_workspace_source(&fs::read_link(super::fd_path(&fd))?)?;
+    Ok(fd)
 }
 
 /// Copy a host workspace into a private staging directory.
 pub fn copy_workspace_in(source: &Path, staging: &Path) -> Result<()> {
-    let source = validate_workspace_host_path(source)?;
+    let pinned = pin_workspace_source(source)?;
+    let source = super::fd_path(&pinned);
     fs::create_dir_all(staging).map_err(|e| {
         NucleusError::FilesystemError(format!(
             "Failed to create workspace staging directory {:?}: {}",
@@ -108,7 +115,8 @@ pub fn copy_workspace_in(source: &Path, staging: &Path) -> Result<()> {
 
 /// Mirror the staged workspace back to the host source after workload exit.
 pub fn sync_workspace_out(staging: &Path, destination: &Path) -> Result<()> {
-    let destination = validate_workspace_host_path(destination)?;
+    let pinned = pin_workspace_source(destination)?;
+    let destination = super::fd_path(&pinned);
     if !staging.is_dir() {
         return Err(NucleusError::FilesystemError(format!(
             "Workspace staging path is not a directory: {}",

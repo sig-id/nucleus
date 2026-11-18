@@ -405,9 +405,9 @@ What happens when `--gpu` is set:
 - **Seccomp** — the restrictive terminal-only `ioctl` rule is replaced with an
   unconditional allow, since vendor driver ioctl request codes cannot be
   enumerated. All other seccomp restrictions remain.
-- **Driver support files** — NVIDIA `/proc/driver/nvidia`, driver userspace
-  library directories, and Vulkan/ICD/EGL manifests are bind-mounted read-only
-  when present (`--no-gpu-driver-libs` skips this).
+- **Driver support files** — The runtime binds individual NVIDIA driver
+  libraries and vendor manifests read-only. Intel discovery selects DRM render
+  nodes. Explicit rootfs images supply their own driver stack.
 - **Environment** — `NVIDIA_VISIBLE_DEVICES`, `NVIDIA_DRIVER_CAPABILITIES`, and
   the EGL vendor manifest pointer are injected at exec time.
 - **gVisor** — runsc receives OCI `linux.devices` entries (major/minor/type) so
@@ -545,9 +545,9 @@ nucleus run \
   --egress-tcp-port 443 --egress-tcp-port 8443 \
   --health-cmd "curl -sf http://localhost:8080/health" \
   --health-interval 30 --health-retries 3 \
-  --secret /run/secrets/tls-cert:/etc/tls/cert.pem \
+  --secret /run/secrets/tls-cert:/run/secrets/tls-cert \
   --systemd-credential db-url:/run/secrets/db-url \
-  --volume /var/lib/myservice:/var/lib/myservice:rw \
+  --volume /srv/myservice:/var/lib/myservice:rw \
   -e CONFIG_PATH=/etc/myservice/config.toml \
   --sd-notify \
   -p 127.0.0.1:8080:8080 \
@@ -695,7 +695,7 @@ subnet = "10.42.0.0/24"
 
 [volumes.db-data]
 volume_type = "persistent"
-path = "/var/lib/nucleus/myapp/db"
+path = "/srv/nucleus/myapp/db"
 owner = "70:70"
 
 [volumes.cache]
@@ -973,7 +973,7 @@ nucleus.lib.mkRootfs {
 
 This produces a Nix store path containing `/bin`, `/lib`, `/etc`, etc. from the specified packages. It is mounted read-only inside the container, replacing the host bind mounts used in agent mode.
 
-`mkRootfs` also emits a `.nucleus-rootfs-sha256` manifest at the root of the closure. Use `--verify-rootfs-attestation` or `verifyRootfsAttestation = true;` to require that manifest to match the mounted rootfs at startup.
+`mkRootfs` also emits a `.nucleus-rootfs-sha256` manifest at the root of the closure. Use `--verify-rootfs-attestation` or `verifyRootfsAttestation = true;` to verify the registered NAR hashes of the selected rootfs and its declared store objects against the host Nix database before launch. Verification also checks canonical store modes, root ownership and the embedded content manifest. It requires the host Nix daemon and a registered store rootfs.
 
 For ephemeral provider agents, use `nucleus.lib.mkAgentToolchainRootfs`
 instead. It layers a broad agent development toolchain on top of `mkRootfs`,
@@ -1030,7 +1030,7 @@ the CLI `nucleus image commit` workflow.
 
 ## Security Notes
 
-**Do not pass secrets via `-e` / `--env`.** Environment variables are visible in `/proc/<pid>/environ` to any process that can read it (mitigated by `hidepid=2` in production mode, but not in agent mode). Use `--secret` instead when a file works. If a provider CLI requires sensitive environment variables, use `--env-fd FD`; the fd carries a JSON object such as `{"OPENAI_API_KEY":"..."}` or a JSON array of `KEY=VALUE` strings so the values are not exposed through Nucleus argv.
+**Do not pass secrets via `-e` / `--env`.** Environment variables are visible in `/proc/<pid>/environ` to any process that can read it. Use `--secret` instead when a file works. If a provider CLI requires sensitive environment variables, use `--env-fd FD`; the fd carries a JSON object such as `{"OPENAI_API_KEY":"..."}` or a JSON array of `KEY=VALUE` strings so the values are not exposed through Nucleus argv.
 
 **Prefer credential brokers for bearer-token APIs.** If untrusted code can drive a provider CLI, do not place the bearer token in the sandbox environment. Run a host-side broker that holds the credential, injects it into approved upstream requests, rate-limits and audits usage, and start Nucleus with `--credential-broker IP:PORT` so the sandbox can only reach that broker endpoint. Proxy environment variables are client hints, not the security boundary: Nucleus enforces the boundary with namespace-local egress rules, and non-HTTP clients that ignore proxy variables are denied unless they speak to the broker endpoint.
 
@@ -1057,7 +1057,7 @@ the CLI `nucleus image commit` workflow.
 | PID 1 init | Direct exec | Direct exec | Mini-init with zombie reaping + signal forwarding |
 | Workload uid/gid | Container root maps to host UID/GID 100000 by default when launched as root | User namespace remapping required when running as host root | Configurable post-setup drop via `--user` / `--group` |
 | Secrets | In-memory tmpfs | In-memory tmpfs | In-memory tmpfs with volatile zeroing |
-| /proc | Mounted normally | Mounted normally | `hidepid=2` (hides other processes) |
+| Native /proc | `hidepid=2,subset=pid` | `hidepid=2,subset=pid` | `hidepid=2,subset=pid` |
 | Mount audit | Skipped | Skipped | Post-setup flag verification (fatal) |
 | Seccomp trace mode | Allowed | Forbidden | Forbidden |
 | Landlock ABI | Best-effort | Full enforcement required on native | V3 minimum required |
@@ -1210,7 +1210,7 @@ Events include a container start record and a final summary record. The records 
 - `--landlock-policy <path>` loads a TOML Landlock filesystem policy (replaces default rules).
 - `--landlock-policy-sha256 <hex>` verifies the Landlock policy hash.
 - `--verify-context-integrity` hashes the source context tree before launch and verifies the populated `/context` tree matches.
-- `--verify-rootfs-attestation` requires a `.nucleus-rootfs-sha256` manifest and verifies the mounted rootfs against it.
+- `--verify-rootfs-attestation` checks the rootfs and declared store objects against host Nix records and verifies the embedded content manifest.
 - `--seccomp-log-denied` requests kernel logging for denied seccomp decisions when the host supports `SECCOMP_FILTER_FLAG_LOG`.
 - `--require-kernel-lockdown integrity|confidentiality` refuses startup unless `/sys/kernel/security/lockdown` satisfies the requested mode.
 - `--gvisor-platform systrap|kvm|ptrace` selects the runsc backend explicitly.

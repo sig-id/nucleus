@@ -38,7 +38,7 @@ A container process needs all of the following to use a GPU:
 | Device node | `/dev/nvidia0`, `/dev/dri/renderD128`, `/dev/kfd`, … recreated in the container `/dev` with the host device numbers and workload ownership. |
 | Device cgroup allow | cgroup v2 has no `devices` controller file; access is gated by a `BPF_PROG_TYPE_CGROUP_DEVICE` eBPF program attached to the cgroup. |
 | `ioctl` syscall | GPU drivers issue dozens of vendor-specific `ioctl` request codes (DRM, NVOS/NV_ESC_RM, KFD). Nucleus's default seccomp allowlist permits only terminal ioctls — **must be relaxed**. |
-| Driver userspace | The CUDA/ROCm/Mesa userspace libraries, Vulkan/ICD JSON, and `/proc/driver/nvidia`. Either shipped in the rootfs or bind-mounted from the host. |
+| Driver userspace | CUDA, ROCm or Mesa libraries and vendor manifests. An explicit rootfs supplies its own userspace drivers. |
 | Env vars | `NVIDIA_VISIBLE_DEVICES`, `NVIDIA_DRIVER_CAPABILITIES`, etc. |
 
 ## Vendor model
@@ -53,9 +53,9 @@ nodes plus the driver support paths to bind.
 
 | Vendor | Device nodes | Support files |
 |---|---|---|
-| NVIDIA | `/dev/nvidia[0-9]+`, `/dev/nvidiactl`, `/dev/nvidia-uvm`, `/dev/nvidia-uvm-tools`, `/dev/nvidia-caps/*` | `/proc/driver/nvidia`, host driver lib dirs, ICD/EGL JSON |
+| NVIDIA | `/dev/nvidia[0-9]+`, `/dev/nvidiactl`, `/dev/nvidia-uvm`, `/dev/nvidia-uvm-tools`, `/dev/nvidia-caps/*` | Individual NVIDIA libraries and vendor ICD/EGL JSON |
 | AMD (ROCm) | `/dev/kfd`, `/dev/dri/renderD[0-9]+` | ROCm `/opt/amdgpu` dirs if present |
-| Intel / Mesa | `/dev/dri/renderD[0-9]+`, `/dev/dri/card[0-9]+` | Mesa ICD JSON |
+| Intel / Mesa | `/dev/dri/renderD[0-9]+` | Drivers supplied by the runtime filesystem |
 | All | union of the above | union |
 
 `renderD*` nodes are shared between AMD and Intel; `All`/`Auto` bind them and
@@ -130,7 +130,7 @@ its NVIDIA nvfs socket, but the OCI device entries are the portable path).
 1. For each resolved device, emit an `OciDevice` entry (`type`, `major`,
    `minor`, `path`, `fileMode`, `uid`, `gid`). runsc creates the device node
    and installs the matching cgroup device rule inside its sandbox.
-2. Bind-mount driver support files (NVIDIA `/proc/driver/nvidia`, lib dirs,
+2. Bind-mount driver support files (individual NVIDIA libraries,
    ICD JSON) as OCI `bind` mounts.
 3. Inject NVIDIA env vars into the process env.
 

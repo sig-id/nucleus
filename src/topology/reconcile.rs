@@ -924,7 +924,7 @@ credential_broker_no_proxy_env = true
 
     #[test]
     fn test_build_service_run_args_include_bind_and_tmpfs_volumes() {
-        let persistent_dir = tempfile::TempDir::new().unwrap();
+        let persistent_dir = crate::filesystem::volume_test_dir();
         let persistent_path = persistent_dir.path().join("db-data");
         let toml = format!(
             r#"
@@ -1016,7 +1016,7 @@ secrets = ["{}"]
 
     #[test]
     fn test_prepare_persistent_volume_rejects_symlink_parent() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = crate::filesystem::volume_test_dir();
         let victim = temp.path().join("victim");
         let link = temp.path().join("link");
         std::fs::create_dir(&victim).unwrap();
@@ -1042,7 +1042,7 @@ secrets = ["{}"]
 
     #[test]
     fn test_prepare_persistent_volume_rejects_final_symlink() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = crate::filesystem::volume_test_dir();
         let victim = temp.path().join("victim");
         let link = temp.path().join("volume");
         std::fs::create_dir(&victim).unwrap();

@@ -238,11 +238,8 @@ fn is_nvidia_device_name(name: &str) -> bool {
 }
 
 fn is_dri_gpu_device_name(name: &str) -> bool {
-    ["renderD", "card"].iter().any(|prefix| {
-        name.strip_prefix(prefix)
-            .map(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()))
-            .unwrap_or(false)
-    })
+    name.strip_prefix("renderD")
+        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|c| c.is_ascii_digit()))
 }
 
 fn is_nvidia_cap_device_name(name: &str) -> bool {
@@ -371,18 +368,6 @@ fn collect_intel(
 ) {
     let had_before = set.nodes.len();
     collect_render_nodes(dev_root, set, is_dev);
-    // /dev/dri/card[0-9]+ are the kernel KMS nodes; bind them so Mesa/DRI works.
-    if let Ok(entries) = fs::read_dir(dev_root.join("dri")) {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if let Some(rest) = name.strip_prefix("card") {
-                if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()) {
-                    push_under_dir(&dev_root.join("dri"), &name, set, is_dev);
-                }
-            }
-        }
-    }
     if set.nodes.len() > had_before {
         set.intel = vendor.includes_intel();
     }
@@ -457,36 +442,31 @@ fn classify_into(path: &Path, _vendor: GpuVendor, set: &mut GpuDeviceSet) {
 pub fn support_paths(set: &GpuDeviceSet, bind_driver_libs: bool) -> Vec<PathBuf> {
     let mut paths = Vec::new();
 
-    if set.nvidia {
-        let proc_driver = Path::new("/proc/driver/nvidia");
-        if proc_driver.is_dir() {
-            paths.push(proc_driver.to_path_buf());
-        }
-        if bind_driver_libs {
-            // NVIDIA driver userspace libraries and the CUDA toolkit, in the
-            // standard Debian/Ubuntu and runfile locations. Bound read-only.
-            for lib_dir in [
-                "/usr/lib/x86_64-linux-gnu",
-                "/usr/lib64",
-                "/opt/nvidia",
-                "/usr/local/cuda",
-            ] {
-                let dir = Path::new(lib_dir);
-                if dir.is_dir() && dir_contains_nvidia_libs(dir) {
-                    paths.push(dir.to_path_buf());
+    if set.nvidia && bind_driver_libs {
+        for dir in [
+            "/usr/lib/x86_64-linux-gnu",
+            "/usr/lib/aarch64-linux-gnu",
+            "/usr/lib64",
+            "/opt/nvidia/lib64",
+            "/usr/local/cuda/lib64",
+        ] {
+            if let Ok(entries) = fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if is_nvidia_library(&entry.file_name().to_string_lossy()) && path.is_file() {
+                        paths.push(path);
+                    }
                 }
             }
-            // Vulkan/ICD manifest JSON so the container's loader finds the host driver.
-            for icd in [
-                "/etc/vulkan/icd.d",
-                "/usr/share/vulkan/icd.d",
-                "/etc/glvnd/egl_vendor.d",
-                "/usr/share/glvnd/egl_vendor.d",
-            ] {
-                let dir = Path::new(icd);
-                if dir.is_dir() && dir_contains_json(dir) {
-                    paths.push(dir.to_path_buf());
-                }
+        }
+        for manifest in [
+            "/etc/vulkan/icd.d/nvidia_icd.json",
+            "/usr/share/vulkan/icd.d/nvidia_icd.json",
+            "/etc/glvnd/egl_vendor.d/10_nvidia.json",
+            "/usr/share/glvnd/egl_vendor.d/10_nvidia.json",
+        ] {
+            if Path::new(manifest).is_file() {
+                paths.push(PathBuf::from(manifest));
             }
         }
     }
@@ -505,27 +485,22 @@ pub fn support_paths(set: &GpuDeviceSet, bind_driver_libs: bool) -> Vec<PathBuf>
     paths
 }
 
-fn dir_contains_nvidia_libs(dir: &Path) -> bool {
-    let Ok(entries) = fs::read_dir(dir) else {
+fn is_nvidia_library(name: &str) -> bool {
+    let Some((library, version)) = name.split_once(".so") else {
         return false;
     };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name.starts_with("libnvidia") || name.starts_with("libcuda") {
-            return true;
-        }
-    }
-    false
-}
-
-fn dir_contains_json(dir: &Path) -> bool {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return false;
-    };
-    entries
-        .flatten()
-        .any(|e| e.file_name().to_string_lossy().ends_with(".json"))
+    let version_ok = version.is_empty()
+        || version.strip_prefix('.').is_some_and(|v| {
+            v.split('.')
+                .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+        });
+    version_ok
+        && (library == "libcuda"
+            || library.starts_with("libnvidia-")
+            || matches!(
+                library,
+                "libEGL_nvidia" | "libGLX_nvidia" | "libGLESv2_nvidia" | "libGLESv1_CM_nvidia"
+            ))
 }
 
 /// Result of exposing GPU devices in a container root.
@@ -612,7 +587,7 @@ pub(crate) fn mount_gpu_support(
     config: &GpuPassthroughConfig,
 ) -> Result<Vec<PathBuf>> {
     let mut bound_support = Vec::new();
-    // Driver support files (NVIDIA /proc, lib dirs, ICD JSON; ROCm /opt/rocm).
+    // Vendor support files. Apply restrictions before attaching each mount.
     for support in support_paths(set, config.bind_driver_libraries) {
         let rel = support.strip_prefix("/").unwrap_or(support.as_path());
         let target = super::mount_target(root, rel, support.is_dir())?;
