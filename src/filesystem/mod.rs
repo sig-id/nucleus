@@ -4,7 +4,9 @@ mod gpu;
 mod lazy;
 mod mount;
 mod state;
+mod target;
 mod tmpfs;
+pub(crate) use target::*;
 mod workspace;
 
 pub use attestation::*;

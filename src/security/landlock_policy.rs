@@ -58,6 +58,28 @@ pub struct LandlockRule {
     pub access: Vec<String>,
 }
 
+/// Snapshot of the filesystem grant configuration for launch and native helpers.
+#[derive(Debug, Clone)]
+pub enum NativeLandlock {
+    Default(super::LandlockManager),
+    Custom(LandlockPolicy),
+}
+
+impl NativeLandlock {
+    pub(crate) fn apply(
+        &self,
+        best_effort: bool,
+        handoff: &std::os::unix::net::UnixStream,
+    ) -> Result<bool> {
+        match self {
+            Self::Custom(policy) => policy.apply_with_handoff(best_effort, Some(handoff)),
+            Self::Default(settings) => settings
+                .clone()
+                .apply_with_handoff(best_effort, Some(handoff)),
+        }
+    }
+}
+
 impl LandlockPolicy {
     /// Validate the policy for production safety.
     ///
@@ -86,6 +108,14 @@ impl LandlockPolicy {
     /// Returns true if the policy was enforced (fully or partially),
     /// false if not enforced (kernel too old).
     pub fn apply(&self, best_effort: bool) -> Result<bool> {
+        self.apply_with_handoff(best_effort, None)
+    }
+
+    fn apply_with_handoff(
+        &self,
+        best_effort: bool,
+        handoff: Option<&std::os::unix::net::UnixStream>,
+    ) -> Result<bool> {
         let access_all = AccessFs::from_all(TARGET_ABI);
 
         // Check minimum ABI
@@ -139,7 +169,7 @@ impl LandlockPolicy {
             }
         }
 
-        let status = ruleset.restrict_self().map_err(ll_err)?;
+        let status = super::landlock_handoff::restrict_and_publish(ruleset, handoff)?;
         match status.ruleset {
             RulesetStatus::FullyEnforced => {
                 info!(

@@ -1,4 +1,5 @@
 use super::attestation::{is_immediate_nix_store_object_path, ROOTFS_STORE_PATHS_FILE};
+use super::{bind_tree, fd_path, mount_target, READ_ONLY};
 use crate::error::{NucleusError, Result};
 use nix::fcntl::{open, OFlag};
 use nix::mount::{mount, MsFlags};
@@ -6,7 +7,7 @@ use nix::sys::stat::{fstat, makedev, mknod, Mode, SFlag};
 use nix::unistd::chroot;
 use std::fs::OpenOptions;
 use std::io::Read;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
 use tracing::{debug, info, warn};
@@ -398,10 +399,12 @@ pub fn create_minimal_fs(root: &Path) -> Result<()> {
     ];
 
     for dir in dirs {
-        let path = root.join(dir);
-        std::fs::create_dir_all(&path).map_err(|e| {
-            NucleusError::FilesystemError(format!("Failed to create directory {:?}: {}", path, e))
-        })?;
+        // FHS executables/libraries may be symlinks in a Nix-built image.
+        // They are data until a mount is requested, which pins its own target.
+        if matches!(dir, "bin" | "sbin" | "lib" | "lib64") && root.join(dir).is_symlink() {
+            continue;
+        }
+        mount_target(root, Path::new(dir), true)?;
     }
 
     info!("Created minimal filesystem structure");
@@ -565,47 +568,8 @@ pub fn bind_mount_rootfs(root: &Path, rootfs_path: &Path) -> Result<()> {
             ))
         })?;
 
-        let target = root.join(subdir);
-        std::fs::create_dir_all(&target).map_err(|e| {
-            NucleusError::FilesystemError(format!(
-                "Failed to create mount point {:?}: {}",
-                target, e
-            ))
-        })?;
-
-        mount(
-            Some(&source),
-            &target,
-            None::<&str>,
-            MsFlags::MS_BIND | MsFlags::MS_REC,
-            None::<&str>,
-        )
-        .map_err(|e| {
-            NucleusError::FilesystemError(format!(
-                "Failed to bind mount rootfs {:?} -> {:?}: {}",
-                source, target, e
-            ))
-        })?;
-
-        // Remount read-only
-        mount(
-            None::<&str>,
-            &target,
-            None::<&str>,
-            MsFlags::MS_REMOUNT
-                | MsFlags::MS_BIND
-                | MsFlags::MS_RDONLY
-                | MsFlags::MS_REC
-                | MsFlags::MS_NOSUID
-                | MsFlags::MS_NODEV,
-            None::<&str>,
-        )
-        .map_err(|e| {
-            NucleusError::FilesystemError(format!(
-                "Failed to remount rootfs {:?} read-only: {}",
-                target, e
-            ))
-        })?;
+        let target = mount_target(root, Path::new(subdir), true)?;
+        bind_tree(&source, &target, true, READ_ONLY)?;
 
         info!("Mounted rootfs/{} read-only", subdir);
     }
@@ -626,14 +590,33 @@ pub fn overlay_mount_rootfs(
     upperdir: &Path,
     workdir: &Path,
 ) -> Result<()> {
-    info!(
-        "Overlay mounting rootfs {:?} into container {:?} (upper={:?}, work={:?})",
-        rootfs_path, root, upperdir, workdir
-    );
+    let (upper, work) = open_overlay_dirs(upperdir, workdir)?;
+    overlay_mount_rootfs_pinned(root, rootfs_path, &upper, &work)
+}
 
+pub(crate) fn open_overlay_dirs(upper: &Path, work: &Path) -> Result<(OwnedFd, OwnedFd)> {
+    let open_dir = |path: &Path| {
+        nix::fcntl::open(
+            path,
+            nix::fcntl::OFlag::O_PATH
+                | nix::fcntl::OFlag::O_DIRECTORY
+                | nix::fcntl::OFlag::O_CLOEXEC
+                | nix::fcntl::OFlag::O_NOFOLLOW,
+            nix::sys::stat::Mode::empty(),
+        )
+    };
+    Ok((open_dir(upper)?, open_dir(work)?))
+}
+
+pub(crate) fn overlay_mount_rootfs_pinned(
+    root: &Path,
+    rootfs_path: &Path,
+    upper: &OwnedFd,
+    work: &OwnedFd,
+) -> Result<()> {
     let lowerdir = validate_overlay_mount_dir(rootfs_path, "rootfs lowerdir")?;
-    let upperdir = validate_overlay_mount_dir(upperdir, "rootfs overlay upperdir")?;
-    let workdir = validate_overlay_mount_dir(workdir, "rootfs overlay workdir")?;
+    let upperdir = fd_path(upper);
+    let workdir = fd_path(work);
     validate_overlay_mount_dir(root, "container root")?;
 
     let options = format!(
@@ -747,46 +730,8 @@ fn bind_mount_rootfs_store_paths(root: &Path, rootfs_path: &Path) -> Result<()> 
             )));
         }
 
-        let target = root.join("nix/store").join(store_name);
-        std::fs::create_dir_all(&target).map_err(|e| {
-            NucleusError::FilesystemError(format!(
-                "Failed to create rootfs store mount point {:?}: {}",
-                target, e
-            ))
-        })?;
-
-        mount(
-            Some(&source),
-            &target,
-            None::<&str>,
-            MsFlags::MS_BIND | MsFlags::MS_REC,
-            None::<&str>,
-        )
-        .map_err(|e| {
-            NucleusError::FilesystemError(format!(
-                "Failed to bind mount rootfs store path {:?} -> {:?}: {}",
-                source, target, e
-            ))
-        })?;
-
-        mount(
-            None::<&str>,
-            &target,
-            None::<&str>,
-            MsFlags::MS_REMOUNT
-                | MsFlags::MS_BIND
-                | MsFlags::MS_RDONLY
-                | MsFlags::MS_REC
-                | MsFlags::MS_NOSUID
-                | MsFlags::MS_NODEV,
-            None::<&str>,
-        )
-        .map_err(|e| {
-            NucleusError::FilesystemError(format!(
-                "Failed to remount rootfs store path {:?} read-only: {}",
-                target, e
-            ))
-        })?;
+        let target = mount_target(root, &Path::new("nix/store").join(store_name), true)?;
+        bind_tree(&source, &target, true, READ_ONLY)?;
     }
 
     Ok(())
@@ -811,68 +756,13 @@ pub fn bind_mount_host_paths(root: &Path, best_effort: bool) -> Result<()> {
             continue;
         }
 
-        let container_path = root.join(host_path.trim_start_matches('/'));
-
-        // Create mount point
-        if let Err(e) = std::fs::create_dir_all(&container_path) {
-            if best_effort {
-                warn!("Failed to create mount point {:?}: {}", container_path, e);
-                continue;
+        let target = mount_target(root, Path::new(host_path.trim_start_matches('/')), true)?;
+        // A failed detached bind cannot leave a writable mount behind.
+        if let Err(error) = bind_tree(host, &target, true, READ_ONLY) {
+            if !best_effort {
+                return Err(error);
             }
-            return Err(NucleusError::FilesystemError(format!(
-                "Failed to create mount point {:?}: {}",
-                container_path, e
-            )));
-        }
-
-        // Attempt bind mount
-        // Note: Linux ignores MS_RDONLY on the initial bind mount call.
-        // A second remount is required to actually enforce read-only.
-        match mount(
-            Some(host),
-            &container_path,
-            None::<&str>,
-            MsFlags::MS_BIND | MsFlags::MS_REC,
-            None::<&str>,
-        ) {
-            Ok(_) => {
-                // Remount as read-only – required because MS_RDONLY is ignored on initial bind
-                mount(
-                    None::<&str>,
-                    &container_path,
-                    None::<&str>,
-                    MsFlags::MS_REMOUNT
-                        | MsFlags::MS_BIND
-                        | MsFlags::MS_RDONLY
-                        | MsFlags::MS_REC
-                        | MsFlags::MS_NOSUID
-                        | MsFlags::MS_NODEV,
-                    None::<&str>,
-                )
-                .map_err(|e| {
-                    NucleusError::FilesystemError(format!(
-                        "Failed to remount {} as read-only: {}",
-                        host_path, e
-                    ))
-                })?;
-                info!(
-                    "Bind mounted {} to {:?} (read-only)",
-                    host_path, container_path
-                );
-            }
-            Err(e) => {
-                if best_effort {
-                    warn!(
-                        "Failed to bind mount {}: {} (continuing anyway)",
-                        host_path, e
-                    );
-                } else {
-                    return Err(NucleusError::FilesystemError(format!(
-                        "Failed to bind mount {}: {}",
-                        host_path, e
-                    )));
-                }
-            }
+            warn!("Skipping unavailable host bind {host_path}: {error}");
         }
     }
 
@@ -1164,73 +1054,21 @@ pub fn mount_volumes(root: &Path, volumes: &[crate::container::VolumeMount]) -> 
                     )));
                 }
 
-                if let Some(parent) = dest.parent() {
-                    std::fs::create_dir_all(parent).map_err(|e| {
-                        NucleusError::FilesystemError(format!(
-                            "Failed to create volume mount parent {:?}: {}",
-                            parent, e
-                        ))
-                    })?;
-                }
-
                 let recursive = source.is_dir();
-                if source.is_file() {
-                    std::fs::write(&dest, "").map_err(|e| {
-                        NucleusError::FilesystemError(format!(
-                            "Failed to create volume mount point {:?}: {}",
-                            dest, e
-                        ))
-                    })?;
-                } else {
-                    std::fs::create_dir_all(&dest).map_err(|e| {
-                        NucleusError::FilesystemError(format!(
-                            "Failed to create volume mount dir {:?}: {}",
-                            dest, e
-                        ))
-                    })?;
-                }
-
-                let initial_flags = if recursive {
-                    MsFlags::MS_BIND | MsFlags::MS_REC
-                } else {
-                    MsFlags::MS_BIND
-                };
-                mount(
-                    Some(source.as_path()),
-                    &dest,
-                    None::<&str>,
-                    initial_flags,
-                    None::<&str>,
-                )
-                .map_err(|e| {
-                    NucleusError::FilesystemError(format!(
-                        "Failed to bind mount volume {:?} -> {:?}: {}",
-                        source, dest, e
-                    ))
-                })?;
-
-                let mut remount_flags =
-                    MsFlags::MS_REMOUNT | MsFlags::MS_BIND | MsFlags::MS_NOSUID | MsFlags::MS_NODEV;
-                if recursive {
-                    remount_flags |= MsFlags::MS_REC;
-                }
-                if volume.read_only {
-                    remount_flags |= MsFlags::MS_RDONLY;
-                }
-
-                mount(
-                    None::<&str>,
-                    &dest,
-                    None::<&str>,
-                    remount_flags,
-                    None::<&str>,
-                )
-                .map_err(|e| {
-                    NucleusError::FilesystemError(format!(
-                        "Failed to remount volume {:?} with final flags: {}",
-                        dest, e
-                    ))
-                })?;
+                let target = mount_target(
+                    root,
+                    dest.strip_prefix(root)
+                        .expect("destination resolved under root"),
+                    recursive,
+                )?;
+                let attrs = libc::MOUNT_ATTR_NODEV
+                    | libc::MOUNT_ATTR_NOSUID
+                    | if volume.read_only {
+                        libc::MOUNT_ATTR_RDONLY
+                    } else {
+                        0
+                    };
+                bind_tree(source, &target, recursive, attrs)?;
 
                 info!(
                     "Mounted bind volume {:?} -> {:?} ({})",
@@ -1240,12 +1078,13 @@ pub fn mount_volumes(root: &Path, volumes: &[crate::container::VolumeMount]) -> 
                 );
             }
             VolumeSource::Tmpfs { size } => {
-                std::fs::create_dir_all(&dest).map_err(|e| {
-                    NucleusError::FilesystemError(format!(
-                        "Failed to create tmpfs mount dir {:?}: {}",
-                        dest, e
-                    ))
-                })?;
+                let target = mount_target(
+                    root,
+                    dest.strip_prefix(root)
+                        .expect("destination resolved under root"),
+                    true,
+                )?;
+                let dest = fd_path(&target);
 
                 // M8: Validate size parameter to prevent option injection.
                 // Only allow digits, optionally followed by K/M/G suffix.
@@ -1308,13 +1147,13 @@ pub fn mount_home_tmpfs(
     identity: &crate::container::ProcessIdentity,
 ) -> Result<()> {
     let dest = resolve_container_destination(root, home)?;
-    std::fs::create_dir_all(&dest).map_err(|e| {
-        NucleusError::FilesystemError(format!(
-            "Failed to create sandbox home mount dir {:?}: {}",
-            dest, e
-        ))
-    })?;
-
+    let target = mount_target(
+        root,
+        dest.strip_prefix(root)
+            .expect("destination resolved under root"),
+        true,
+    )?;
+    let dest = fd_path(&target);
     let mount_data = format!(
         "size=256M,mode=0700,uid={},gid={}",
         identity.uid, identity.gid
@@ -1369,77 +1208,21 @@ pub fn mount_provider_configs(
         let container_dest = normalize_provider_config_destination(home, &provider_config.dest)?;
         let dest = resolve_container_destination(root, &container_dest)?;
 
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                NucleusError::FilesystemError(format!(
-                    "Failed to create provider config parent {:?}: {}",
-                    parent, e
-                ))
-            })?;
-        }
-
-        if metadata.is_file() {
-            std::fs::write(&dest, "").map_err(|e| {
-                NucleusError::FilesystemError(format!(
-                    "Failed to create provider config mount point {:?}: {}",
-                    dest, e
-                ))
-            })?;
-        } else {
-            std::fs::create_dir_all(&dest).map_err(|e| {
-                NucleusError::FilesystemError(format!(
-                    "Failed to create provider config mount dir {:?}: {}",
-                    dest, e
-                ))
-            })?;
-        }
-
-        let recursive = metadata.is_dir();
-        let initial_flags = if recursive {
-            MsFlags::MS_BIND | MsFlags::MS_REC
-        } else {
-            MsFlags::MS_BIND
-        };
-        mount(
-            Some(canonical_source.as_path()),
-            &dest,
-            None::<&str>,
-            initial_flags,
-            None::<&str>,
-        )
-        .map_err(|e| {
-            NucleusError::FilesystemError(format!(
-                "Failed to bind mount provider config {:?} -> {:?}: {}",
-                canonical_source, dest, e
-            ))
-        })?;
-
-        let mut remount_flags = MsFlags::MS_REMOUNT
-            | MsFlags::MS_BIND
-            | MsFlags::MS_NOSUID
-            | MsFlags::MS_NODEV
-            | MsFlags::MS_NOEXEC;
-        if recursive {
-            remount_flags |= MsFlags::MS_REC;
-        }
-        if provider_config.read_only {
-            remount_flags |= MsFlags::MS_RDONLY;
-        }
-
-        mount(
-            None::<&str>,
-            &dest,
-            None::<&str>,
-            remount_flags,
-            None::<&str>,
-        )
-        .map_err(|e| {
-            NucleusError::FilesystemError(format!(
-                "Failed to remount provider config {:?} with final flags: {}",
-                dest, e
-            ))
-        })?;
-
+        let target = mount_target(
+            root,
+            dest.strip_prefix(root)
+                .expect("destination resolved under root"),
+            metadata.is_dir(),
+        )?;
+        let attrs = libc::MOUNT_ATTR_NODEV
+            | libc::MOUNT_ATTR_NOSUID
+            | libc::MOUNT_ATTR_NOEXEC
+            | if provider_config.read_only {
+                libc::MOUNT_ATTR_RDONLY
+            } else {
+                0
+            };
+        bind_tree(&canonical_source, &target, metadata.is_dir(), attrs)?;
         info!(
             "Mounted provider config {:?} -> {:?} ({})",
             canonical_source,
@@ -1478,52 +1261,25 @@ pub fn mount_workspace(root: &Path, workspace: &crate::container::WorkspaceConfi
         crate::filesystem::validate_workspace_host_path(source)?;
     }
     let dest = resolve_container_destination(root, &workspace.container_path)?;
-    std::fs::create_dir_all(&dest).map_err(|e| {
-        NucleusError::FilesystemError(format!(
-            "Failed to create workspace mount point {:?}: {}",
-            dest, e
-        ))
-    })?;
-
-    mount(
-        Some(source.as_path()),
-        &dest,
-        None::<&str>,
-        MsFlags::MS_BIND | MsFlags::MS_REC,
-        None::<&str>,
-    )
-    .map_err(|e| {
-        NucleusError::FilesystemError(format!(
-            "Failed to bind mount workspace {:?} -> {:?}: {}",
-            source, dest, e
-        ))
-    })?;
-
-    let mut remount_flags = MsFlags::MS_REMOUNT
-        | MsFlags::MS_BIND
-        | MsFlags::MS_REC
-        | MsFlags::MS_NOSUID
-        | MsFlags::MS_NODEV;
-    if workspace.is_read_only() {
-        remount_flags |= MsFlags::MS_RDONLY;
-    }
-    if !workspace.allow_execute {
-        remount_flags |= MsFlags::MS_NOEXEC;
-    }
-
-    mount(
-        None::<&str>,
-        &dest,
-        None::<&str>,
-        remount_flags,
-        None::<&str>,
-    )
-    .map_err(|e| {
-        NucleusError::FilesystemError(format!(
-            "Failed to remount workspace {:?} with final flags: {}",
-            dest, e
-        ))
-    })?;
+    let target = mount_target(
+        root,
+        dest.strip_prefix(root)
+            .expect("destination resolved under root"),
+        true,
+    )?;
+    let attrs = libc::MOUNT_ATTR_NODEV
+        | libc::MOUNT_ATTR_NOSUID
+        | if workspace.is_read_only() {
+            libc::MOUNT_ATTR_RDONLY
+        } else {
+            0
+        }
+        | if workspace.allow_execute {
+            0
+        } else {
+            libc::MOUNT_ATTR_NOEXEC
+        };
+    bind_tree(source, &target, true, attrs)?;
 
     info!(
         "Mounted workspace {:?} -> {:?} (mode={:?}, exec={})",
@@ -1637,37 +1393,12 @@ pub const PROC_READONLY_PATHS: &[&str] = &["bus", "fs", "irq", "sys"];
 pub const PROC_TMPFS_MASKED: &[&str] = &["acpi", "scsi"];
 
 fn remount_proc_path_readonly(target: &Path) -> Result<()> {
-    mount(
-        Some(target),
+    let fd = open(
         target,
-        None::<&str>,
-        MsFlags::MS_BIND | MsFlags::MS_REC,
-        None::<&str>,
-    )
-    .map_err(|e| {
-        NucleusError::FilesystemError(format!(
-            "Failed to bind-mount {:?} onto itself for read-only remount: {}",
-            target, e
-        ))
-    })?;
-
-    mount(
-        None::<&str>,
-        target,
-        None::<&str>,
-        MsFlags::MS_REMOUNT
-            | MsFlags::MS_BIND
-            | MsFlags::MS_RDONLY
-            | MsFlags::MS_NOSUID
-            | MsFlags::MS_NODEV
-            | MsFlags::MS_NOEXEC,
-        None::<&str>,
-    )
-    .map_err(|e| {
-        NucleusError::FilesystemError(format!("Failed to remount {:?} read-only: {}", target, e))
-    })?;
-
-    Ok(())
+        OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )?;
+    bind_tree(target, &fd, true, READ_ONLY | libc::MOUNT_ATTR_NOEXEC)
 }
 
 /// Mask sensitive /proc paths by bind-mounting /dev/null or tmpfs over them
@@ -1824,26 +1555,12 @@ fn pivot_root_impl(new_root: &Path) -> Result<()> {
     // pivot_root requires new_root to be a mount point
     // and old_root to be under new_root
 
-    let old_root = new_root.join(".old_root");
-    std::fs::create_dir_all(&old_root).map_err(|e| {
-        NucleusError::PivotRootError(format!("Failed to create old_root directory: {}", e))
-    })?;
-
-    // Perform pivot_root
-    pivot_root(new_root, &old_root)
-        .map_err(|e| NucleusError::PivotRootError(format!("pivot_root syscall failed: {}", e)))?;
-
-    // Change to new root
-    std::env::set_current_dir("/")
-        .map_err(|e| NucleusError::PivotRootError(format!("Failed to chdir to /: {}", e)))?;
-
-    // Unmount old root
-    nix::mount::umount2("/.old_root", nix::mount::MntFlags::MNT_DETACH)
-        .map_err(|e| NucleusError::PivotRootError(format!("Failed to unmount old root: {}", e)))?;
-
-    // Remove old root directory
-    let _ = std::fs::remove_dir("/.old_root");
-
+    // Stack the old root on the new one, avoiding an image-controlled put_old path.
+    nix::unistd::chdir(new_root)?;
+    pivot_root(".", ".")
+        .map_err(|e| NucleusError::PivotRootError(format!("pivot_root syscall failed: {e}")))?;
+    nix::mount::umount2(".", nix::mount::MntFlags::MNT_DETACH)?;
+    nix::unistd::chdir("/")?;
     Ok(())
 }
 
@@ -1968,79 +1685,18 @@ pub fn mount_secrets(root: &Path, secrets: &[crate::container::SecretMount]) -> 
         // Destination inside container root
         let dest = resolve_container_destination(root, &secret.dest)?;
 
-        // Create parent directories
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                NucleusError::FilesystemError(format!(
-                    "Failed to create secret mount parent {:?}: {}",
-                    parent, e
-                ))
-            })?;
-        }
-
-        // Create mount point file
-        if source_is_file {
-            std::fs::write(&dest, "").map_err(|e| {
-                NucleusError::FilesystemError(format!(
-                    "Failed to create secret mount point {:?}: {}",
-                    dest, e
-                ))
-            })?;
-        } else {
-            std::fs::create_dir_all(&dest).map_err(|e| {
-                NucleusError::FilesystemError(format!(
-                    "Failed to create secret mount dir {:?}: {}",
-                    dest, e
-                ))
-            })?;
-        }
-
-        // Bind mount read-only
-        mount(
-            Some(source_fd_path.as_path()),
-            &dest,
-            None::<&str>,
-            MsFlags::MS_BIND,
-            None::<&str>,
-        )
-        .map_err(|e| {
-            NucleusError::FilesystemError(format!(
-                "Failed to bind mount secret {:?}: {}",
-                secret.source, e
-            ))
-        })?;
-
-        mount(
-            None::<&str>,
-            &dest,
-            None::<&str>,
-            MsFlags::MS_REMOUNT
-                | MsFlags::MS_BIND
-                | MsFlags::MS_RDONLY
-                | MsFlags::MS_NOSUID
-                | MsFlags::MS_NODEV
-                | MsFlags::MS_NOEXEC,
-            None::<&str>,
-        )
-        .map_err(|e| {
-            NucleusError::FilesystemError(format!(
-                "Failed to remount secret {:?} read-only: {}",
-                dest, e
-            ))
-        })?;
-
-        // Apply configured file permissions on the mount point
-        if source_is_file {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(secret.mode);
-            if let Err(e) = std::fs::set_permissions(&dest, perms) {
-                warn!(
-                    "Failed to set mode {:04o} on secret {:?}: {} (bind mount may override)",
-                    secret.mode, dest, e
-                );
-            }
-        }
-
+        let target = mount_target(
+            root,
+            dest.strip_prefix(root)
+                .expect("destination resolved under root"),
+            source_is_dir,
+        )?;
+        bind_tree(
+            &source_fd_path,
+            &target,
+            source_is_dir,
+            READ_ONLY | libc::MOUNT_ATTR_NOEXEC,
+        )?;
         debug!(
             "Mounted secret {:?} -> {:?} (mode {:04o})",
             secret.source, secret.dest, secret.mode
@@ -2066,29 +1722,36 @@ pub fn mount_secrets_inmemory(
 
     info!("Mounting {} secret(s) on in-memory tmpfs", secrets.len());
 
-    let secrets_dir = root.join("run/secrets");
-    std::fs::create_dir_all(&secrets_dir).map_err(|e| {
-        NucleusError::FilesystemError(format!(
-            "Failed to create secrets dir {:?}: {}",
-            secrets_dir, e
-        ))
-    })?;
-
-    // Mount a size-limited tmpfs for secrets (16 MiB max)
-    if let Err(e) = mount(
+    let target = mount_target(root, Path::new("run/secrets"), true)?;
+    // Open the new tmpfs itself before moving it onto the pinned image target.
+    // The setup writer never reopens a pathname through a writable host bind.
+    use std::os::unix::fs::PermissionsExt;
+    let stage = tempfile::Builder::new()
+        .prefix("nucleus-secrets-")
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir_in(
+            root.parent()
+                .ok_or_else(|| NucleusError::FilesystemError("Missing runtime parent".into()))?,
+        )?;
+    mount(
         Some("tmpfs"),
-        &secrets_dir,
+        stage.path(),
         Some("tmpfs"),
         MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
         Some("size=16m,mode=0700"),
+    )?;
+    let secrets_fd = mount_target(stage.path(), Path::new(""), true)?;
+    if let Err(e) = mount(
+        Some(stage.path()),
+        &fd_path(&target),
+        None::<&str>,
+        MsFlags::MS_MOVE,
+        None::<&str>,
     ) {
-        let _ = std::fs::remove_dir_all(&secrets_dir);
-        return Err(NucleusError::FilesystemError(format!(
-            "Failed to mount secrets tmpfs at {:?}: {}",
-            secrets_dir, e
-        )));
+        let _ = nix::mount::umount2(stage.path(), nix::mount::MntFlags::MNT_DETACH);
+        return Err(e.into());
     }
-
+    let secrets_dir = fd_path(&secrets_fd);
     if !identity.is_root() {
         nix::unistd::chown(
             &secrets_dir,
@@ -2097,7 +1760,7 @@ pub fn mount_secrets_inmemory(
         )
         .map_err(|e| {
             let _ = nix::mount::umount2(&secrets_dir, nix::mount::MntFlags::MNT_DETACH);
-            let _ = std::fs::remove_dir_all(&secrets_dir);
+
             NucleusError::FilesystemError(format!(
                 "Failed to set /run/secrets owner to {}:{}: {}",
                 identity.uid, identity.gid, e
@@ -2105,11 +1768,11 @@ pub fn mount_secrets_inmemory(
         })?;
     }
 
-    // Rollback: unmount tmpfs and remove dir if any secret fails
+    // Detach the private tmpfs if any secret fails.
     let result = mount_secrets_inmemory_inner(&secrets_dir, root, secrets, identity);
     if let Err(ref e) = result {
         let _ = nix::mount::umount2(&secrets_dir, nix::mount::MntFlags::MNT_DETACH);
-        let _ = std::fs::remove_dir_all(&secrets_dir);
+
         return Err(NucleusError::FilesystemError(format!(
             "Secret mount failed (rolled back): {}",
             e
@@ -2180,54 +1843,14 @@ fn mount_secrets_inmemory_inner(
         // Also bind-mount the secret to its expected container path for compatibility
         let container_dest = resolve_container_destination(root, &secret.dest)?;
         if container_dest != dest {
-            if let Some(parent) = container_dest.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| {
-                    NucleusError::FilesystemError(format!(
-                        "Failed to create secret mount parent {:?}: {}",
-                        parent, e
-                    ))
-                })?;
-            }
-
-            std::fs::write(&container_dest, "").map_err(|e| {
-                NucleusError::FilesystemError(format!(
-                    "Failed to create secret mount point {:?}: {}",
-                    container_dest, e
-                ))
-            })?;
-
-            mount(
-                Some(dest.as_path()),
-                &container_dest,
-                None::<&str>,
-                MsFlags::MS_BIND,
-                None::<&str>,
-            )
-            .map_err(|e| {
-                NucleusError::FilesystemError(format!(
-                    "Failed to bind mount secret {:?} -> {:?}: {}",
-                    dest, container_dest, e
-                ))
-            })?;
-
-            mount(
-                None::<&str>,
-                &container_dest,
-                None::<&str>,
-                MsFlags::MS_REMOUNT
-                    | MsFlags::MS_BIND
-                    | MsFlags::MS_RDONLY
-                    | MsFlags::MS_NOSUID
-                    | MsFlags::MS_NODEV
-                    | MsFlags::MS_NOEXEC,
-                None::<&str>,
-            )
-            .map_err(|e| {
-                NucleusError::FilesystemError(format!(
-                    "Failed to remount secret {:?} read-only: {}",
-                    container_dest, e
-                ))
-            })?;
+            let target = mount_target(
+                root,
+                container_dest
+                    .strip_prefix(root)
+                    .expect("destination resolved under root"),
+                false,
+            )?;
+            bind_tree(&dest, &target, false, READ_ONLY | libc::MOUNT_ATTR_NOEXEC)?;
         }
 
         debug!(

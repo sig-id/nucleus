@@ -84,6 +84,10 @@ pub struct ContainerState {
     /// Absent in state written before native helper confinement was recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_seccomp: Option<crate::security::NativeSeccomp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub landlock_socket: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_device_filter: Option<SavedDeviceFilter>,
 
     /// Desired topology config hash associated with this container, if any.
     #[serde(default)]
@@ -139,6 +143,13 @@ pub struct ContainerState {
     pub rootfs_workdir: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SavedDeviceFilter {
+    pub gpu: Vec<crate::filesystem::DeviceNodeSpec>,
+    pub supervisor: Vec<crate::filesystem::DeviceNodeSpec>,
+    pub include_tty: bool,
+}
+
 fn default_oci_status() -> OciStatus {
     OciStatus::Stopped
 }
@@ -188,6 +199,8 @@ impl ContainerState {
             cgroup_path: params.cgroup_path,
             pids_max: None,
             native_seccomp: None,
+            landlock_socket: None,
+            gpu_device_filter: None,
             config_hash: None,
             creator_uid: nix::unistd::Uid::effective().as_raw(),
             process_uid: params.process_uid,

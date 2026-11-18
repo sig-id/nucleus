@@ -176,6 +176,21 @@ impl IdMapping {
         }
     }
 
+    /// Host ID corresponding to `container_id`, or `None` when unmapped.
+    ///
+    /// Pure translation of a container-relative numeric ID into its host
+    /// counterpart for this mapping range.
+    pub fn host_id_for(&self, container_id: u32) -> Option<u32> {
+        if container_id < self.container_id {
+            return None;
+        }
+        let offset = container_id - self.container_id;
+        if offset >= self.count {
+            return None;
+        }
+        self.host_id.checked_add(offset)
+    }
+
     /// Validate the mapping for safety.
     ///
     /// Rejects zero count, overflow in ID ranges, and excessively large
@@ -818,4 +833,23 @@ mod tests {
 
     // Note: Testing actual mapping setup requires user namespace creation
     // This is tested in integration tests
+    #[test]
+    fn host_id_for_translates_mapped_container_ids() {
+        let mapping = IdMapping::new(0, 100_000, 65_536);
+        assert_eq!(mapping.host_id_for(0), Some(100_000));
+        assert_eq!(mapping.host_id_for(1000), Some(101_000));
+        assert_eq!(mapping.host_id_for(65_535), Some(165_535));
+        // Outside the container range.
+        assert_eq!(mapping.host_id_for(65_536), None);
+        assert_eq!(mapping.host_id_for(u32::MAX), None);
+    }
+
+    #[test]
+    fn host_id_for_handles_offset_ranges() {
+        let mapping = IdMapping::new(1000, 2000, 100);
+        assert_eq!(mapping.host_id_for(999), None);
+        assert_eq!(mapping.host_id_for(1000), Some(2000));
+        assert_eq!(mapping.host_id_for(1099), Some(2099));
+        assert_eq!(mapping.host_id_for(1100), None);
+    }
 }

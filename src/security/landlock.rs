@@ -36,6 +36,7 @@ enum PathAccessMode {
 /// - Irreversible: once restrict_self() is called, restrictions cannot be lifted
 /// - Stackable: layered with seccomp and capability dropping
 /// - Unprivileged: works in rootless mode
+#[derive(Debug, Clone)]
 pub struct LandlockManager {
     applied: bool,
     /// Additional paths to grant read+write access to (e.g. volume mounts).
@@ -163,6 +164,14 @@ impl LandlockManager {
     /// When `best_effort` is true, failures (e.g. kernel without Landlock) are
     /// logged and execution continues.
     pub fn apply_container_policy_with_mode(&mut self, best_effort: bool) -> Result<bool> {
+        self.apply_with_handoff(best_effort, None)
+    }
+
+    pub(crate) fn apply_with_handoff(
+        &mut self,
+        best_effort: bool,
+        handoff: Option<&std::os::unix::net::UnixStream>,
+    ) -> Result<bool> {
         if self.applied {
             debug!("Landlock policy already applied, skipping");
             return Ok(true);
@@ -170,7 +179,7 @@ impl LandlockManager {
 
         info!("Applying Landlock filesystem policy");
 
-        match self.build_and_restrict() {
+        match self.build_and_restrict(handoff) {
             Ok(status) => match status {
                 RulesetStatus::FullyEnforced => {
                     self.applied = true;
@@ -281,7 +290,10 @@ impl LandlockManager {
     }
 
     /// Build the ruleset and call restrict_self().
-    fn build_and_restrict(&self) -> Result<RulesetStatus> {
+    fn build_and_restrict(
+        &self,
+        handoff: Option<&std::os::unix::net::UnixStream>,
+    ) -> Result<RulesetStatus> {
         let access_all = AccessFs::from_all(TARGET_ABI);
         let access_read = AccessFs::from_read(TARGET_ABI);
 
@@ -416,7 +428,7 @@ impl LandlockManager {
             }
         }
 
-        let status = ruleset.restrict_self().map_err(ll_err)?;
+        let status = super::landlock_handoff::restrict_and_publish(ruleset, handoff)?;
         Ok(status.ruleset)
     }
 
@@ -642,7 +654,7 @@ mod tests {
     fn test_not_enforced_returns_error_in_strict_mode() {
         // SEC-11: When best_effort=false, NotEnforced must return Err, not Ok(false)
         let source = include_str!("landlock.rs");
-        let fn_body = extract_fn_body(source, "fn apply_container_policy_with_mode");
+        let fn_body = extract_fn_body(source, "fn apply_with_handoff");
         // Find the NotEnforced match arm within the function body
         let not_enforced_start = fn_body
             .find("NotEnforced")
@@ -663,7 +675,7 @@ mod tests {
     #[test]
     fn test_partially_enforced_returns_error_in_strict_mode() {
         let source = include_str!("landlock.rs");
-        let fn_body = extract_fn_body(source, "fn apply_container_policy_with_mode");
+        let fn_body = extract_fn_body(source, "fn apply_with_handoff");
         let partial_start = fn_body
             .find("PartiallyEnforced")
             .expect("function must handle PartiallyEnforced status");

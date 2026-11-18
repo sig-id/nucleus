@@ -1703,6 +1703,20 @@ impl ContainerConfig {
             }
         }
 
+        if matches!(self.network, crate::network::NetworkMode::Bridge(_)) && !self.namespaces.net {
+            return Err(crate::error::NucleusError::ConfigError(
+                "Bridge egress requires a private network namespace".into(),
+            ));
+        }
+        if matches!(
+            self.network,
+            crate::network::NetworkMode::Host | crate::network::NetworkMode::GVisorHost
+        ) && self.egress_policy.is_some()
+        {
+            return Err(crate::error::NucleusError::ConfigError(
+                "Egress policies require a private network namespace".into(),
+            ));
+        }
         self.validate_credential_broker()?;
         if self.use_gvisor
             && matches!(self.network, crate::network::NetworkMode::Bridge(_))

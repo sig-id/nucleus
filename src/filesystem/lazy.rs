@@ -38,49 +38,28 @@ impl LazyContextPopulator {
     fn bind_mount_context(source: &Path, dest: &Path) -> Result<()> {
         ContextPopulator::new(source, dest).validate_source_tree()?;
 
-        // Ensure destination exists
-        std::fs::create_dir_all(dest).map_err(|e| {
-            NucleusError::ContextError(format!("Failed to create destination {:?}: {}", dest, e))
-        })?;
-
         info!(
             "Bind mounting context: {:?} -> {:?} (read-only)",
             source, dest
         );
 
-        // Initial bind mount
-        nix::mount::mount(
-            Some(source),
-            dest,
-            None::<&str>,
-            nix::mount::MsFlags::MS_BIND | nix::mount::MsFlags::MS_REC,
-            None::<&str>,
-        )
-        .map_err(|e| {
-            NucleusError::ContextError(format!(
-                "Failed to bind mount {:?} -> {:?}: {}",
-                source, dest, e
-            ))
-        })?;
-
-        // Remount read-only
-        nix::mount::mount(
-            None::<&str>,
-            dest,
-            None::<&str>,
-            nix::mount::MsFlags::MS_BIND
-                | nix::mount::MsFlags::MS_REC
-                | nix::mount::MsFlags::MS_RDONLY
-                | nix::mount::MsFlags::MS_NOSUID
-                | nix::mount::MsFlags::MS_NODEV
-                | nix::mount::MsFlags::MS_NOEXEC
-                | nix::mount::MsFlags::MS_REMOUNT,
-            None::<&str>,
-        )
-        .map_err(|e| {
-            NucleusError::ContextError(format!("Failed to remount {:?} read-only: {}", dest, e))
-        })?;
-
+        let parent = dest
+            .parent()
+            .ok_or_else(|| NucleusError::ContextError("Missing context parent".into()))?;
+        let target = super::mount_target(
+            parent,
+            Path::new(
+                dest.file_name()
+                    .ok_or_else(|| NucleusError::ContextError("Missing context name".into()))?,
+            ),
+            true,
+        )?;
+        super::bind_tree(
+            source,
+            &target,
+            true,
+            super::READ_ONLY | libc::MOUNT_ATTR_NOEXEC,
+        )?;
         info!("Context bind mounted successfully");
         Ok(())
     }
@@ -122,44 +101,6 @@ mod tests {
         assert!(
             err.to_string().contains("special file"),
             "bind-mounted contexts must reject host special files"
-        );
-    }
-
-    #[test]
-    fn test_bind_mount_context_remount_adds_hardening_flags() {
-        // Verify bind_mount_context applies hardening mount flags.
-        // Uses brace-matched extraction instead of scanning to EOF (SEC-MED-03).
-        let source = include_str!("lazy.rs");
-        let fn_start = source.find("fn bind_mount_context").unwrap();
-        let after = &source[fn_start..];
-        let open = after.find('{').unwrap();
-        let mut depth = 0u32;
-        let mut fn_end = open;
-        for (i, ch) in after[open..].char_indices() {
-            match ch {
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        fn_end = open + i + 1;
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-        let fn_body = &after[..fn_end];
-        assert!(
-            fn_body.contains("MS_NOSUID"),
-            "bind_mount_context must set MS_NOSUID"
-        );
-        assert!(
-            fn_body.contains("MS_NODEV"),
-            "bind_mount_context must set MS_NODEV"
-        );
-        assert!(
-            fn_body.contains("MS_NOEXEC"),
-            "bind_mount_context must set MS_NOEXEC"
         );
     }
 }

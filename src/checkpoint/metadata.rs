@@ -174,6 +174,10 @@ pub struct CheckpointMetadata {
     /// Whether container was rootless
     pub rootless: bool,
 
+    /// Original launch record, covered by the checkpoint HMAC. Older snapshots lack it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_state: Option<ContainerState>,
+
     /// Original cgroup path, if the container was tracked in a cgroup.
     #[serde(default)]
     pub cgroup_path: Option<String>,
@@ -200,6 +204,7 @@ impl CheckpointMetadata {
             container_id: state.id.clone(),
             container_name: state.name.clone(),
             original_pid: state.pid,
+            launch_state: Some(state.clone()),
             command: state.command.clone(),
             checkpoint_at,
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -312,6 +317,7 @@ mod tests {
             container_id: "test-id".to_string(),
             container_name: "test".to_string(),
             original_pid: 1,
+            launch_state: None,
             command: vec!["/bin/sh".to_string()],
             checkpoint_at: 0,
             version: "0.0.0".to_string(),

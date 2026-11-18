@@ -1,13 +1,14 @@
 use crate::container::{ContainerState, ContainerStateManager, ProcessIdentity};
 use crate::error::{NucleusError, Result};
 use crate::resources::Cgroup;
+use crate::security::landlock_handoff::{load_launch_ruleset, restrict_to_launch_ruleset};
 use crate::security::{NativeSeccomp, SeccompManager};
 use nix::sys::signal::{kill, killpg, Signal};
 use nix::sys::wait::{waitid, waitpid, Id, WaitPidFlag, WaitStatus};
 use nix::unistd::{fork, ForkResult, Pid};
 use std::ffi::CString;
 use std::fs::File;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, OwnedFd};
 use std::thread;
 use std::time::{Duration, Instant};
 use tracing::info;
@@ -60,6 +61,7 @@ impl ContainerAttach {
         info!("Attaching to container {} (PID {})", state.id, pid);
 
         let policy = Self::saved_policy(state)?;
+        let landlock = load_launch_ruleset(state.landlock_socket.as_deref())?;
         let ns_fds = Self::open_namespace_fds(pid, state.rootless)?;
         Self::verify_target(state)?;
 
@@ -73,7 +75,7 @@ impl ContainerAttach {
             }
             ForkResult::Child => {
                 // Child: enter namespaces and exec
-                match Self::enter_and_exec(state, policy, &ns_fds, &command) {
+                match Self::enter_and_exec(state, policy, &landlock, &ns_fds, &command) {
                     Ok(_) => unreachable!(),
                     Err(e) => {
                         eprintln!("Attach failed: {}", e);
@@ -101,6 +103,7 @@ impl ContainerAttach {
     fn enter_and_exec(
         state: &ContainerState,
         policy: &NativeSeccomp,
+        landlock: &OwnedFd,
         ns_fds: &[(String, File)],
         command: &[String],
     ) -> Result<()> {
@@ -110,8 +113,9 @@ impl ContainerAttach {
             ));
         }
 
+        nix::sys::prctl::set_dumpable(false)?;
         Self::enter_namespaces(state, ns_fds)?;
-        Self::apply_exec_hardening(state, policy)?;
+        Self::apply_exec_hardening(state, policy, landlock)?;
         let env = Self::default_exec_env()?;
         Self::exec_with_env(command, &env)
     }
@@ -148,6 +152,9 @@ impl ContainerAttach {
     }
 
     fn enter_namespaces(state: &ContainerState, ns_fds: &[(String, File)]) -> Result<()> {
+        if state.rootless && nix::unistd::Uid::effective().is_root() {
+            nix::unistd::setgroups(&[])?;
+        }
         if let Some(path) = &state.cgroup_path {
             Cgroup::join_existing(path.as_ref())?;
         }
@@ -232,7 +239,11 @@ impl ContainerAttach {
         Ok(())
     }
 
-    fn apply_exec_hardening(state: &ContainerState, policy: &NativeSeccomp) -> Result<()> {
+    fn apply_exec_hardening(
+        state: &ContainerState,
+        policy: &NativeSeccomp,
+        landlock: &OwnedFd,
+    ) -> Result<()> {
         // Apply security hardening before exec: no_new_privs + capability drop +
         // seccomp + Landlock (C4: attach/exec path must match container security).
         // SAFETY: PR_SET_NO_NEW_PRIVS with arg 1 is always safe to call; it only
@@ -255,6 +266,7 @@ impl ContainerAttach {
             },
             state.rootless,
         )?;
+        nix::sys::prctl::set_dumpable(false)?;
         cap_mgr.finalize_drop()?;
         if let Some(max) = state.pids_max {
             // Preserve any tighter limits the caller already had.
@@ -269,11 +281,7 @@ impl ContainerAttach {
             nix::errno::Errno::result(unsafe { libc::setrlimit(libc::RLIMIT_NPROC, &limits) })?;
         }
 
-        // Apply Landlock filesystem restrictions
-        let mut landlock_mgr = crate::security::LandlockManager::new();
-        if let Err(e) = landlock_mgr.apply_container_policy_with_mode(true) {
-            tracing::warn!("Failed to apply Landlock on attach: {} (continuing)", e);
-        }
+        restrict_to_launch_ruleset(landlock)?;
 
         // Install last. A service profile can deny the setup syscalls themselves.
         policy.apply()
@@ -389,6 +397,7 @@ impl NamespaceCommandRunner {
             ));
         }
         let policy = ContainerAttach::saved_policy(state)?;
+        let landlock = load_launch_ruleset(state.landlock_socket.as_deref())?;
         let ns_fds = ContainerAttach::open_namespace_fds(state.pid, state.rootless)?;
         ContainerAttach::verify_target(state)?;
 
@@ -397,15 +406,21 @@ impl NamespaceCommandRunner {
         })? {
             ForkResult::Parent { child } => Self::wait_for_probe(child, timeout),
             ForkResult::Child => {
-                let exit_code =
-                    match Self::enter_and_run(state, policy, &ns_fds, probe, timeout.is_some()) {
-                        Ok(true) => 0,
-                        Ok(false) => 1,
-                        Err(e) => {
-                            eprintln!("Namespace helper failed: {}", e);
-                            125
-                        }
-                    };
+                let exit_code = match Self::enter_and_run(
+                    state,
+                    policy,
+                    &landlock,
+                    &ns_fds,
+                    probe,
+                    timeout.is_some(),
+                ) {
+                    Ok(true) => 0,
+                    Ok(false) => 1,
+                    Err(e) => {
+                        eprintln!("Namespace helper failed: {}", e);
+                        125
+                    }
+                };
                 std::process::exit(exit_code);
             }
         }
@@ -414,17 +429,19 @@ impl NamespaceCommandRunner {
     fn enter_and_run(
         state: &ContainerState,
         policy: &NativeSeccomp,
+        landlock: &OwnedFd,
         ns_fds: &[(String, File)],
         probe: NamespaceProbe,
         timed: bool,
     ) -> Result<bool> {
+        nix::sys::prctl::set_dumpable(false)?;
         if timed {
             // A fresh session excludes unrelated processes from the group.
             nix::unistd::setsid()?;
             SeccompManager::confine_probe_process_group()?;
         }
         ContainerAttach::enter_namespaces(state, ns_fds)?;
-        ContainerAttach::apply_exec_hardening(state, policy)?;
+        ContainerAttach::apply_exec_hardening(state, policy, landlock)?;
 
         match probe {
             NamespaceProbe::Exec(command) => {

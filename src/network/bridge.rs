@@ -841,6 +841,12 @@ impl BridgeNetwork {
                 "/usr/bin/iptables",
                 "/run/current-system/sw/bin/iptables",
             ],
+            "ip6tables" => &[
+                "/usr/sbin/ip6tables",
+                "/sbin/ip6tables",
+                "/usr/bin/ip6tables",
+                "/run/current-system/sw/bin/ip6tables",
+            ],
             "slirp4netns" => &[
                 "/usr/bin/slirp4netns",
                 "/bin/slirp4netns",
@@ -1018,14 +1024,18 @@ impl BridgeNetwork {
 
     /// Write resolv.conf inside container (for writable /etc, e.g. agent mode)
     pub fn write_resolv_conf(root: &std::path::Path, dns: &[String]) -> Result<()> {
-        let resolv_path = root.join("etc/resolv.conf");
-        let content: String = dns
-            .iter()
-            .map(|server| format!("nameserver {}\n", server))
-            .collect();
-        std::fs::write(&resolv_path, content).map_err(|e| {
-            NucleusError::NetworkError(format!("Failed to write resolv.conf: {}", e))
-        })?;
+        let parent = crate::filesystem::mount_target(root, std::path::Path::new("etc"), true)?;
+        let parent_path = crate::filesystem::fd_path(&parent);
+        let mut temp = tempfile::NamedTempFile::new_in(&parent_path)?;
+        for server in dns {
+            use std::io::Write;
+            writeln!(temp, "nameserver {server}")?;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        temp.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o644))?;
+        temp.persist(parent_path.join("resolv.conf"))
+            .map_err(|e| e.error)?;
         Ok(())
     }
 
@@ -1035,8 +1045,6 @@ impl BridgeNetwork {
     /// /etc/resolv.conf so it works even when the rootfs /etc is read-only.
     /// The memfd is cleaned up when the container exits.
     pub fn bind_mount_resolv_conf(root: &std::path::Path, dns: &[String]) -> Result<()> {
-        use nix::mount::{mount, MsFlags};
-
         let content: String = dns
             .iter()
             .map(|server| format!("nameserver {}\n", server))
@@ -1073,27 +1081,15 @@ impl BridgeNetwork {
             unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) }
         };
 
-        // Ensure the mount target exists
-        let target = root.join("etc/resolv.conf");
-        if !target.exists() {
-            let _ = std::fs::write(&target, "");
-        }
-
-        // Bind mount the memfd over the read-only resolv.conf
+        let target =
+            crate::filesystem::mount_target(root, std::path::Path::new("etc/resolv.conf"), false)?;
         let memfd_path = format!("/proc/self/fd/{}", memfd.as_raw_fd());
-        if let Err(e) = mount(
-            Some(memfd_path.as_str()),
+        crate::filesystem::bind_tree(
+            std::path::Path::new(&memfd_path),
             &target,
-            None::<&str>,
-            MsFlags::MS_BIND,
-            None::<&str>,
-        ) {
-            return Err(NucleusError::NetworkError(format!(
-                "Failed to bind mount memfd-backed resolv.conf: {}",
-                e
-            )));
-        }
-        Self::harden_resolv_conf_bind(&target)?;
+            false,
+            crate::filesystem::READ_ONLY | libc::MOUNT_ATTR_NOEXEC,
+        )?;
 
         // memfd dropped here – the mount holds a kernel reference to the file,
         // so it survives the fd close.
@@ -1104,8 +1100,6 @@ impl BridgeNetwork {
 
     /// Fallback: bind-mount a staging resolv.conf file.
     fn bind_mount_resolv_conf_staging(root: &std::path::Path, dns: &[String]) -> Result<()> {
-        use nix::mount::{mount, MsFlags};
-
         let content: String = dns
             .iter()
             .map(|server| format!("nameserver {}\n", server))
@@ -1113,24 +1107,14 @@ impl BridgeNetwork {
 
         let staging = Self::create_resolv_conf_staging_file(root, content.as_bytes())?;
 
-        // Ensure the mount target exists
-        let target = root.join("etc/resolv.conf");
-        if !target.exists() {
-            let _ = std::fs::write(&target, "");
-        }
-
-        // Bind mount the staging file over the read-only resolv.conf
-        mount(
-            Some(staging.path()),
+        let target =
+            crate::filesystem::mount_target(root, std::path::Path::new("etc/resolv.conf"), false)?;
+        crate::filesystem::bind_tree(
+            staging.path(),
             &target,
-            None::<&str>,
-            MsFlags::MS_BIND,
-            None::<&str>,
-        )
-        .map_err(|e| {
-            NucleusError::NetworkError(format!("Failed to bind mount resolv.conf: {}", e))
-        })?;
-        Self::harden_resolv_conf_bind(&target)?;
+            false,
+            crate::filesystem::READ_ONLY | libc::MOUNT_ATTR_NOEXEC,
+        )?;
 
         // The bind mount holds a reference to the inode. Dropping the temporary
         // file unlinks the staging path so DNS server info is not left on disk.
@@ -1171,29 +1155,6 @@ impl BridgeNetwork {
         })?;
 
         Ok(staging)
-    }
-
-    fn harden_resolv_conf_bind(target: &std::path::Path) -> Result<()> {
-        use nix::mount::{mount, MsFlags};
-
-        mount(
-            None::<&str>,
-            target,
-            None::<&str>,
-            MsFlags::MS_REMOUNT
-                | MsFlags::MS_BIND
-                | MsFlags::MS_RDONLY
-                | MsFlags::MS_NOSUID
-                | MsFlags::MS_NODEV
-                | MsFlags::MS_NOEXEC,
-            None::<&str>,
-        )
-        .map_err(|e| {
-            NucleusError::NetworkError(format!(
-                "Failed to remount resolv.conf with hardened flags at {:?}: {}",
-                target, e
-            ))
-        })
     }
 }
 
