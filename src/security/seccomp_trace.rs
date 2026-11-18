@@ -12,7 +12,9 @@
 use crate::error::{NucleusError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{BufRead, BufReader, Write};
+use std::fs::File;
+use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -61,12 +63,22 @@ impl SeccompTraceReader {
     /// Opens `/dev/kmsg` and filters for `audit: type=1326` (SECCOMP)
     /// messages matching the target PID.
     pub fn start_recording(&mut self) -> Result<()> {
-        let pid = self.pid;
-        let output_path = self.output_path.clone();
-        let stop = self.stop.clone();
+        self.start_scoped(None)
+    }
 
+    pub(crate) fn start_scoped(&mut self, cgroup_path: Option<PathBuf>) -> Result<()> {
+        let mut kmsg = File::options()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+            .open("/dev/kmsg")?;
+        // Skip historical records for previous occupants of these PID numbers.
+        kmsg.seek(SeekFrom::End(0))?;
+        let output = create_trace_file(&self.output_path)?;
+        let mut scope = SeccompAuditScope::new(self.pid, cgroup_path);
+        scope.refresh(Instant::now());
+        let stop = self.stop.clone();
         let handle = std::thread::spawn(move || {
-            if let Err(e) = record_loop(pid, &output_path, &stop) {
+            if let Err(e) = record_loop(kmsg, output, scope, &stop) {
                 warn!("Seccomp trace reader error: {}", e);
             }
         });
@@ -98,91 +110,92 @@ impl Drop for SeccompTraceReader {
     }
 }
 
-/// Main recording loop – reads /dev/kmsg and extracts SECCOMP records.
-fn record_loop(pid: u32, output_path: &Path, stop: &AtomicBool) -> Result<()> {
+/// Exclusively create a private output file without traversing symlinks.
+fn create_trace_file(path: &Path) -> Result<File> {
+    use nix::fcntl::{openat2, OFlag, OpenHow, ResolveFlag, AT_FDCWD};
+    use nix::sys::stat::Mode;
+    let how = OpenHow::new()
+        .flags(OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_WRONLY | OFlag::O_CLOEXEC)
+        .mode(Mode::S_IRUSR | Mode::S_IWUSR)
+        .resolve(ResolveFlag::RESOLVE_NO_SYMLINKS);
+    Ok(File::from(openat2(AT_FDCWD, path, how).map_err(|e| {
+        NucleusError::ConfigError(format!("Cannot create new trace file {path:?}: {e}"))
+    })?))
+}
+
+fn record_loop(
+    file: File,
+    output: File,
+    mut scope: SeccompAuditScope,
+    stop: &AtomicBool,
+) -> Result<()> {
+    use std::os::fd::AsRawFd;
     let mut syscalls: BTreeMap<i64, u64> = BTreeMap::new();
-
-    // Verify /dev/kmsg is not a symlink before opening
-    let kmsg_path = std::path::Path::new("/dev/kmsg");
-    if let Ok(meta) = std::fs::symlink_metadata(kmsg_path) {
-        if meta.file_type().is_symlink() {
-            warn!("/dev/kmsg is a symlink – refusing to open for seccomp tracing");
-            write_trace_file(output_path, &syscalls)?;
-            return Ok(());
-        }
-    }
-
-    // Open /dev/kmsg for reading (requires CAP_SYSLOG or root)
-    let file = match std::fs::File::open(kmsg_path) {
-        Ok(f) => f,
-        Err(e) => {
-            warn!(
-                "Cannot open /dev/kmsg for seccomp tracing: {} \
-                 (requires root or CAP_SYSLOG). Falling back to no-trace mode.",
-                e
-            );
-            // Write empty trace file
-            write_trace_file(output_path, &syscalls)?;
-            return Ok(());
-        }
-    };
-
-    // Set O_NONBLOCK so reads don't block indefinitely. We use poll() with a
-    // timeout to periodically check the stop flag. The previous setsockopt(SO_RCVTIMEO)
-    // approach was incorrect: /dev/kmsg is a character device, not a socket, so
-    // setsockopt silently fails with ENOTSOCK.
-    use std::os::unix::io::AsRawFd;
     let fd = file.as_raw_fd();
-    // SAFETY: fd is a valid file descriptor from File::open("/dev/kmsg").
-    // F_GETFL/F_SETFL only modify the file status flags; O_NONBLOCK is safe
-    // to set and required for poll-based reading.
-    unsafe {
-        let flags = libc::fcntl(fd, libc::F_GETFL);
-        if flags >= 0 {
-            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-        }
-    }
-
     let reader = BufReader::new(file);
-    let pid_pattern = format!("pid={}", pid);
 
+    let mut stopping_since = None;
     for line in reader.lines() {
-        if stop.load(Ordering::Acquire) {
+        if stop.load(Ordering::Acquire)
+            && stopping_since.get_or_insert_with(Instant::now).elapsed()
+                >= DENY_SCOPE_REFRESH_INTERVAL
+        {
             break;
         }
-
         let line = match line {
             Ok(l) => l,
             Err(e) => {
                 if e.kind() == std::io::ErrorKind::WouldBlock {
-                    // No data available – poll with 2s timeout, then check stop flag
+                    if stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    scope.refresh_if_stale(Instant::now());
                     let mut pfd = libc::pollfd {
                         fd,
                         events: libc::POLLIN,
                         revents: 0,
                     };
                     // SAFETY: pfd is a valid stack-allocated pollfd with a valid fd.
-                    // poll with nfds=1 and timeout=2000ms is safe; it only blocks.
-                    unsafe { libc::poll(&mut pfd, 1, 2000) };
+                    // The timeout bounds the interval between membership refreshes.
+                    unsafe { libc::poll(&mut pfd, 1, DENY_SCOPE_POLL_TIMEOUT_MS) };
                     continue;
                 }
-                debug!("kmsg read error: {}", e);
-                continue;
+                if e.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                if kmsg_loss_is_recoverable(&e) {
+                    warn!(
+                        "Seccomp trace: kernel log buffer overran and some records \
+                         were lost; continuing with the trace collected so far"
+                    );
+                    continue;
+                }
+                return Err(e.into());
             }
         };
 
         // SECCOMP audit lines look like:
         // audit: type=1326 ... pid=<PID> ... syscall=<NR> ...
-        if line.contains("type=1326") && line.contains(&pid_pattern) {
-            if let Some(nr) = extract_syscall_nr(&line) {
-                *syscalls.entry(nr).or_insert(0) += 1;
-            }
+        if let Some((_, nr)) = syscall_record_for_scope(&line, &mut scope, Instant::now()) {
+            *syscalls.entry(nr).or_insert(0) += 1;
         }
     }
 
-    write_trace_file(output_path, &syscalls)?;
+    write_trace_file(output, &syscalls)?;
     info!("Seccomp trace: recorded {} unique syscalls", syscalls.len());
     Ok(())
+}
+
+/// Whether a `/dev/kmsg` read error indicates lost records that the reader
+/// can recover from.
+///
+/// Per the kernel ABI (`Documentation/ABI/testing/dev-kmsg`), a read returns
+/// `EPIPE` when the printk ring buffer overran: the cursor is advanced and
+/// subsequent reads return newer records. The recorder must keep reading
+/// instead of aborting, which would discard every syscall already collected
+/// and leave the trace file empty.
+fn kmsg_loss_is_recoverable(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::BrokenPipe
 }
 
 /// Extract the syscall number from an audit SECCOMP line.
@@ -203,11 +216,7 @@ fn extract_audit_pid(line: &str) -> Option<u32> {
 }
 
 /// Write the accumulated trace data as NDJSON.
-fn write_trace_file(path: &Path, syscalls: &BTreeMap<i64, u64>) -> Result<()> {
-    let mut file = std::fs::File::create(path).map_err(|e| {
-        NucleusError::ConfigError(format!("Failed to create trace file {:?}: {}", path, e))
-    })?;
-
+fn write_trace_file(mut file: File, syscalls: &BTreeMap<i64, u64>) -> Result<()> {
     for (&nr, &count) in syscalls {
         let record = TraceRecord {
             syscall: nr,
@@ -291,17 +300,18 @@ impl Drop for SeccompDenyLogger {
 }
 
 #[derive(Debug)]
-struct SeccompDenyScope {
+struct SeccompAuditScope {
     target_pid: u32,
     proc_root: PathBuf,
     cgroup_path: Option<PathBuf>,
     cgroup_relative_path: Option<String>,
     target_pid_namespace: Option<String>,
-    known_pids: BTreeMap<u32, Instant>,
+    target_inode: Option<u64>,
+    known_pids: BTreeMap<u32, (Instant, Option<u64>)>,
     last_refresh: Option<Instant>,
 }
 
-impl SeccompDenyScope {
+impl SeccompAuditScope {
     fn new(target_pid: u32, cgroup_path: Option<PathBuf>) -> Self {
         Self::with_proc_root(target_pid, PathBuf::from(PROC_ROOT), cgroup_path, None)
     }
@@ -317,8 +327,10 @@ impl SeccompDenyScope {
                 .as_deref()
                 .and_then(cgroup_relative_path_from_host_path)
         });
+        let target_inode = proc_inode(&proc_root, target_pid);
         Self {
             target_pid,
+            target_inode,
             proc_root,
             cgroup_path,
             cgroup_relative_path,
@@ -330,8 +342,7 @@ impl SeccompDenyScope {
 
     fn matches_pid(&mut self, pid: u32, now: Instant) -> bool {
         if pid == self.target_pid {
-            self.remember_pid(pid, now);
-            return true;
+            return self.is_original_target() || self.has_recent_pid(pid, now);
         }
 
         self.refresh_if_stale(now);
@@ -368,14 +379,18 @@ impl SeccompDenyScope {
 
     fn refresh(&mut self, now: Instant) {
         self.expire_stale_pids(now);
-        self.remember_pid(self.target_pid, now);
-
-        if self.target_pid_namespace.is_none() {
-            self.target_pid_namespace = read_pid_namespace(&self.proc_root, self.target_pid);
+        let target_is_live = self.is_original_target();
+        if target_is_live && self.target_pid_namespace.is_none() {
+            self.target_pid_namespace = read_pid_namespace(&self.proc_root, self.target_pid)
+                .filter(|ns| {
+                    Some(ns) != read_pid_namespace(&self.proc_root, std::process::id()).as_ref()
+                });
         }
 
         let mut scoped_pids = BTreeSet::new();
-        collect_process_tree_pids(&self.proc_root, self.target_pid, &mut scoped_pids);
+        if target_is_live {
+            collect_process_tree_pids(&self.proc_root, self.target_pid, &mut scoped_pids);
+        }
         for pid in scoped_pids {
             self.remember_pid(pid, now);
         }
@@ -389,19 +404,30 @@ impl SeccompDenyScope {
         self.last_refresh = Some(now);
     }
 
+    fn is_original_target(&self) -> bool {
+        self.target_inode.is_some()
+            && proc_inode(&self.proc_root, self.target_pid) == self.target_inode
+    }
+
     fn remember_pid(&mut self, pid: u32, now: Instant) {
-        self.known_pids.insert(pid, now);
+        self.known_pids
+            .insert(pid, (now, proc_inode(&self.proc_root, pid)));
     }
 
     fn has_recent_pid(&self, pid: u32, now: Instant) -> bool {
         self.known_pids
             .get(&pid)
-            .map(|seen| is_recent(*seen, now))
+            .map(|(seen, inode)| {
+                // A dead child can leave a queued audit record. A live process
+                // reusing its numeric PID has a different procfs inode.
+                let current = proc_inode(&self.proc_root, pid);
+                is_recent(*seen, now) && (current.is_none() || current == *inode)
+            })
             .unwrap_or(false)
     }
 
     fn expire_stale_pids(&mut self, now: Instant) {
-        self.known_pids.retain(|_, seen| is_recent(*seen, now));
+        self.known_pids.retain(|_, (seen, _)| is_recent(*seen, now));
     }
 
     fn process_matches_cgroup(&self, pid: u32) -> bool {
@@ -424,6 +450,12 @@ impl SeccompDenyScope {
             .map(|pid_ns| pid_ns == target_ns)
             .unwrap_or(false)
     }
+}
+
+fn proc_inode(proc_root: &Path, pid: u32) -> Option<u64> {
+    std::fs::metadata(proc_root.join(pid.to_string()))
+        .ok()
+        .map(|meta| meta.ino())
 }
 
 fn is_recent(seen: Instant, now: Instant) -> bool {
@@ -558,7 +590,7 @@ fn deny_log_loop(pid: u32, cgroup_path: Option<PathBuf>, stop: &AtomicBool) -> R
     }
 
     let reader = BufReader::new(file);
-    let mut scope = SeccompDenyScope::new(pid, cgroup_path);
+    let mut scope = SeccompAuditScope::new(pid, cgroup_path);
     scope.refresh(Instant::now());
 
     for line in reader.lines() {
@@ -586,9 +618,7 @@ fn deny_log_loop(pid: u32, cgroup_path: Option<PathBuf>, stop: &AtomicBool) -> R
             }
         };
 
-        if let Some((audit_pid, nr)) =
-            denied_syscall_record_for_scope(&line, &mut scope, Instant::now())
-        {
+        if let Some((audit_pid, nr)) = syscall_record_for_scope(&line, &mut scope, Instant::now()) {
             let name = super::seccomp_generate::syscall_number_to_name(nr).unwrap_or("unknown");
             warn!(
                 syscall = nr,
@@ -603,12 +633,12 @@ fn deny_log_loop(pid: u32, cgroup_path: Option<PathBuf>, stop: &AtomicBool) -> R
     Ok(())
 }
 
-fn denied_syscall_record_for_scope(
+fn syscall_record_for_scope(
     line: &str,
-    scope: &mut SeccompDenyScope,
+    scope: &mut SeccompAuditScope,
     now: Instant,
 ) -> Option<(u32, i64)> {
-    if !line.contains("type=1326") {
+    if !line.split_whitespace().any(|field| field == "type=1326") {
         return None;
     }
     let pid = extract_audit_pid(line)?;
@@ -646,27 +676,29 @@ mod tests {
         std::fs::create_dir_all(&target_task).unwrap();
         std::fs::write(target_task.join("children"), "43\n").unwrap();
 
-        let mut scope = SeccompDenyScope::with_proc_root(42, temp.path().to_path_buf(), None, None);
+        let mut scope =
+            SeccompAuditScope::with_proc_root(42, temp.path().to_path_buf(), None, None);
         let line = "6,1234,5678,-;audit: type=1326 audit(123:456): auid=0 uid=0 gid=0 ses=1 pid=43 comm=\"probe\" exe=\"/bin/probe\" sig=31 arch=c000003e syscall=257 compat=0 ip=0x7f action=0x80000000";
 
         assert_eq!(
-            denied_syscall_record_for_scope(line, &mut scope, Instant::now()),
+            syscall_record_for_scope(line, &mut scope, Instant::now()),
             Some((43, 257))
         );
     }
 
     #[test]
-    fn test_deny_scope_rejects_unrelated_seccomp_pid() {
+    fn test_trace_scope_rejects_pid_prefix_and_parent_fields() {
         let temp = tempfile::tempdir().unwrap();
         let target_task = temp.path().join("42/task/42");
         std::fs::create_dir_all(&target_task).unwrap();
         std::fs::write(target_task.join("children"), "").unwrap();
 
-        let mut scope = SeccompDenyScope::with_proc_root(42, temp.path().to_path_buf(), None, None);
-        let line = "6,1234,5678,-;audit: type=1326 audit(123:456): auid=0 uid=0 gid=0 ses=1 pid=43 comm=\"other\" exe=\"/bin/other\" sig=31 arch=c000003e syscall=257 compat=0 ip=0x7f action=0x80000000";
+        let mut scope =
+            SeccompAuditScope::with_proc_root(42, temp.path().to_path_buf(), None, None);
+        let line = "6,1234,5678,-;audit: type=1326 audit(123:456): auid=0 uid=0 gid=0 ses=1 ppid=42 pid=423 comm=\"other\" exe=\"/bin/other\" sig=31 arch=c000003e syscall=257 compat=0 ip=0x7f action=0x80000000";
 
         assert_eq!(
-            denied_syscall_record_for_scope(line, &mut scope, Instant::now()),
+            syscall_record_for_scope(line, &mut scope, Instant::now()),
             None
         );
     }
@@ -682,7 +714,7 @@ mod tests {
         std::fs::write(proc_root.join("42/task/42/children"), "").unwrap();
         std::fs::write(cgroup_dir.join("cgroup.procs"), "43\n").unwrap();
 
-        let mut scope = SeccompDenyScope::with_proc_root(
+        let mut scope = SeccompAuditScope::with_proc_root(
             42,
             proc_root,
             Some(cgroup_dir),
@@ -691,7 +723,7 @@ mod tests {
         let line = "6,1234,5678,-;audit: type=1326 audit(123:456): auid=0 uid=0 gid=0 ses=1 pid=43 comm=\"probe\" exe=\"/bin/probe\" sig=31 arch=c000003e syscall=257 compat=0 ip=0x7f action=0x80000000";
 
         assert_eq!(
-            denied_syscall_record_for_scope(line, &mut scope, Instant::now()),
+            syscall_record_for_scope(line, &mut scope, Instant::now()),
             Some((43, 257))
         );
     }
@@ -744,7 +776,7 @@ mod tests {
         let source = include_str!("seccomp_trace.rs");
         let fn_body = extract_fn_body(source, "fn record_loop");
         assert!(
-            fn_body.contains("O_NONBLOCK"),
+            extract_fn_body(source, "fn start_scoped").contains("O_NONBLOCK"),
             "record_loop must use O_NONBLOCK for non-blocking reads on /dev/kmsg"
         );
         assert!(
@@ -764,6 +796,26 @@ mod tests {
     }
 
     #[test]
+    fn trace_file_is_private_and_never_follows_or_replaces_existing_paths() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("trace");
+        let output = create_trace_file(&path).unwrap();
+        assert_eq!(
+            output.metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(create_trace_file(&path).is_err());
+        let link = temp.path().join("link");
+        symlink(&path, &link).unwrap();
+        assert!(create_trace_file(&link).is_err());
+        let dir_link = temp.path().join("directory-link");
+        symlink(temp.path(), &dir_link).unwrap();
+        assert!(create_trace_file(&dir_link.join("unexpected")).is_err());
+        assert!(!temp.path().join("unexpected").exists());
+    }
+
+    #[test]
     fn test_trace_record_serialization() {
         let record = TraceRecord {
             syscall: 0,
@@ -774,5 +826,36 @@ mod tests {
         assert!(json.contains("\"syscall\":0"));
         assert!(json.contains("\"name\":\"read\""));
         assert!(json.contains("\"count\":42"));
+    }
+    #[test]
+    fn test_kmsg_ring_buffer_overrun_is_recoverable() {
+        // /dev/kmsg reports lost records via EPIPE and keeps its cursor
+        // advancing; the recorder must continue instead of aborting.
+        let epipe = std::io::Error::from_raw_os_error(libc::EPIPE);
+        assert!(kmsg_loss_is_recoverable(&epipe));
+        // Other errors stay fatal.
+        assert!(!kmsg_loss_is_recoverable(
+            &std::io::Error::from_raw_os_error(libc::EIO)
+        ));
+        assert!(!kmsg_loss_is_recoverable(
+            &std::io::Error::from_raw_os_error(libc::EBADF)
+        ));
+    }
+
+    #[test]
+    fn test_record_loop_survives_kmsg_overrun_before_writing_trace() {
+        // Structural regression: the EPIPE recovery must run inside the read
+        // loop (before write_trace_file), so an overrun can no longer discard
+        // the collected trace and leave the output file empty.
+        let source = include_str!("seccomp_trace.rs");
+        let fn_body = extract_fn_body(source, "fn record_loop");
+        let recoverable = fn_body.find("kmsg_loss_is_recoverable").unwrap();
+        let warn = fn_body.find("kernel log buffer overran").unwrap();
+        let fatal = fn_body.find("return Err(e.into())").unwrap();
+        let write = fn_body.find("write_trace_file(output").unwrap();
+        assert!(
+            recoverable < fatal && fatal < write && warn < fatal,
+            "overrun recovery must precede the fatal error path and the trace write"
+        );
     }
 }

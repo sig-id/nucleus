@@ -191,7 +191,7 @@ fn default_nat_backend() -> crate::network::NatBackend {
 }
 
 fn default_runtime() -> String {
-    "native".to_string()
+    "gvisor".to_string()
 }
 
 /// Dependency specification with optional health condition.
@@ -362,6 +362,11 @@ impl TopologyConfig {
 
         let mut ranges: Vec<(&str, crate::network::BridgeConfig, std::net::Ipv4Addr)> = Vec::new();
         for (name, network) in &self.networks {
+            if network.encrypted {
+                return Err(crate::error::NucleusError::ConfigError(format!(
+                    "Network {name} requests encryption, which is unsupported"
+                )));
+            }
             let bridge = crate::network::BridgeConfig {
                 subnet: network.subnet.clone(),
                 ..Default::default()
@@ -416,6 +421,12 @@ impl TopologyConfig {
                 }
             }
 
+            if !matches!(svc.runtime.as_str(), "native" | "gvisor") {
+                return Err(crate::error::NucleusError::ConfigError(format!(
+                    "Unknown runtime for service {name}: {}",
+                    svc.runtime
+                )));
+            }
             if svc.networks.len() > 1 {
                 return Err(crate::error::NucleusError::ConfigError(format!(
                     "Service {name} currently supports one network attachment"
@@ -624,7 +635,15 @@ condition = "healthy"
             vec!["api.example.com"]
         );
         assert_eq!(config.services["web"].egress_udp_ports, vec![53]);
-        assert!(config.validate().is_ok());
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("encryption"));
+        let config =
+            TopologyConfig::from_toml(&toml.replace("encrypted = true", "encrypted = false"))
+                .unwrap();
+        config.validate().unwrap();
     }
 
     #[test]

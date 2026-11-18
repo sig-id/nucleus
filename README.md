@@ -878,7 +878,10 @@ in
       seccompLogDenied = true;
       requireKernelLockdown = "integrity";
 
-      # Networking
+      # This service uses native policies and configures a host bridge.
+      privilegedSupervisor = true;
+      runtime = "native";
+      trustLevel = "trusted";
       network = "bridge";
       natBackend = "auto";  # or "userspace" to force slirp4netns
       dns = [ "10.0.0.1" ];  # internal resolver – no public DNS default
@@ -925,11 +928,8 @@ in
         }
       ];
 
-      # Environment
-      environment = {
-        RUST_LOG = "info";
-        CONFIG_PATH = "/etc/sigid/proxy.toml";
-      };
+      # Provision a private JSON object of environment variables at runtime.
+      environmentFile = "/run/secrets/proxy-env.json";
 
       # systemd integration
       sdNotify = true;  # Type=notify, passes NOTIFY_SOCKET into container
@@ -982,8 +982,12 @@ For each enabled container, the module creates a systemd service:
 - **Restart**: `on-failure` with 5s backoff
 - **Logging**: stdout/stderr captured to journald with `SyslogIdentifier=nucleus-<name>`
 - **Command**: `nucleus run --service-mode production ...` with all configured options
-- **Workload identity**: Nucleus itself starts as root for setup, then drops the container workload to the configured `user` / `group` before exec
-- **Hardening**: `ProtectSystem=strict`, `ProtectHome=true` at the systemd level (defense-in-depth)
+- Each supervisor runs under a per-unit dynamic user by default. Set `privilegedSupervisor = true` for operations requiring host privileges. The workload identity is configured separately through `user` and `group`.
+- Containers default to untrusted gVisor workloads with networking disabled. Both unit types bound capabilities, filter system calls, restrict namespaces and use a delegated cgroup subtree. State is under `/run/<unit-name>/state`.
+
+When upgrading, move inline NixOS `environment` values into a private runtime JSON file and set `environmentFile`. Supply secret and credential sources as quoted absolute host paths. Replace `extraArgs` with typed module options. For writable topology volumes, add their host directories to `writablePaths`. Use a quoted runtime `configFile` path for topology TOML containing sensitive values and grant the supervisor read access.
+
+Compose records topology ownership at launch. Before the first reconcile after upgrading, stop legacy containers by ID if their names conflict with the desired services. Topology services default to gVisor. Set `runtime = "native"` explicitly for trusted services that require native features such as exec health checks or filtered bridge networking. Encrypted topology networks are currently rejected during validation.
 
 ### Building a Rootfs
 
@@ -1240,7 +1244,7 @@ Events include a container start record and a final summary record. The records 
 - Native attach, exec probes, and TCP readiness probes reuse the seccomp program recorded at launch and join the configured workload cgroup. Recreate containers launched by older versions before using these helpers. Timed probe descendants share a private process group until cleanup. Calls to `setsid` and `setpgid` from these probes return `EPERM` when the workload filter permits the call.
 - `--seccomp-profile-sha256 <hex>` verifies the profile's SHA-256 hash before loading.
 - `--seccomp-mode trace|enforce` switches between trace (record all syscalls) and enforce (default).
-- `--seccomp-log <path>` writes NDJSON syscall trace when in trace mode.
+- `--seccomp-log <path>` creates a new private NDJSON trace file. Use a fresh path with no symlink components. Kernel audit delivery and descendant discovery are best effort, especially for short-lived processes.
 - Capability policy files in all service modes reject dangerous capabilities, including `NET_ADMIN`, `SYS_RESOURCE` and `MKNOD`.
 - `--caps-policy <path>` loads a TOML capability policy (replaces default drop-all).
 - `--caps-policy-sha256 <hex>` verifies the capability policy hash.

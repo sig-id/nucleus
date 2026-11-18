@@ -57,6 +57,7 @@ enum PathAccessMode {
 #[derive(Debug, Clone)]
 pub struct LandlockManager {
     applied: bool,
+    partially_applied: bool,
     /// Additional paths to grant read+write access to (e.g. volume mounts).
     extra_paths: Vec<(String, PathAccessMode)>,
     /// Access policy for the first-class `/workspace` path.
@@ -67,6 +68,7 @@ impl LandlockManager {
     pub fn new() -> Self {
         Self {
             applied: false,
+            partially_applied: false,
             extra_paths: Vec::new(),
             workspace_access: PathAccessMode::ReadWrite,
         }
@@ -153,6 +155,7 @@ impl LandlockManager {
     /// logged and execution continues.
     pub fn apply_container_policy_with_mode(&mut self, best_effort: bool) -> Result<bool> {
         self.apply_with_handoff(best_effort, None, &LandlockTcp::default())
+            .map(|status| status != RulesetStatus::NotEnforced)
     }
 
     pub(crate) fn apply_with_handoff(
@@ -160,10 +163,14 @@ impl LandlockManager {
         best_effort: bool,
         handoff: Option<&std::os::unix::net::UnixStream>,
         tcp: &LandlockTcp,
-    ) -> Result<bool> {
+    ) -> Result<RulesetStatus> {
         if self.applied {
             debug!("Landlock policy already applied, skipping");
-            return Ok(true);
+            return Ok(if self.partially_applied {
+                RulesetStatus::PartiallyEnforced
+            } else {
+                RulesetStatus::FullyEnforced
+            });
         }
 
         info!("Applying Landlock filesystem policy");
@@ -173,15 +180,16 @@ impl LandlockManager {
                 RulesetStatus::FullyEnforced => {
                     self.applied = true;
                     info!("Landlock policy fully enforced");
-                    Ok(true)
+                    Ok(status)
                 }
                 RulesetStatus::PartiallyEnforced => {
                     if best_effort {
+                        self.partially_applied = true;
                         self.applied = true;
                         info!(
                             "Landlock policy partially enforced (kernel lacks some access rights)"
                         );
-                        Ok(true)
+                        Ok(status)
                     } else {
                         Err(NucleusError::LandlockError(
                             "Landlock policy only partially enforced; strict mode requires full target ABI support".to_string(),
@@ -191,7 +199,7 @@ impl LandlockManager {
                 RulesetStatus::NotEnforced => {
                     if best_effort {
                         warn!("Landlock not enforced (kernel does not support Landlock)");
-                        Ok(false)
+                        Ok(RulesetStatus::NotEnforced)
                     } else {
                         Err(NucleusError::LandlockError(
                             "Landlock not enforced (kernel does not support Landlock)".to_string(),
@@ -205,7 +213,7 @@ impl LandlockManager {
                         "Failed to apply Landlock policy: {} (continuing without Landlock)",
                         e
                     );
-                    Ok(false)
+                    Ok(RulesetStatus::NotEnforced)
                 } else {
                     Err(e)
                 }
@@ -245,6 +253,7 @@ impl LandlockManager {
                 RulesetStatus::PartiallyEnforced => {
                     if best_effort {
                         self.applied = true;
+                        self.partially_applied = true;
                         info!("Landlock execute allowlist partially enforced");
                         Ok(true)
                     } else {

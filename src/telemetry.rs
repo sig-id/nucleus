@@ -322,6 +322,7 @@ pub struct WorkspaceMountEvent {
 #[derive(Debug, Clone, Serialize)]
 pub struct SecurityEventMetadata {
     pub seccomp_mode: String,
+    pub seccomp_status: String,
     pub landlock_status: String,
     pub capabilities_status: String,
     pub rootless: bool,
@@ -341,7 +342,28 @@ pub struct GpuEventSummary {
     pub relaxed_seccomp_ioctl: bool,
 }
 
+/// Sent by the native setup child after the kernel policy calls complete.
+#[derive(serde::Deserialize, Serialize)]
+pub(crate) struct NativeSecurityOutcome {
+    pub landlock: String,
+    pub capabilities: String,
+    pub seccomp_applied: bool,
+}
+
 impl SecurityEventMetadata {
+    pub(crate) fn record_native_outcome(&mut self, outcome: Option<&NativeSecurityOutcome>) {
+        if let Some(outcome) = outcome {
+            self.landlock_status.clone_from(&outcome.landlock);
+            self.capabilities_status.clone_from(&outcome.capabilities);
+            self.seccomp_status = if outcome.seccomp_applied {
+                "installed"
+            } else {
+                "not_enforced"
+            }
+            .into();
+        }
+    }
+
     fn from_config(config: &ContainerConfig) -> Self {
         let gpu = config.gpu.as_ref().map(|g| GpuEventSummary {
             vendor: format!("{:?}", g.vendor).to_lowercase(),
@@ -350,10 +372,16 @@ impl SecurityEventMetadata {
             bind_driver_libraries: g.bind_driver_libraries,
             relaxed_seccomp_ioctl: true,
         });
+        let unobserved = if config.use_gvisor {
+            "managed_by_gvisor"
+        } else {
+            "unknown"
+        };
         Self {
             seccomp_mode: seccomp_mode_label(config),
-            landlock_status: landlock_status_label(config),
-            capabilities_status: capabilities_status_label(config),
+            landlock_status: unobserved.into(),
+            capabilities_status: unobserved.into(),
+            seccomp_status: unobserved.into(),
             rootless: config.user_ns_config.is_some(),
             allow_degraded_security: config.allow_degraded_security,
             gpu,
@@ -423,26 +451,6 @@ fn seccomp_mode_label(config: &ContainerConfig) -> String {
     }
 }
 
-fn landlock_status_label(config: &ContainerConfig) -> String {
-    if config.use_gvisor {
-        "managed_by_gvisor".to_string()
-    } else if config.landlock_policy.is_some() {
-        "policy_file".to_string()
-    } else {
-        "default_policy".to_string()
-    }
-}
-
-fn capabilities_status_label(config: &ContainerConfig) -> String {
-    if config.use_gvisor {
-        "managed_by_gvisor".to_string()
-    } else if config.caps_policy.is_some() {
-        "policy_file".to_string()
-    } else {
-        "drop_all".to_string()
-    }
-}
-
 fn now_unix_ms() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -487,6 +495,15 @@ mod tests {
             1234,
             Some("/sys/fs/cgroup/nucleus-demo".to_string()),
         );
+        let mut security = event.security.clone();
+        security.record_native_outcome(Some(&NativeSecurityOutcome {
+            landlock: "partially_enforced".into(),
+            capabilities: "policy_applied".into(),
+            seccomp_applied: false,
+        }));
+        assert_eq!(security.seccomp_status, "not_enforced");
+        assert_eq!(security.landlock_status, "partially_enforced");
+        assert_eq!(security.capabilities_status, "policy_applied");
         let value = serde_json::to_value(event).unwrap();
 
         assert_eq!(value["type"], "container_started");
@@ -504,8 +521,8 @@ mod tests {
         assert_eq!(value["container"]["workspace_mount"]["mode"], "bind-ro");
         assert_eq!(value["container"]["workspace_mount"]["allow_execute"], true);
         assert_eq!(value["security"]["seccomp_mode"], "enforce");
-        assert_eq!(value["security"]["landlock_status"], "default_policy");
-        assert_eq!(value["security"]["capabilities_status"], "drop_all");
+        assert_eq!(value["security"]["landlock_status"], "unknown");
+        assert_eq!(value["security"]["capabilities_status"], "unknown");
         assert!(value.get("resource_limits").is_some());
     }
 }

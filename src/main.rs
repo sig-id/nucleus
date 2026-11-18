@@ -25,7 +25,8 @@ use nucleus::network::{
 use nucleus::resources::{IoDeviceLimit, ResourceLimits, ResourceStats};
 use nucleus::security::GVisorPlatform;
 use nucleus::topology::{
-    execute_reconcile, plan_reconcile, DependencyGraph, ReconcileAction, TopologyConfig,
+    execute_reconcile, plan_reconcile, running_topology_services, DependencyGraph, ReconcileAction,
+    TopologyConfig,
 };
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
@@ -731,6 +732,7 @@ const RUN_CONFIG_PATH_CONFLICTS: &[&str] = &[
     "disable_cgroup_namespace",
     "hooks",
     "topology_config_hash",
+    "topology_name",
     "command",
 ];
 
@@ -827,6 +829,7 @@ const RUN_CONFIG_FD_CONFLICTS: &[&str] = &[
     "disable_cgroup_namespace",
     "hooks",
     "topology_config_hash",
+    "topology_name",
     "gpu",
     "gpu_device",
     "gpu_driver_capabilities",
@@ -1230,6 +1233,8 @@ enum Commands {
         /// Internal: topology config hash for reconciliation diffing
         #[arg(long = "topology-config-hash", hide = true)]
         topology_config_hash: Option<u64>,
+        #[arg(long, hide = true)]
+        topology_name: Option<String>,
 
         /// Expose host GPU(s) to the container (auto/nvidia/amd/intel/all).
         ///
@@ -1587,6 +1592,7 @@ struct RunConfig {
     disable_cgroup_namespace: bool,
     hooks: Option<String>,
     topology_config_hash: Option<u64>,
+    topology_name: Option<String>,
     gpu: Option<GpuVendor>,
     gpu_device: Vec<String>,
     gpu_driver_capabilities: Option<String>,
@@ -1688,6 +1694,7 @@ impl Default for RunConfig {
             disable_cgroup_namespace: false,
             hooks: None,
             topology_config_hash: None,
+            topology_name: None,
             gpu: None,
             gpu_device: Vec::new(),
             gpu_driver_capabilities: None,
@@ -2262,6 +2269,7 @@ fn try_main() -> Result<i32> {
             disable_cgroup_namespace,
             hooks,
             topology_config_hash,
+            topology_name,
             gpu,
             gpu_device,
             gpu_driver_capabilities,
@@ -2378,6 +2386,7 @@ fn try_main() -> Result<i32> {
                     disable_cgroup_namespace,
                     hooks,
                     topology_config_hash,
+                    topology_name,
                     gpu,
                     gpu_device,
                     gpu_driver_capabilities,
@@ -2584,6 +2593,7 @@ fn try_main() -> Result<i32> {
                 disable_cgroup_namespace,
                 hooks,
                 topology_config_hash,
+                topology_name,
                 gpu,
                 gpu_device,
                 gpu_driver_capabilities,
@@ -2713,6 +2723,7 @@ fn try_main() -> Result<i32> {
                 config = config.with_required_kernel_lockdown(mode);
             }
 
+            config.topology_name = topology_name;
             if let Some(hash) = topology_config_hash {
                 config = config.with_config_hash(hash);
             }
@@ -3234,6 +3245,7 @@ fn try_main() -> Result<i32> {
                 let config = TopologyConfig::from_file(&PathBuf::from(&file))?;
                 config.validate()?;
                 let state_mgr = ContainerStateManager::new_with_root(state_root.clone())?;
+                let _lock = state_mgr.lock_reconciliation()?;
                 let plan = plan_reconcile(&config, &state_mgr)?;
 
                 println!("Bringing up topology '{}'...", config.name);
@@ -3246,16 +3258,16 @@ fn try_main() -> Result<i32> {
                 let config = TopologyConfig::from_file(&PathBuf::from(&file))?;
                 config.validate()?;
                 let state_mgr = ContainerStateManager::new_with_root(state_root.clone())?;
+                let _lock = state_mgr.lock_reconciliation()?;
                 let graph = DependencyGraph::resolve(&config)?;
 
                 println!("Tearing down topology '{}'...", config.name);
+                let running = running_topology_services(&config, &state_mgr)?;
                 for service_name in graph.shutdown_order() {
                     let container_name = format!("{}-{}", config.name, service_name);
-                    if let Ok(state) = state_mgr.resolve_container(&container_name) {
-                        if state.is_running() {
-                            println!("Stopping {}...", container_name);
-                            ContainerLifecycle::stop(&state, timeout)?;
-                        }
+                    if let Some(state) = running.get(&service_name) {
+                        println!("Stopping {}...", container_name);
+                        ContainerLifecycle::stop(state, timeout)?;
                     }
                 }
                 println!("Topology '{}' is down", config.name);
@@ -3271,10 +3283,21 @@ fn try_main() -> Result<i32> {
                     "SERVICE", "STATUS", "PID", "COMMAND"
                 );
 
+                let running = running_topology_services(&config, &state_mgr)?;
+                let states = state_mgr.list_states()?;
                 for service_name in config.services.keys() {
-                    let container_name = format!("{}-{}", config.name, service_name);
-                    match state_mgr.resolve_container(&container_name) {
-                        Ok(state) => {
+                    let name = format!("{}-{service_name}", config.name);
+                    let state = running.get(service_name).or_else(|| {
+                        states
+                            .iter()
+                            .filter(|state| {
+                                state.name == name
+                                    && state.topology_name.as_ref() == Some(&config.name)
+                            })
+                            .max_by_key(|state| state.started_at)
+                    });
+                    match state {
+                        Some(state) => {
                             let status = if state.is_running() {
                                 state.status.to_string()
                             } else {
@@ -3291,7 +3314,7 @@ fn try_main() -> Result<i32> {
                                 service_name, status, state.pid, cmd_display
                             );
                         }
-                        Err(_) => {
+                        None => {
                             println!(
                                 "{:<25} {:<10} {:<10} {:<30}",
                                 service_name, "Not found", "-", "-"
@@ -3500,6 +3523,7 @@ mod tests {
             disable_cgroup_namespace: true,
             hooks: Some("/tmp/hooks.json".to_string()),
             topology_config_hash: Some(42),
+            topology_name: None,
             gpu: None,
             gpu_device: Vec::new(),
             gpu_driver_capabilities: None,
@@ -3621,6 +3645,7 @@ mod tests {
             disable_cgroup_namespace: false,
             hooks: None,
             topology_config_hash: None,
+            topology_name: None,
             gpu: None,
             gpu_device: Vec::new(),
             gpu_driver_capabilities: None,

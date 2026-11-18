@@ -122,7 +122,7 @@ impl NativeLandlock {
         best_effort: bool,
         handoff: &std::os::unix::net::UnixStream,
         config: &crate::container::ContainerConfig,
-    ) -> Result<bool> {
+    ) -> Result<RulesetStatus> {
         let best_effort =
             best_effort && config.namespaces.net && !matches!(config.network, NetworkMode::Host);
         if !best_effort {
@@ -177,6 +177,7 @@ impl LandlockPolicy {
     /// false if not enforced (kernel too old).
     pub fn apply(&self, best_effort: bool) -> Result<bool> {
         self.apply_with_handoff(best_effort, None, &self.tcp, false)
+            .map(|status| status != RulesetStatus::NotEnforced)
     }
 
     fn apply_with_handoff(
@@ -185,7 +186,7 @@ impl LandlockPolicy {
         handoff: Option<&std::os::unix::net::UnixStream>,
         tcp: &LandlockTcp,
         production: bool,
-    ) -> Result<bool> {
+    ) -> Result<RulesetStatus> {
         if !(1..=TARGET_ABI as u8).contains(&self.min_abi) {
             return Err(NucleusError::ConfigError(format!(
                 "Invalid minimum Landlock ABI {}",
@@ -207,6 +208,7 @@ impl LandlockPolicy {
         let mounts = production
             .then(|| std::fs::read_to_string(proc_dir.join("mountinfo")))
             .transpose()?;
+        let mut skipped_rule = false;
         for rule in &self.rules {
             let flags = parse_access_flags(&rule.access)?;
             match PathFd::new(&rule.path) {
@@ -250,6 +252,7 @@ impl LandlockPolicy {
                 }
                 Err(e) => {
                     if best_effort {
+                        skipped_rule = true;
                         warn!(
                             "Skipping Landlock rule for {:?} (path not accessible: {})",
                             rule.path, e
@@ -266,17 +269,18 @@ impl LandlockPolicy {
 
         let status = super::landlock_handoff::restrict_and_publish(ruleset, handoff)?;
         match status.ruleset {
+            RulesetStatus::FullyEnforced if skipped_rule => Ok(RulesetStatus::PartiallyEnforced),
             RulesetStatus::FullyEnforced => {
                 info!(
                     "Landlock custom policy fully enforced ({} rules)",
                     self.rules.len()
                 );
-                Ok(true)
+                Ok(status.ruleset)
             }
             RulesetStatus::PartiallyEnforced => {
                 if best_effort {
                     info!("Landlock custom policy partially enforced");
-                    Ok(true)
+                    Ok(status.ruleset)
                 } else {
                     Err(NucleusError::LandlockError(
                         "Landlock custom policy only partially enforced; strict mode requires full target ABI support".to_string(),
@@ -286,7 +290,7 @@ impl LandlockPolicy {
             RulesetStatus::NotEnforced => {
                 if best_effort {
                     warn!("Landlock custom policy not enforced (kernel unsupported)");
-                    Ok(false)
+                    Ok(status.ruleset)
                 } else {
                     Err(NucleusError::LandlockError(
                         "Landlock custom policy not enforced (kernel unsupported) \

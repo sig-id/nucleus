@@ -93,6 +93,10 @@ pub struct ContainerState {
     #[serde(default)]
     pub config_hash: Option<u64>,
 
+    /// Owning topology, recorded by compose at launch.
+    #[serde(default)]
+    pub topology_name: Option<String>,
+
     /// UID of the user who created this container
     #[serde(default)]
     pub creator_uid: u32,
@@ -202,6 +206,7 @@ impl ContainerState {
             landlock_socket: None,
             gpu_device_filter: None,
             config_hash: None,
+            topology_name: None,
             creator_uid: nix::unistd::Uid::effective().as_raw(),
             process_uid: params.process_uid,
             process_gid: params.process_gid,
@@ -256,23 +261,28 @@ impl ContainerState {
     /// Cross-checks PID start time to detect PID reuse after process exit.
     /// Also returns false if the OCI status is `Stopped`.
     pub fn is_running(&self) -> bool {
+        self.check_running().unwrap_or(false)
+    }
+
+    pub(crate) fn check_running(&self) -> Result<bool> {
         if self.status == OciStatus::Stopped {
-            return false;
+            return Ok(false);
         }
-        let stat_path = format!("/proc/{}/stat", self.pid);
-        match std::fs::read_to_string(&stat_path) {
-            Ok(content) => {
-                if self.start_ticks == 0 {
-                    // PID existence alone is insufficient because the PID may have
-                    // been recycled since this state was recorded.
-                    return false;
-                }
-                Self::parse_start_ticks(&content)
-                    .map(|ticks| ticks == self.start_ticks)
-                    .unwrap_or(false)
-            }
-            Err(_) => false,
-        }
+        let path = format!("/proc/{}/stat", self.pid);
+        let content = match fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e.into()),
+        };
+        let ticks = Self::parse_start_ticks(&content)
+            .filter(|_| self.start_ticks != 0)
+            .ok_or_else(|| {
+                NucleusError::ConfigError(format!(
+                    "Cannot verify process identity for container {}",
+                    self.id
+                ))
+            })?;
+        Ok(ticks == self.start_ticks)
     }
 
     /// Return OCI runtime state as a JSON value
@@ -709,8 +719,19 @@ impl ContainerStateManager {
         Ok(())
     }
 
+    /// Serialize compose mutations across topologies sharing a container-name namespace.
+    pub fn lock_reconciliation(&self) -> Result<std::fs::File> {
+        let directory = std::fs::File::open(&self.state_dir)?;
+        directory.lock()?;
+        Ok(directory)
+    }
+
     /// List all container states
     pub fn list_states(&self) -> Result<Vec<ContainerState>> {
+        self.read_states(false)
+    }
+
+    pub(crate) fn read_states(&self, strict: bool) -> Result<Vec<ContainerState>> {
         let mut states = Vec::new();
 
         let entries = fs::read_dir(&self.state_dir).map_err(|e| {
@@ -730,16 +751,18 @@ impl ContainerStateManager {
                 // Use O_NOFOLLOW to prevent symlink attacks, consistent with
                 // load_state/save_state. Without this, a symlink in the state
                 // directory could be used as a file-read oracle.
-                match Self::read_file_nofollow(&path) {
-                    Ok(json) => match serde_json::from_str::<ContainerState>(&json) {
-                        Ok(state) => states.push(state),
-                        Err(e) => {
-                            warn!("Failed to parse state file {:?}: {}", path, e);
-                        }
-                    },
-                    Err(e) => {
-                        warn!("Failed to read state file {:?}: {}", path, e);
+                let result = Self::read_file_nofollow(&path).and_then(|json| {
+                    serde_json::from_str::<ContainerState>(&json).map_err(std::io::Error::other)
+                });
+                match result {
+                    Ok(state) => states.push(state),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) if strict => {
+                        return Err(NucleusError::ConfigError(format!(
+                            "Cannot reconcile with unreadable state {path:?}: {e}"
+                        )))
                     }
+                    Err(e) => warn!("Failed to read state file {path:?}: {e}"),
                 }
             }
         }
