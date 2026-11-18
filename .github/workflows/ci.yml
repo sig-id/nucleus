@@ -73,11 +73,11 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: sudo
         run: cargo test --locked --test integration_filesystem tests::root_agent_bind_mount_uses_unprivileged_host_ids -- --ignored --exact
 
-      - name: Verify native procfs descriptor confinement
+      - name: Verify native procfs self resolution and noexec /tmp
         env:
           RUSTC_WRAPPER: ""
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: sudo
-        run: cargo test --locked --test integration_filesystem tests::native_procfs_exposes_status_but_refuses_descriptor_links -- --ignored --exact
+        run: cargo test --locked --test integration_filesystem tests::native_procfs_self_resolves_and_tmp_stays_non_executable -- --ignored --exact
 
       - name: Verify GPU device ownership as root
         env:

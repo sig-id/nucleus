@@ -1,5 +1,6 @@
 use crate::error::{NucleusError, Result};
 use std::fs;
+use std::os::fd::OwnedFd;
 use std::os::unix::fs::{symlink, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use tracing::{debug, warn};
@@ -101,22 +102,29 @@ pub(crate) fn pin_workspace_source(source: &Path) -> Result<std::os::fd::OwnedFd
 }
 
 /// Copy a host workspace into a private staging directory.
+///
+/// The host source is pinned with an `O_PATH` descriptor and every child is
+/// opened relative to that pin (`openat` + `O_NOFOLLOW`), so a concurrent
+/// writer on the host cannot swap a name between the metadata check and the
+/// copy: the copied bytes always come from the pinned inode.
 pub fn copy_workspace_in(source: &Path, staging: &Path) -> Result<()> {
     let pinned = pin_workspace_source(source)?;
-    let source = super::fd_path(&pinned);
     fs::create_dir_all(staging).map_err(|e| {
         NucleusError::FilesystemError(format!(
             "Failed to create workspace staging directory {:?}: {}",
             staging, e
         ))
     })?;
-    copy_tree_contents(&source, staging)
+    copy_tree_contents(&pinned, staging, 0)
 }
 
 /// Mirror the staged workspace back to the host source after workload exit.
+///
+/// The host destination is pinned; directory creation, file publication and
+/// stale-entry removal all operate relative to pinned directory descriptors,
+/// never on re-resolved host paths.
 pub fn sync_workspace_out(staging: &Path, destination: &Path) -> Result<()> {
     let pinned = pin_workspace_source(destination)?;
-    let destination = super::fd_path(&pinned);
     if !staging.is_dir() {
         return Err(NucleusError::FilesystemError(format!(
             "Workspace staging path is not a directory: {}",
@@ -124,51 +132,307 @@ pub fn sync_workspace_out(staging: &Path, destination: &Path) -> Result<()> {
         )));
     }
 
-    remove_stale_entries(staging, &destination, 0)?;
-    copy_tree_contents(staging, &destination)
+    remove_stale_entries(staging, &pinned, 0)?;
+    sync_tree_to_fd(staging, &pinned, 0)
 }
 
-fn copy_tree_contents(source: &Path, destination: &Path) -> Result<()> {
-    for entry in read_workspace_entries(source, 0)? {
-        let (src_path, name, metadata) = entry;
-        copy_entry(&src_path, &destination.join(name), &metadata, 1)?;
+/// List the entry names of a pinned directory, depth-limited.
+fn workspace_entry_names(
+    dir: &std::os::fd::OwnedFd,
+    depth: u32,
+) -> Result<Vec<std::ffi::OsString>> {
+    if depth > MAX_WORKSPACE_DEPTH {
+        return Err(NucleusError::FilesystemError(format!(
+            "Maximum workspace directory depth ({}) exceeded",
+            MAX_WORKSPACE_DEPTH
+        )));
+    }
+    let mut names = Vec::new();
+    for entry in fs::read_dir(super::fd_path(dir)).map_err(|e| {
+        NucleusError::FilesystemError(format!("Failed to read pinned workspace directory: {}", e))
+    })? {
+        names.push(
+            entry
+                .map_err(|e| {
+                    NucleusError::FilesystemError(format!("Failed to read workspace entry: {}", e))
+                })?
+                .file_name(),
+        );
+    }
+    Ok(names)
+}
+
+/// Copy the pinned source directory into `destination` (a trusted staging
+/// path). Children are pinned one by one; symlinks are recreated, special
+/// files are skipped and set-id bits are stripped.
+fn copy_tree_contents(source: &OwnedFd, destination: &Path, depth: u32) -> Result<()> {
+    for name in workspace_entry_names(source, depth)? {
+        let child = super::pinned_child(source, &name)?;
+        let kind = super::pinned_kind(&child)?;
+        let dst = destination.join(&name);
+        if kind == nix::sys::stat::SFlag::S_IFDIR {
+            prepare_staging_dir(&dst)?;
+            copy_tree_contents(&child, &dst, depth + 1)?;
+            let mode = nix::sys::stat::fstat(&child)?.st_mode;
+            fs::set_permissions(&dst, fs::Permissions::from_mode(mode & 0o1777)).map_err(|e| {
+                NucleusError::FilesystemError(format!(
+                    "Failed to set permissions on workspace directory {:?}: {}",
+                    dst, e
+                ))
+            })?;
+        } else if kind == nix::sys::stat::SFlag::S_IFREG {
+            copy_pinned_file(&child, &dst)?;
+        } else if kind == nix::sys::stat::SFlag::S_IFLNK {
+            // Read the link target relative to the pinned parent, then
+            // recreate it; the copy never follows the host-side link.
+            let target =
+                nix::fcntl::readlinkat(source, std::path::Path::new(&name)).map_err(|e| {
+                    NucleusError::FilesystemError(format!(
+                        "Failed to read workspace symlink {:?}: {}",
+                        name, e
+                    ))
+                })?;
+            remove_existing_path(&dst)?;
+            symlink(&target, &dst).map_err(|e| {
+                NucleusError::FilesystemError(format!(
+                    "Failed to create workspace symlink {:?} -> {:?}: {}",
+                    dst, target, e
+                ))
+            })?;
+        } else {
+            debug!("Skipping special workspace file {:?}", name);
+        }
     }
     Ok(())
 }
 
-fn read_workspace_entries(
-    dir: &Path,
-    depth: u32,
-) -> Result<Vec<(PathBuf, std::ffi::OsString, fs::Metadata)>> {
-    if depth > MAX_WORKSPACE_DEPTH {
+/// Ensure the staging path is a real directory, replacing anything else.
+fn prepare_staging_dir(dst: &Path) -> Result<()> {
+    match fs::symlink_metadata(dst) {
+        Ok(existing) if existing.is_dir() && !existing.file_type().is_symlink() => {}
+        Ok(_) => remove_existing_path(dst)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(NucleusError::FilesystemError(format!(
+                "Failed to stat workspace destination {:?}: {}",
+                dst, e
+            )))
+        }
+    }
+    fs::create_dir_all(dst).map_err(|e| {
+        NucleusError::FilesystemError(format!(
+            "Failed to create workspace directory {:?}: {}",
+            dst, e
+        ))
+    })
+}
+
+/// Stream a pinned regular file into a fresh private inode next to `dst`,
+/// then publish it under the sanitized mode.
+fn copy_pinned_file(src: &OwnedFd, dst: &Path) -> Result<()> {
+    // Re-open the pin (not the mutable name) for reading. Opening the
+    // procfs descriptor link resolves exactly the pinned inode, and the
+    // kernel refuses to re-open a pin whose original open disallowed it;
+    // O_NOFOLLOW is deliberately absent because the procfs link itself is a
+    // symlink.
+    let mut from = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(super::fd_path(src))?;
+    let metadata = from.metadata()?;
+    if !metadata.is_file() {
         return Err(NucleusError::FilesystemError(format!(
-            "Maximum workspace directory depth ({}) exceeded at {:?}",
-            MAX_WORKSPACE_DEPTH, dir
+            "Workspace entry is no longer a regular file: {:?}",
+            super::fd_path(src)
         )));
     }
+    stream_file(&mut from, metadata.permissions().mode(), dst)
+}
 
-    let entries = fs::read_dir(dir).map_err(|e| {
-        NucleusError::FilesystemError(format!("Failed to read workspace dir {:?}: {}", dir, e))
-    })?;
-
-    let mut result = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|e| {
-            NucleusError::FilesystemError(format!(
-                "Failed to read workspace entry in {:?}: {}",
-                dir, e
-            ))
-        })?;
-        let src_path = entry.path();
-        let metadata = fs::symlink_metadata(&src_path).map_err(|e| {
-            NucleusError::FilesystemError(format!(
-                "Failed to stat workspace entry {:?}: {}",
-                src_path, e
-            ))
-        })?;
-        result.push((src_path, entry.file_name(), metadata));
+fn stream_file(from: &mut fs::File, raw_mode: u32, dst: &Path) -> Result<()> {
+    let mut file =
+        tempfile::NamedTempFile::new_in(dst.parent().expect("workspace entry has a parent"))?;
+    std::io::copy(from, &mut file)?;
+    file.as_file()
+        .set_permissions(fs::Permissions::from_mode(raw_mode & 0o1777))?;
+    if fs::symlink_metadata(dst).is_ok_and(|existing| existing.is_dir()) {
+        fs::remove_dir_all(dst)?;
     }
-    Ok(result)
+    file.persist(dst).map_err(|e| e.error)?;
+    Ok(())
+}
+
+/// Mirror the trusted staging tree into the pinned host destination.
+fn sync_tree_to_fd(source: &Path, destination: &OwnedFd, depth: u32) -> Result<()> {
+    if depth > MAX_WORKSPACE_DEPTH {
+        return Err(NucleusError::FilesystemError(format!(
+            "Maximum workspace directory depth ({}) exceeded",
+            MAX_WORKSPACE_DEPTH
+        )));
+    }
+    for entry in fs::read_dir(source).map_err(|e| {
+        NucleusError::FilesystemError(format!(
+            "Failed to read workspace staging directory {:?}: {}",
+            source, e
+        ))
+    })? {
+        let entry =
+            entry.map_err(|e| NucleusError::FilesystemError(format!("Workspace stage: {e}")))?;
+        let name = entry.file_name();
+        let metadata = fs::symlink_metadata(entry.path()).map_err(|e| {
+            NucleusError::FilesystemError(format!("Failed to stat staged entry: {e}"))
+        })?;
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            let dst_dir = ensure_destination_dir(destination, &name)?;
+            sync_tree_to_fd(&entry.path(), &dst_dir, depth + 1)?;
+            fs::set_permissions(
+                super::fd_path(&dst_dir),
+                fs::Permissions::from_mode(metadata.permissions().mode() & 0o1777),
+            )
+            .map_err(|e| {
+                NucleusError::FilesystemError(format!(
+                    "Failed to set permissions on workspace directory: {}",
+                    e
+                ))
+            })?;
+        } else if metadata.is_file() {
+            let mut from = fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(entry.path())?;
+            publish_file(&mut from, metadata.permissions().mode(), destination, &name)?;
+        } else if metadata.file_type().is_symlink() {
+            let target = fs::read_link(entry.path()).map_err(|e| {
+                NucleusError::FilesystemError(format!(
+                    "Failed to read staged symlink {:?}: {}",
+                    entry.path(),
+                    e
+                ))
+            })?;
+            clear_destination_entry(destination, &name)?;
+            nix::unistd::symlinkat(&target, destination, Path::new(&name)).map_err(|e| {
+                NucleusError::FilesystemError(format!(
+                    "Failed to create workspace symlink {:?} -> {:?}: {}",
+                    name, target, e
+                ))
+            })?;
+        } else {
+            debug!("Skipping special staged workspace file {:?}", name);
+        }
+    }
+    Ok(())
+}
+
+/// Create (or reuse a real) directory `name` under the pinned destination.
+///
+/// A non-directory occupying the name is removed first; a symlink is never
+/// followed, so the copy cannot be redirected through a swapped link.
+fn ensure_destination_dir(parent: &OwnedFd, name: &std::ffi::OsStr) -> Result<OwnedFd> {
+    let mkdir = || {
+        // nix 0.32 does not wrap mkdirat; call it directly. Both arguments
+        // are an integer and a path relative to the pinned parent.
+        let c_name = match std::ffi::CString::new(name.as_encoded_bytes()) {
+            Ok(c_name) => c_name,
+            Err(e) => {
+                return Err(std::io::Error::other(format!(
+                    "Invalid workspace name: {e}"
+                )))
+            }
+        };
+        let result = unsafe {
+            libc::mkdirat(
+                std::os::fd::AsRawFd::as_raw_fd(parent),
+                c_name.as_ptr(),
+                0o700,
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    };
+    match mkdir() {
+        Ok(()) => super::pinned_child(parent, name),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let existing = super::pinned_child(parent, name)?;
+            if super::pinned_kind(&existing)? == nix::sys::stat::SFlag::S_IFDIR {
+                return Ok(existing);
+            }
+            remove_pinned_entry(parent, name)?;
+            mkdir().map_err(|e| {
+                NucleusError::FilesystemError(format!("Failed to create workspace directory: {e}"))
+            })?;
+            super::pinned_child(parent, name)
+        }
+        Err(e) => Err(NucleusError::FilesystemError(format!(
+            "Failed to create workspace directory: {e}"
+        ))),
+    }
+}
+
+/// Publish a file under `name` in the pinned destination directory.
+///
+/// The content streams into a private temporary inode inside the pinned
+/// directory and is renamed into place; a directory occupying the name is
+/// removed through its own pin, never by re-resolving the host path.
+fn publish_file(
+    from: &mut fs::File,
+    raw_mode: u32,
+    destination: &OwnedFd,
+    name: &std::ffi::OsStr,
+) -> Result<()> {
+    let dir_path = super::fd_path(destination);
+    let dst = dir_path.join(name);
+    let mut file = tempfile::NamedTempFile::new_in(&dir_path)?;
+    std::io::copy(from, &mut file)?;
+    file.as_file()
+        .set_permissions(fs::Permissions::from_mode(raw_mode & 0o1777))?;
+    if let Err(persist_error) = file.persist(&dst) {
+        // A directory at the destination blocks the rename; clear it through
+        // the pin and retry once. A vanished entry means nothing blocks the
+        // retry either.
+        clear_destination_entry(destination, name)?;
+        persist_error.file.persist(&dst).map_err(|e| e.error)?;
+    }
+    Ok(())
+}
+
+/// Remove `name` below the pinned `parent` if it exists, whatever it is.
+fn clear_destination_entry(parent: &OwnedFd, name: &std::ffi::OsStr) -> Result<()> {
+    match super::pinned_child(parent, name) {
+        Ok(_) => remove_pinned_entry(parent, name),
+        Err(e) if e.to_string().contains("No such file") => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Clear `name` below the pinned `parent` directory, whatever it is.
+fn remove_pinned_entry(parent: &OwnedFd, name: &std::ffi::OsStr) -> Result<()> {
+    let child = super::pinned_child(parent, name)?;
+    if super::pinned_kind(&child)? == nix::sys::stat::SFlag::S_IFDIR {
+        // remove_dir_all on the pin path deletes exactly the pinned tree;
+        // the implementation opens its own descriptors without following
+        // symlinks.
+        fs::remove_dir_all(super::fd_path(&child)).map_err(|e| {
+            NucleusError::FilesystemError(format!(
+                "Failed to remove workspace directory {:?}: {}",
+                name, e
+            ))
+        })
+    } else {
+        nix::unistd::unlinkat(
+            parent,
+            Path::new(name),
+            nix::unistd::UnlinkatFlags::NoRemoveDir,
+        )
+        .map_err(|e| {
+            NucleusError::FilesystemError(format!(
+                "Failed to remove workspace entry {:?}: {}",
+                name, e
+            ))
+        })
+    }
 }
 
 fn remove_existing_path(path: &Path) -> Result<()> {
@@ -195,132 +459,32 @@ fn remove_existing_path(path: &Path) -> Result<()> {
     }
 }
 
-fn copy_entry(src: &Path, dst: &Path, metadata: &fs::Metadata, depth: u32) -> Result<()> {
-    if metadata.is_dir() && !metadata.file_type().is_symlink() {
-        match fs::symlink_metadata(dst) {
-            Ok(existing) if existing.is_dir() && !existing.file_type().is_symlink() => {}
-            Ok(_) => remove_existing_path(dst)?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                return Err(NucleusError::FilesystemError(format!(
-                    "Failed to stat workspace destination {:?}: {}",
-                    dst, e
-                )))
-            }
-        }
-        fs::create_dir_all(dst).map_err(|e| {
-            NucleusError::FilesystemError(format!(
-                "Failed to create workspace directory {:?}: {}",
-                dst, e
-            ))
-        })?;
-        for entry in read_workspace_entries(src, depth)? {
-            let (child_src, name, child_metadata) = entry;
-            copy_entry(&child_src, &dst.join(name), &child_metadata, depth + 1)?;
-        }
-        fs::set_permissions(
-            dst,
-            fs::Permissions::from_mode(metadata.permissions().mode() & 0o1777),
-        )
-        .map_err(|e| {
-            NucleusError::FilesystemError(format!(
-                "Failed to set permissions on workspace directory {:?}: {}",
-                dst, e
-            ))
-        })?;
-    } else if metadata.is_file() {
-        // fs::copy also copies permission bits. Stream only the contents into
-        // a fresh private inode, then publish it with the sanitized mode.
-        let mut from = fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(src)?;
-        let metadata = from.metadata()?;
-        if !metadata.is_file() {
-            return Err(NucleusError::FilesystemError(format!(
-                "Workspace entry is no longer a regular file: {src:?}"
-            )));
-        }
-        let mut file =
-            tempfile::NamedTempFile::new_in(dst.parent().expect("workspace entry has a parent"))?;
-        std::io::copy(&mut from, &mut file)?;
-        file.as_file().set_permissions(fs::Permissions::from_mode(
-            metadata.permissions().mode() & 0o1777,
-        ))?;
-        if fs::symlink_metadata(dst).is_ok_and(|existing| existing.is_dir()) {
-            fs::remove_dir_all(dst)?;
-        }
-        file.persist(dst).map_err(|e| e.error)?;
-    } else if metadata.file_type().is_symlink() {
-        let target = fs::read_link(src).map_err(|e| {
-            NucleusError::FilesystemError(format!(
-                "Failed to read workspace symlink {:?}: {}",
-                src, e
-            ))
-        })?;
-        remove_existing_path(dst)?;
-        symlink(&target, dst).map_err(|e| {
-            NucleusError::FilesystemError(format!(
-                "Failed to create workspace symlink {:?} -> {:?}: {}",
-                dst, target, e
-            ))
-        })?;
-    } else {
-        debug!("Skipping special workspace file {:?}", src);
-    }
-
-    Ok(())
-}
-
-fn remove_stale_entries(source: &Path, destination: &Path, depth: u32) -> Result<()> {
+/// Remove host destination entries that no longer exist in staging.
+///
+/// The destination walk is anchored on pinned directory descriptors, so a
+/// concurrent host writer cannot redirect a removal through a swapped
+/// symlink; the staging side is trusted and read by path.
+fn remove_stale_entries(source: &Path, destination: &OwnedFd, depth: u32) -> Result<()> {
     if depth > MAX_WORKSPACE_DEPTH {
         return Err(NucleusError::FilesystemError(format!(
-            "Maximum workspace directory depth ({}) exceeded at {:?}",
-            MAX_WORKSPACE_DEPTH, destination
+            "Maximum workspace directory depth ({}) exceeded",
+            MAX_WORKSPACE_DEPTH
         )));
     }
 
-    let entries = fs::read_dir(destination).map_err(|e| {
-        NucleusError::FilesystemError(format!(
-            "Failed to read workspace destination {:?}: {}",
-            destination, e
-        ))
-    })?;
-
-    for entry in entries {
-        let entry = entry.map_err(|e| {
-            NucleusError::FilesystemError(format!(
-                "Failed to read workspace destination entry in {:?}: {}",
-                destination, e
-            ))
-        })?;
-        let name = entry.file_name();
-        let dst_path = entry.path();
+    for name in workspace_entry_names(destination, depth)? {
         let src_path = source.join(&name);
-        if fs::symlink_metadata(&src_path).is_err() {
-            warn!("Removing workspace path absent from stage: {:?}", dst_path);
-            remove_existing_path(&dst_path)?;
+        let Ok(src_meta) = fs::symlink_metadata(&src_path) else {
+            warn!("Removing workspace path absent from stage: {:?}", name);
+            remove_pinned_entry(destination, &name)?;
             continue;
-        }
+        };
 
-        let src_meta = fs::symlink_metadata(&src_path).map_err(|e| {
-            NucleusError::FilesystemError(format!(
-                "Failed to stat staged workspace path {:?}: {}",
-                src_path, e
-            ))
-        })?;
-        let dst_meta = fs::symlink_metadata(&dst_path).map_err(|e| {
-            NucleusError::FilesystemError(format!(
-                "Failed to stat destination workspace path {:?}: {}",
-                dst_path, e
-            ))
-        })?;
-        if src_meta.is_dir()
-            && !src_meta.file_type().is_symlink()
-            && dst_meta.is_dir()
-            && !dst_meta.file_type().is_symlink()
-        {
-            remove_stale_entries(&src_path, &dst_path, depth + 1)?;
+        if src_meta.is_dir() && !src_meta.file_type().is_symlink() {
+            let child = super::pinned_child(destination, &name)?;
+            if super::pinned_kind(&child)? == nix::sys::stat::SFlag::S_IFDIR {
+                remove_stale_entries(&src_path, &child, depth + 1)?;
+            }
         }
     }
 

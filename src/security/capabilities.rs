@@ -235,7 +235,9 @@ struct ProcessCaps {
 
 impl ProcessCaps {
     fn verify_workload(&self) -> Result<()> {
-        let forbidden = cap_mask(super::caps_policy::DANGEROUS_CAPABILITIES);
+        // Same allowlist the TOML policy enforces: nothing outside it may
+        // remain in any set when control is handed to the workload.
+        let allowed = cap_mask(crate::security::caps_policy::ALLOWED_CAPABILITIES);
         for (name, value) in [
             ("bounding", self.bounding),
             ("permitted", self.permitted),
@@ -243,10 +245,10 @@ impl ProcessCaps {
             ("inheritable", self.inheritable),
             ("ambient", self.ambient),
         ] {
-            if value & forbidden != 0 {
+            if value & !allowed != 0 {
                 return Err(NucleusError::CapabilityError(format!(
-                    "Forbidden capabilities {:#x} remain in {name}",
-                    value & forbidden
+                    "Capabilities {:#x} outside the workload allowlist remain in {name}",
+                    value & !allowed
                 )));
             }
         }
@@ -384,6 +386,36 @@ mod tests {
             },
         ] {
             assert!(caps.verify_workload().is_err());
+        }
+    }
+
+    #[test]
+    fn audit_accepts_only_allowlisted_bits() {
+        let allowed = cap_mask(crate::security::caps_policy::ALLOWED_CAPABILITIES);
+        // Every allowlisted capability may remain after a policy is applied...
+        assert!(ProcessCaps {
+            effective: allowed,
+            bounding: allowed,
+            ..Default::default()
+        }
+        .verify_workload()
+        .is_ok());
+        // ...and anything else, including caps the old denylist used to
+        // permit (CHOWN, SETFCAP, SYS_TIME), is rejected.
+        for cap in [
+            Capability::CAP_CHOWN,
+            Capability::CAP_SETFCAP,
+            Capability::CAP_SYS_TIME,
+        ] {
+            assert!(
+                ProcessCaps {
+                    effective: cap.bitmask(),
+                    ..Default::default()
+                }
+                .verify_workload()
+                .is_err(),
+                "{cap:?} must not be retainable"
+            );
         }
     }
 

@@ -261,8 +261,29 @@ impl Container {
                 self.config.context_mode,
                 crate::filesystem::ContextMode::BindMount
             ) {
-                ContextPopulator::new(context_dir, "/context").validate_source_tree()?;
+                // Stage the context bind like every other host source: the
+                // directory is pinned, validated through the pin and bound
+                // from the staging area, so a concurrent writer cannot swap
+                // the source between validation and the runsc mount.
+                let offset = oci_config.mounts.len();
                 oci_config = oci_config.with_context_bind(context_dir);
+                stage_bind_sources(
+                    &artifact_dir,
+                    offset,
+                    &mut oci_config.mounts[offset..],
+                    |path| {
+                        let fd = nix::fcntl::open(
+                            path,
+                            nix::fcntl::OFlag::O_PATH
+                                | nix::fcntl::OFlag::O_DIRECTORY
+                                | nix::fcntl::OFlag::O_NOFOLLOW
+                                | nix::fcntl::OFlag::O_CLOEXEC,
+                            nix::sys::stat::Mode::empty(),
+                        )?;
+                        ContextPopulator::validate_pinned_tree(&fd)?;
+                        Ok(fd)
+                    },
+                )?;
             }
         }
 

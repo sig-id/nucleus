@@ -331,11 +331,9 @@ impl SeccompManager {
 
     fn network_mode_syscalls(allow_network: bool) -> Vec<i64> {
         if allow_network {
+            // sendto/recvfrom/sendmsg/recvmsg are argument-filtered above
+            // (MSG_OOB denial), not unconditionally allowed.
             vec![
-                libc::SYS_sendto,
-                libc::SYS_recvfrom,
-                libc::SYS_sendmsg,
-                libc::SYS_recvmsg,
                 libc::SYS_shutdown,
                 libc::SYS_bind,
                 libc::SYS_listen,
@@ -451,15 +449,47 @@ impl SeccompManager {
                     }
                 }
             }
-            // Deny attaching a TCP upper-layer protocol to an existing socket.
-            // Option numbers at other levels have independent meanings.
-            rules.insert(
-                libc::SYS_setsockopt,
-                vec![
-                    Self::int_rule(&[(1, Ne, libc::IPPROTO_TCP)])?,
-                    Self::int_rule(&[(2, Ne, libc::TCP_ULP)])?,
-                ],
-            );
+            // Socket options are allowed only at well-known levels. Every
+            // other level (IPPROTO_RAW, SOL_NETLINK, SOL_ALG, SOL_XFRM, ...)
+            // reaches subsystems a confined workload never needs. Option
+            // numbers are level-relative, so the protocol-attachment options
+            // are denied per level: TCP_ULP loads upper-layer protocol
+            // modules, and UDP_ENCAP routes datagrams into the xfrm
+            // ESP-in-UDP input path (the Dirty Frag / Fragnesia bug class).
+            // ICMPv6 is deliberately absent: its options are only reachable
+            // through raw ICMPv6 sockets, which the socket() filter denies.
+            let mut setsockopt_rules = Vec::new();
+            for level in [libc::SOL_SOCKET, libc::IPPROTO_IP, libc::IPPROTO_IPV6] {
+                setsockopt_rules.push(Self::int_rule(&[(1, Eq, level)])?);
+            }
+            for (level, option) in [
+                (libc::IPPROTO_TCP, libc::TCP_ULP),
+                (libc::IPPROTO_UDP, libc::UDP_ENCAP),
+            ] {
+                setsockopt_rules.push(Self::int_rule(&[(1, Eq, level), (2, Ne, option)])?);
+            }
+            rules.insert(libc::SYS_setsockopt, setsockopt_rules);
+
+            // Out-of-band data stays denied: MSG_OOB reaches TCP urgent-data
+            // handling and, on AF_UNIX, the same descriptor-heavy paths as
+            // ordinary data. It is filtered on the flags argument; passing
+            // descriptors with SCM_RIGHTS on AF_UNIX is not seccomp-filterable
+            // and remains an accepted residual risk.
+            for (nr, flags_arg) in [
+                (libc::SYS_sendto, 3),
+                (libc::SYS_recvfrom, 3),
+                (libc::SYS_sendmsg, 2),
+                (libc::SYS_recvmsg, 2),
+            ] {
+                rules.insert(
+                    nr,
+                    vec![Self::int_rule(&[(
+                        flags_arg,
+                        MaskedEq(libc::MSG_OOB as u64),
+                        0,
+                    )])?],
+                );
+            }
         }
         rules.insert(libc::SYS_socket, socket_rules);
 
@@ -1137,12 +1167,20 @@ impl SeccompManager {
         "preadv2",
         "prctl",
         "pwritev2",
+        "recvfrom",
+        "recvmsg",
+        "sendmsg",
+        "sendto",
         "setsockopt",
         "socket",
         "socketpair",
     ];
 
     const KCMP_FILE: i32 = 0;
+
+    /// Argument-filtered syscalls that are only available in network modes.
+    const NETWORK_ARG_FILTERED_SYSCALLS: &'static [&'static str] =
+        &["setsockopt", "sendto", "recvfrom", "sendmsg", "recvmsg"];
 
     /// Argument-filtered syscalls that are absent unless explicitly requested.
     fn opt_in_arg_filtered() -> Vec<String> {
@@ -1152,7 +1190,8 @@ impl SeccompManager {
     }
 
     fn arg_filtered_in_mode(name: &str, allow_network: bool) -> bool {
-        Self::ARG_FILTERED_SYSCALLS.contains(&name) && (allow_network || name != "setsockopt")
+        Self::ARG_FILTERED_SYSCALLS.contains(&name)
+            && (allow_network || !Self::NETWORK_ARG_FILTERED_SYSCALLS.contains(&name))
     }
 
     /// Security-critical syscalls that must not be re-enabled by the
@@ -1178,9 +1217,9 @@ impl SeccompManager {
         "clock_adjtime",
         "adjtimex",
         "settimeofday",
-        // Namespace entry and mount attribute changes can clear the procfs
-        // nosymfollow flag, which the kernel does not lock across user
-        // namespaces.
+        // Namespace entry and mount attribute changes can weaken the mount
+        // hardening (nosuid/nodev/noexec, read-only) verified at setup, which
+        // the kernel does not lock across user namespaces.
         "unshare",
         "setns",
         "mount_setattr",
@@ -2080,7 +2119,7 @@ mod tests {
         #[cfg(not(target_arch = "x86_64"))]
         const FULL_COUNT_OFFLINE: usize = 179;
         assert_eq!(base.len(), BASE_COUNT);
-        assert_eq!(net.len(), 9);
+        assert_eq!(net.len(), 5);
         assert_eq!(
             SeccompManager::minimal_filter(false, &[]).unwrap().len(),
             FULL_COUNT_OFFLINE

@@ -70,7 +70,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires host root, native namespaces and mount privileges"]
-    fn native_procfs_exposes_status_but_refuses_descriptor_links() {
+    fn native_procfs_self_resolves_and_tmp_stays_non_executable() {
         let state = TempDir::new().unwrap();
         let output = std::process::Command::new(env!("CARGO_BIN_EXE_nucleus"))
             .args(["create", "--root"])
@@ -88,14 +88,34 @@ mod tests {
                 "--",
                 "/bin/sh",
                 "-ec",
-                r#"exec 3</dev/null
+                r#"
+                   # /proc/self and its magic links resolve again (regression
+                   # for the mount-wide nosymfollow flag that used to break
+                   # them with ELOOP).
                    test -r "/proc/$$/status"
-                   test -L "/proc/$$/fd/3"
-                   test ! -r "/proc/$$/fd/3"
-                   test ! -r /proc/self/fd/3
-                   exec 4</bin/sh
-                   if "/proc/$$/fd/4" -c true 2>/dev/null; then exit 1; fi
-                   /bin/sh -ec 'test -r "/proc/$$/status" && test ! -r "/proc/$$/fd/3"'"#,
+                   test -r /proc/self/status
+                   test -r /proc/self/maps
+                   head -c 1 /proc/self/exe > /dev/null
+                   exec 3</dev/null
+                   test -r /proc/self/fd/3
+
+                   # /tmp is mounted noexec: neither direct execution nor
+                   # execution through a descriptor link may succeed, which
+                   # also keeps file-backed W^X mappings out of /tmp.
+                   mountinfo="$(cat /proc/self/mountinfo)"
+                   echo "$mountinfo" | grep -F ' /tmp ' | grep -qw noexec
+                   cp /bin/sh /tmp/payload
+                   chmod 0755 /tmp/payload
+                   if /tmp/payload -c true 2>/dev/null; then
+                     echo 'direct execution from /tmp succeeded' >&2
+                     exit 90
+                   fi
+                   exec 4</tmp/payload
+                   if /bin/sh -c '/proc/self/fd/4 -c true' 2>/dev/null; then
+                     echo 'execution through a descriptor link succeeded' >&2
+                     exit 91
+                   fi
+                   /bin/sh -ec 'test -r "/proc/$$/status" && test -r /proc/self/fd/3'"#,
             ])
             .output()
             .unwrap();

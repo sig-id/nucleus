@@ -1012,6 +1012,89 @@ mod tests {
     }
 
     #[test]
+    fn setsockopt_level_allowlist_and_msg_oob_survive_compilation() {
+        use crate::security::SeccompManager;
+        let action = |prog: &BpfProgram, nr: i64, args: [u64; 6]| {
+            bpf_eval(
+                prog,
+                &make_seccomp_data(
+                    nr as u32,
+                    arch_audit_value(std::env::consts::ARCH.try_into().unwrap()),
+                    args,
+                ),
+            )
+        };
+        let network = SeccompManager::compile_builtin(true, &[], false).unwrap();
+        let setsockopt = |level: i64, option: i64| {
+            action(
+                &network,
+                libc::SYS_setsockopt,
+                [0, level as u64, option as u64, 0, 0, 0],
+            )
+        };
+        // Well-known socket-option levels stay available.
+        for level in [
+            libc::SOL_SOCKET,
+            libc::IPPROTO_IP,
+            libc::IPPROTO_TCP,
+            libc::IPPROTO_UDP,
+            libc::IPPROTO_IPV6,
+        ] {
+            assert_eq!(setsockopt(level as i64, 1), RET_ALLOW);
+        }
+        // Unknown levels reach unrelated subsystems and stay denied. ICMPv6
+        // options are only reachable through raw ICMPv6 sockets, which the
+        // socket() filter denies in the first place.
+        for level in [
+            libc::SOL_NETLINK,
+            libc::SOL_ALG,
+            libc::IPPROTO_RAW,
+            libc::IPPROTO_UDPLITE,
+            libc::SOL_XDP,
+            libc::IPPROTO_ICMPV6,
+        ] {
+            assert_eq!(setsockopt(level as i64, 1), RET_KILL);
+        }
+        // Protocol-attachment options are denied even at allowed levels:
+        // TCP_ULP loads upper-layer protocols and UDP_ENCAP reaches the xfrm
+        // ESP-in-UDP input path.
+        assert_eq!(
+            setsockopt(libc::IPPROTO_TCP as i64, libc::TCP_ULP as i64),
+            RET_KILL
+        );
+        assert_eq!(
+            setsockopt(libc::IPPROTO_UDP as i64, libc::UDP_ENCAP as i64),
+            RET_KILL
+        );
+        assert_eq!(
+            setsockopt(libc::IPPROTO_TCP as i64, libc::TCP_NODELAY as i64),
+            RET_ALLOW
+        );
+
+        // Out-of-band data is denied on the flags argument of every
+        // send/recv entry point; ordinary flags keep working.
+        for (nr, flags_arg) in [
+            (libc::SYS_sendto, 3),
+            (libc::SYS_recvfrom, 3),
+            (libc::SYS_sendmsg, 2),
+            (libc::SYS_recvmsg, 2),
+        ] {
+            let mut args = [0u64; 6];
+            args[flags_arg] = (libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) as u64;
+            assert_eq!(action(&network, nr, args), RET_ALLOW);
+            args[flags_arg] = libc::MSG_OOB as u64;
+            assert_eq!(action(&network, nr, args), RET_KILL);
+            args[flags_arg] = (libc::MSG_OOB | libc::MSG_DONTWAIT) as u64;
+            assert_eq!(action(&network, nr, args), RET_KILL);
+        }
+
+        // Without network mode the filtered network syscalls stay denied.
+        let offline = SeccompManager::compile_builtin(false, &[], false).unwrap();
+        assert_eq!(action(&offline, libc::SYS_setsockopt, [0; 6]), RET_KILL);
+        assert_eq!(action(&offline, libc::SYS_sendto, [0; 6]), RET_KILL);
+    }
+
+    #[test]
     fn test_builtin_prctl_denies_pr_set_mm_before_capability_checks() {
         let rules = crate::security::SeccompManager::minimal_filter_for_test(true, &[]);
         let prog = compile_bitmap_bpf_with_errno_syscalls(
@@ -1229,9 +1312,12 @@ mod tests {
         )
         .unwrap();
 
-        // Keep the network-enabled filter compact as argument predicates evolve.
+        // Keep the network-enabled filter compact as argument predicates
+        // evolve. The setsockopt level allowlist and the MSG_OOB flag filters
+        // deliberately widened the linear section; the budget leaves room
+        // only for small, reviewed additions.
         assert!(
-            prog.len() < 450,
+            prog.len() < 520,
             "BPF program should be compact, got {} instructions",
             prog.len()
         );
