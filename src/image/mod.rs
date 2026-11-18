@@ -5,6 +5,7 @@ use crate::filesystem::{
     ROOTFS_ATTESTATION_FILE, ROOTFS_STORE_PATHS_FILE,
 };
 use crate::resources::Cgroup;
+use nix::fcntl::{open, openat, readlinkat, OFlag};
 use nix::sys::stat::{makedev, mknod, Mode, SFlag};
 use nix::unistd::Uid;
 use serde::{Deserialize, Serialize};
@@ -100,6 +101,15 @@ impl NucleusImageManifest {
                 "Unsupported image schema version {}",
                 self.schema_version
             )));
+        }
+        if self
+            .diff
+            .as_ref()
+            .is_some_and(|diff| diff.path != IMAGE_DIFF_DIR)
+        {
+            return Err(image_error(
+                "Image diff must use the image-local diff directory".into(),
+            ));
         }
         let expected = self.compute_image_id()?;
         if self.image_id != expected {
@@ -209,55 +219,102 @@ pub fn commit_container_image(
     Ok(manifest)
 }
 
-pub fn load_image(image_dir: &Path) -> Result<NucleusImageManifest> {
-    let sig_path = image_dir.join(IMAGE_SIGNATURE_FILE);
-    if sig_path.exists() {
-        verify_image_hmac(image_dir)?;
-    } else if !is_immediate_nix_store_object_path(image_dir) {
-        return Err(image_error(format!(
-            "Image signature {:?} is missing outside the Nix store",
-            sig_path
-        )));
+/// A private copy of a signed package ties verification and import to the
+/// same bytes. Immutable, base-only Nix image packages can be read in place.
+pub struct VerifiedImage {
+    pub manifest: NucleusImageManifest,
+    snapshot: Option<tempfile::TempDir>,
+}
+
+impl VerifiedImage {
+    pub fn open(image_dir: &Path) -> Result<Self> {
+        ensure_real_directory(image_dir, "image directory")?;
+        let signed = match fs::symlink_metadata(image_dir.join(IMAGE_SIGNATURE_FILE)) {
+            Ok(_) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => return Err(e.into()),
+        };
+        if signed {
+            let snapshot = tempfile::Builder::new()
+                .prefix("nucleus-image-")
+                .permissions(fs::Permissions::from_mode(0o700))
+                .tempdir()?;
+            if snapshot
+                .path()
+                .canonicalize()?
+                .starts_with(image_dir.canonicalize()?)
+            {
+                return Err(image_error(
+                    "Image includes the snapshot staging directory".into(),
+                ));
+            }
+            copy_image_tree(image_dir, snapshot.path(), None)?;
+            verify_image_hmac(snapshot.path())?;
+            let manifest = NucleusImageManifest::load(snapshot.path())?;
+            return Ok(Self {
+                manifest,
+                snapshot: Some(snapshot),
+            });
+        }
+        if !is_immediate_nix_store_object_path(image_dir)
+            || fs::canonicalize(image_dir)? != image_dir
+        {
+            return Err(image_error(
+                "Image signature is missing outside the Nix store".into(),
+            ));
+        }
+        let manifest = NucleusImageManifest::load(image_dir)?;
+        if manifest.diff.is_some() {
+            return Err(image_error(
+                "Images with a writable layer require an image signature".into(),
+            ));
+        }
+        Ok(Self {
+            manifest,
+            snapshot: None,
+        })
     }
-    NucleusImageManifest::load(image_dir)
+
+    pub fn copy_diff_to_upper(&self, upperdir: &Path) -> Result<()> {
+        let Some(diff) = &self.manifest.diff else {
+            return Ok(());
+        };
+        let snapshot = self
+            .snapshot
+            .as_ref()
+            .ok_or_else(|| image_error("Missing signed image snapshot".into()))?;
+        let diff_dir = snapshot.path().join(IMAGE_DIFF_DIR);
+        ensure_real_directory(&diff_dir, "image diff directory")?;
+        ensure_real_directory(upperdir, "target overlay upperdir")?;
+        if fs::read_dir(upperdir)?.next().is_some() {
+            return Err(image_error(
+                "Image import requires an empty overlay upperdir".into(),
+            ));
+        }
+        let mut imported = LayerEntries::default();
+        copy_image_tree(&diff_dir, upperdir, Some(&mut imported))?;
+        replay_deleted_paths(upperdir, &diff.deleted_paths)
+    }
+}
+
+pub fn load_image(image_dir: &Path) -> Result<NucleusImageManifest> {
+    Ok(VerifiedImage::open(image_dir)?.manifest)
 }
 
 pub fn copy_image_diff_to_upper(image_dir: &Path, upperdir: &Path) -> Result<()> {
-    let manifest = load_image(image_dir)?;
-    let Some(diff) = manifest.diff else {
-        return Ok(());
-    };
-    let diff_dir = image_dir.join(diff.path);
-    ensure_real_directory(&diff_dir, "image diff directory")?;
-    ensure_real_directory(upperdir, "target overlay upperdir")?;
-    copy_tree(
-        &diff_dir,
-        &diff_dir,
-        upperdir,
-        &mut BTreeMap::new(),
-        &mut Vec::new(),
-    )?;
-    replay_deleted_paths(upperdir, &diff.deleted_paths)?;
-    Ok(())
+    VerifiedImage::open(image_dir)?.copy_diff_to_upper(upperdir)
 }
 
 fn replay_deleted_paths(upperdir: &Path, deleted_paths: &[String]) -> Result<()> {
     for deleted in deleted_paths {
-        let dest = upperdir.join(validate_manifest_relative_path(deleted)?);
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent).map_err(|e| {
-                image_error(format!(
-                    "Failed to create whiteout parent {:?}: {}",
-                    parent, e
-                ))
-            })?;
-        }
-        if dest.exists() {
-            return Err(image_error(format!(
-                "Cannot replay deletion whiteout over existing path {:?}",
-                dest
-            )));
-        }
+        let relative = validate_manifest_relative_path(deleted)?;
+        let parent = crate::filesystem::mount_target(
+            upperdir,
+            relative.parent().expect("validated relative entry"),
+            true,
+        )?;
+        let dest = crate::filesystem::fd_path(&parent)
+            .join(relative.file_name().expect("validated relative entry"));
         mknod(
             &dest,
             SFlag::S_IFCHR,
@@ -275,98 +332,97 @@ fn replay_deleted_paths(upperdir: &Path, deleted_paths: &[String]) -> Result<()>
 }
 
 fn export_diff(upperdir: &Path, diff_dir: &Path) -> Result<ImageDiff> {
-    let mut manifest = BTreeMap::new();
-    let mut deleted_paths = Vec::new();
-    copy_tree(
-        upperdir,
-        upperdir,
-        diff_dir,
-        &mut manifest,
-        &mut deleted_paths,
-    )?;
-    let digest = digest_diff_manifest(&manifest, &deleted_paths)?;
+    let mut entries = LayerEntries::default();
+    copy_image_tree(upperdir, diff_dir, Some(&mut entries))?;
+    let digest = digest_diff_manifest(&entries.manifest, &entries.deleted_paths)?;
     Ok(ImageDiff {
         path: IMAGE_DIFF_DIR.to_string(),
-        manifest,
-        deleted_paths,
+        manifest: entries.manifest,
+        deleted_paths: entries.deleted_paths,
         digest,
     })
 }
 
-fn copy_tree(
-    root: &Path,
-    current: &Path,
-    dest_root: &Path,
-    manifest: &mut BTreeMap<String, String>,
-    deleted_paths: &mut Vec<String>,
-) -> Result<()> {
-    let mut entries = fs::read_dir(current)
-        .map_err(|e| {
-            image_error(format!(
-                "Failed to read diff directory {:?}: {}",
-                current, e
-            ))
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|e| image_error(format!("Failed to enumerate diff directory: {}", e)))?;
-    entries.sort_by_key(|entry| entry.file_name());
+#[derive(Default)]
+struct LayerEntries {
+    manifest: BTreeMap<String, String>,
+    deleted_paths: Vec<String>,
+}
 
+fn copy_image_tree(source: &Path, dest: &Path, layer: Option<&mut LayerEntries>) -> Result<()> {
+    let dir = open(
+        source,
+        OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )?;
+    copy_image_dir(&dir, Path::new(""), dest, layer)
+}
+
+fn copy_image_dir(
+    dir: &std::os::fd::OwnedFd,
+    prefix: &Path,
+    dest_root: &Path,
+    mut layer: Option<&mut LayerEntries>,
+) -> Result<()> {
+    let base = crate::filesystem::fd_path(dir);
+    let mut entries = fs::read_dir(&base)?.collect::<std::io::Result<Vec<_>>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
     for entry in entries {
-        let path = entry.path();
-        let rel = relative_path(root, &path)?;
-        if should_skip_runtime_diff_path(&rel) {
+        let name = entry.file_name();
+        let relative = prefix.join(&name);
+        let rel = path_to_string(&relative)?;
+        if layer.is_some() && should_skip_runtime_diff_path(&rel) {
             continue;
         }
-
-        let metadata = fs::symlink_metadata(&path)
-            .map_err(|e| image_error(format!("Failed to stat diff path {:?}: {}", path, e)))?;
-        let dest = dest_root.join(&rel);
+        // Hold every source inode across stat/read/copy. A running container
+        // can rename entries while an unfrozen image commit is in progress.
+        let fd = openat(
+            dir,
+            name.as_os_str(),
+            OFlag::O_PATH | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )?;
+        let source = crate::filesystem::fd_path(&fd);
+        let metadata = fs::metadata(&source)?;
+        let dest = dest_root.join(&relative);
         if metadata.file_type().is_symlink() {
-            let target = fs::read_link(&path)
-                .map_err(|e| image_error(format!("Failed to read symlink {:?}: {}", path, e)))?;
-            if let Some(parent) = dest.parent() {
-                fs::create_dir_all(parent).map_err(|e| {
-                    image_error(format!("Failed to create diff parent {:?}: {}", parent, e))
-                })?;
+            let target = readlinkat(&fd, "")?;
+            let target = Path::new(std::ffi::OsStr::from_bytes(target.as_bytes()));
+            std::os::unix::fs::symlink(target, &dest)?;
+            // l*xattr operations on a symlink use the pinned parent and never follow the leaf.
+            preserve_path_metadata(&entry.path(), &dest, &metadata, false)?;
+            if let Some(entries) = layer.as_deref_mut() {
+                entries
+                    .manifest
+                    .insert(rel, format!("symlink:{}", target.display()));
             }
-            std::os::unix::fs::symlink(&target, &dest).map_err(|e| {
-                image_error(format!(
-                    "Failed to copy symlink {:?} -> {:?}: {}",
-                    path, dest, e
-                ))
-            })?;
-            preserve_path_metadata(&path, &dest, &metadata, false)?;
-            manifest.insert(rel, format!("symlink:{}", target.display()));
         } else if metadata.is_dir() {
-            fs::create_dir_all(&dest).map_err(|e| {
-                image_error(format!("Failed to create diff directory {:?}: {}", dest, e))
-            })?;
-            copy_tree(root, &path, dest_root, manifest, deleted_paths)?;
-            preserve_path_metadata(&path, &dest, &metadata, true)?;
+            fs::create_dir(&dest)?;
+            copy_image_dir(&fd, &relative, dest_root, layer.as_deref_mut())?;
+            preserve_path_metadata(&source, &dest, &metadata, true)?;
         } else if metadata.is_file() {
-            if let Some(parent) = dest.parent() {
-                fs::create_dir_all(parent).map_err(|e| {
-                    image_error(format!("Failed to create diff parent {:?}: {}", parent, e))
-                })?;
+            let mut input = fs::File::open(&source)?;
+            let mut output = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .open(&dest)?;
+            std::io::copy(&mut input, &mut output)?;
+            if let Some(entries) = layer.as_deref_mut() {
+                entries.manifest.insert(rel, hash_file(&dest)?);
             }
-            fs::copy(&path, &dest).map_err(|e| {
-                image_error(format!(
-                    "Failed to copy diff file {:?} -> {:?}: {}",
-                    path, dest, e
-                ))
-            })?;
-            preserve_path_metadata(&path, &dest, &metadata, true)?;
-            manifest.insert(rel, hash_file(&path)?);
-        } else if metadata.file_type().is_char_device() && metadata.rdev() == 0 {
-            deleted_paths.push(rel);
+            preserve_path_metadata(&source, &dest, &metadata, true)?;
+        } else if let Some(entries) = layer
+            .as_deref_mut()
+            .filter(|_| metadata.file_type().is_char_device() && metadata.rdev() == 0)
+        {
+            entries.deleted_paths.push(rel);
         } else {
             return Err(image_error(format!(
-                "Image diff contains unsupported special file {:?}",
-                path
+                "Image contains unsupported special file {relative:?}"
             )));
         }
     }
-
     Ok(())
 }
 
@@ -657,13 +713,6 @@ fn first_component(path: &str) -> Option<&str> {
         .filter(|component| !component.is_empty())
 }
 
-fn relative_path(root: &Path, path: &Path) -> Result<String> {
-    let rel = path
-        .strip_prefix(root)
-        .map_err(|e| image_error(format!("Failed to compute relative diff path: {}", e)))?;
-    path_to_string(rel)
-}
-
 fn path_to_string(path: &Path) -> Result<String> {
     let mut parts = Vec::new();
     for component in path.components() {
@@ -900,10 +949,9 @@ fn verify_image_hmac(dir: &Path) -> Result<()> {
     let key = load_or_create_image_hmac_key()?;
     let actual = compute_image_hmac(dir, &key)?;
     if expected != actual {
-        return Err(image_error(format!(
-            "Image integrity verification failed: HMAC mismatch (expected {}, got {})",
-            expected, actual
-        )));
+        return Err(image_error(
+            "Image integrity verification failed: HMAC mismatch".into(),
+        ));
     }
     Ok(())
 }
@@ -1288,6 +1336,25 @@ mod tests {
     }
 
     #[test]
+    fn rejects_nonlocal_diff_even_with_a_matching_manifest_digest() {
+        let tmp = TempDir::new().unwrap();
+        let root = sample_rootfs(tmp.path());
+        let base = ImageBase::from_rootfs(&root).unwrap();
+        let cfg = ImageConfig::from_state(&sample_state(&root, tmp.path()));
+        for path in ["/outside", "../sibling", "diff/child"] {
+            let diff = ImageDiff {
+                path: path.into(),
+                digest: String::new(),
+                manifest: BTreeMap::new(),
+                deleted_paths: Vec::new(),
+            };
+            let manifest =
+                NucleusImageManifest::new(base.clone(), Some(diff), cfg.clone()).unwrap();
+            assert!(manifest.validate_identity().is_err());
+        }
+    }
+
+    #[test]
     fn test_manifest_detects_tampered_image_id() {
         let base = ImageBase {
             rootfs_path: "/nix/store/rootfs".to_string(),
@@ -1391,7 +1458,17 @@ mod tests {
             );
         }
 
-        let loaded = load_image(&image_dir).unwrap();
+        let verified = VerifiedImage::open(&image_dir).unwrap();
+        fs::write(
+            image_dir.join("diff/etc/config"),
+            "modified after verification",
+        )
+        .unwrap();
+        let imported = temp.path().join("imported");
+        fs::create_dir(&imported).unwrap();
+        verified.copy_diff_to_upper(&imported).unwrap();
+        assert_eq!(fs::read(imported.join("etc/config")).unwrap(), b"changed");
+        let loaded = verified.manifest;
         assert_eq!(loaded.image_id, manifest.image_id);
         assert!(loaded
             .diff

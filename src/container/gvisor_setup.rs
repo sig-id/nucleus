@@ -332,32 +332,8 @@ impl Container {
                     normalized, e
                 ))
             })?;
-            let target = rootfs.join(relative);
-            if mount.mount_type == "bind" && std::path::Path::new(&mount.source).is_file() {
-                if let Some(parent) = target.parent() {
-                    std::fs::create_dir_all(parent).map_err(|e| {
-                        NucleusError::FilesystemError(format!(
-                            "Failed to create OCI mount parent {:?}: {}",
-                            parent, e
-                        ))
-                    })?;
-                }
-                if !target.exists() {
-                    std::fs::File::create(&target).map_err(|e| {
-                        NucleusError::FilesystemError(format!(
-                            "Failed to create OCI mount target {:?}: {}",
-                            target, e
-                        ))
-                    })?;
-                }
-            } else {
-                std::fs::create_dir_all(&target).map_err(|e| {
-                    NucleusError::FilesystemError(format!(
-                        "Failed to create OCI mount target {:?}: {}",
-                        target, e
-                    ))
-                })?;
-            }
+            let file = mount.mount_type == "bind" && std::path::Path::new(&mount.source).is_file();
+            crate::filesystem::mount_target(rootfs, relative, !file)?;
         }
 
         Ok(())

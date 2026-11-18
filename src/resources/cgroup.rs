@@ -29,6 +29,7 @@ const CGROUP_FREEZE_SLEEP: Duration = Duration::from_millis(10);
 pub struct Cgroup {
     path: PathBuf,
     state: CgroupState,
+    cleanup_on_drop: bool,
 }
 
 /// RAII guard for a frozen cgroup v2 subtree.
@@ -62,7 +63,11 @@ impl Cgroup {
 
         Self::validate_cgroup_directory(&path)?;
 
-        Ok(Self { path, state })
+        Ok(Self {
+            path,
+            state,
+            cleanup_on_drop: true,
+        })
     }
 
     fn root_path() -> Result<PathBuf> {
@@ -583,6 +588,22 @@ impl Cgroup {
         install_device_allowlist(&self.path, &specs, best_effort)
     }
 
+    /// The registered, detached workload now owns this cgroup's lifetime.
+    pub(crate) fn leave_registered(mut self) {
+        self.cleanup_on_drop = false;
+    }
+
+    /// Open and validate the migration fd before forking the restore helper.
+    pub(crate) fn membership_file(&self) -> Result<fs::File> {
+        let path = self.path.join("cgroup.procs");
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&path)?;
+        Self::ensure_fd_on_cgroup2_fs(file.as_raw_fd(), &path)?;
+        Ok(file)
+    }
+
     /// Get cgroup path
     pub fn path(&self) -> &Path {
         &self.path
@@ -645,7 +666,7 @@ impl Drop for CgroupFreezeGuard {
 
 impl Drop for Cgroup {
     fn drop(&mut self) {
-        if !self.state.is_terminal() && self.path.exists() {
+        if self.cleanup_on_drop && !self.state.is_terminal() && self.path.exists() {
             let froze = self.set_frozen(true).unwrap_or(false);
             let _ = self.kill_all_processes();
             let _ = self.wait_until_empty();
@@ -763,6 +784,7 @@ mod tests {
         fs::write(&control_file, "old").unwrap();
 
         let cgroup = Cgroup {
+            cleanup_on_drop: true,
             path,
             state: CgroupState::Removed,
         };
@@ -780,6 +802,7 @@ mod tests {
         symlink(&target, path.join("memory.max")).unwrap();
 
         let cgroup = Cgroup {
+            cleanup_on_drop: true,
             path,
             state: CgroupState::Removed,
         };

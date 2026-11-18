@@ -1,14 +1,14 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 
 use clap::Parser;
-use nucleus::checkpoint::{CheckpointMetadata, CriuRuntime};
+use nucleus::checkpoint::CriuRuntime;
 use nucleus::container::{
     parse_signal, validate_container_name, validate_hostname, ConsoleSize, Container,
-    ContainerConfig, ContainerLifecycle, ContainerState, ContainerStateManager,
-    ContainerStateParams, GpuPassthroughConfig, GpuVendor, HealthCheck, KernelLockdownMode,
-    NetworkModeArg, OciStatus, ProcessIdentity, ProviderConfigMount, ReadinessProbe, RootfsMode,
-    RuntimeSelection, SeccompMode, SecretMount, ServiceMode, TrustLevel, UsernsModeArg, VolumeMount,
-    VolumeSource, WorkspaceConfig, WorkspaceMode, DEFAULT_HOME_PATH,
+    ContainerConfig, ContainerLifecycle, ContainerStateManager, GpuPassthroughConfig, GpuVendor,
+    HealthCheck, KernelLockdownMode, NetworkModeArg, OciStatus, ProcessIdentity,
+    ProviderConfigMount, ReadinessProbe, RootfsMode, RuntimeSelection, SeccompMode, SecretMount,
+    ServiceMode, TrustLevel, UsernsModeArg, VolumeMount, VolumeSource, WorkspaceConfig,
+    WorkspaceMode, DEFAULT_HOME_PATH,
 };
 use nucleus::error::{NucleusError, Result};
 use nucleus::filesystem::{
@@ -22,7 +22,7 @@ use nucleus::isolation::{ContainerAttach, NamespaceConfig};
 use nucleus::network::{
     BridgeConfig, CredentialBrokerConfig, EgressPolicy, NatBackend, NetworkMode, PortForward,
 };
-use nucleus::resources::{Cgroup, IoDeviceLimit, ResourceLimits, ResourceStats};
+use nucleus::resources::{IoDeviceLimit, ResourceLimits, ResourceStats};
 use nucleus::security::GVisorPlatform;
 use nucleus::topology::{
     execute_reconcile, plan_reconcile, DependencyGraph, ReconcileAction, TopologyConfig,
@@ -609,42 +609,6 @@ fn exit_code_from_i32(code: i32) -> ExitCode {
     u8::try_from(code)
         .map(ExitCode::from)
         .unwrap_or(ExitCode::FAILURE)
-}
-
-fn restore_checkpoint_cgroup(
-    container_id: &str,
-    pid: u32,
-    metadata: &CheckpointMetadata,
-) -> Result<(Option<String>, Option<u64>, Option<u64>)> {
-    let Some(resource_limits) = metadata.resource_limits.as_ref() else {
-        return Ok((None, None, None));
-    };
-
-    let cgroup_name = format!("nucleus-{}", container_id);
-    let mut cgroup = Cgroup::create(&cgroup_name).map_err(|e| {
-        NucleusError::CheckpointError(format!("Failed to recreate cgroup on restore: {}", e))
-    })?;
-    let limits = resource_limits.to_resource_limits();
-    if let Err(e) = cgroup.set_limits(&limits) {
-        let _ = cgroup.cleanup();
-        return Err(NucleusError::CheckpointError(format!(
-            "Failed to restore cgroup limits for restored container: {}",
-            e
-        )));
-    }
-    if let Err(e) = cgroup.attach_process(pid) {
-        let _ = cgroup.cleanup();
-        return Err(NucleusError::CheckpointError(format!(
-            "Failed to attach restored process {} to cgroup: {}",
-            pid, e
-        )));
-    }
-
-    Ok((
-        Some(cgroup.path().display().to_string()),
-        resource_limits.memory_bytes,
-        resource_limits.cpu_limit_millicores(),
-    ))
 }
 
 #[derive(Parser, Debug)]
@@ -2014,47 +1978,9 @@ fn try_main() -> Result<i32> {
         Commands::Restore { input } => {
             let mut criu = CriuRuntime::new()?;
             let input_path = PathBuf::from(&input);
-            let metadata = CheckpointMetadata::load(&input_path)?;
-            let pid = criu.restore(&input_path)?;
-
-            // Register restored container in state manager so state/stop/kill/attach work.
-            // Generate a NEW container ID to avoid overwriting the original state file
-            // (the original container may still be running with --leave-running).
-            let new_id = nucleus::container::generate_container_id()?;
-            let new_name = format!("{}-restored", metadata.container_name);
             let state_mgr = ContainerStateManager::new_with_root(state_root.clone())?;
-            let (cgroup_path, memory_limit, cpu_limit) =
-                match restore_checkpoint_cgroup(&new_id, pid, &metadata) {
-                    Ok(restored) => restored,
-                    Err(err) => {
-                        let _ = nix::sys::signal::kill(
-                            nix::unistd::Pid::from_raw(pid as i32),
-                            nix::sys::signal::Signal::SIGKILL,
-                        );
-                        return Err(err);
-                    }
-                };
-            let state = ContainerState::new(ContainerStateParams {
-                id: new_id.clone(),
-                name: new_name,
-                pid,
-                command: metadata.command,
-                memory_limit,
-                cpu_limit,
-                using_gvisor: metadata.using_gvisor,
-                rootless: metadata.rootless,
-                cgroup_path,
-                process_uid: 0,
-                process_gid: 0,
-                additional_gids: Vec::new(),
-            });
-            state_mgr.save_state(&state)?;
-            info!(
-                "Registered restored container {} (was {}, PID {})",
-                new_id, metadata.container_id, pid
-            );
-
-            println!("{}", new_id);
+            let restored = criu.restore_registered(&input_path, &state_mgr)?;
+            println!("{}", restored.id);
             Ok(0)
         }
 
@@ -2085,7 +2011,8 @@ fn try_main() -> Result<i32> {
                 let _image_key_env =
                     ScopedEnvVar::set_path(IMAGE_HMAC_KEY_ENV, image_key_file.as_deref());
                 let image_dir = PathBuf::from(&image);
-                let manifest = image::load_image(&image_dir)?;
+                let verified = image::VerifiedImage::open(&image_dir)?;
+                let manifest = &verified.manifest;
                 let command = if args.is_empty() {
                     manifest.config.command.clone()
                 } else {
@@ -2112,6 +2039,9 @@ fn try_main() -> Result<i32> {
                         gid: manifest.config.gid,
                         additional_gids: manifest.config.additional_gids.clone(),
                     });
+                // Manifest IDs describe identities inside the image, including
+                // nonzero service users. Never treat them as host credentials.
+                config.namespaces.user = true;
                 for (key, value) in manifest.config.env.clone() {
                     config = config.with_env(key, value);
                 }
@@ -2155,7 +2085,21 @@ fn try_main() -> Result<i32> {
                         workdir, e
                     ))
                 })?;
-                image::copy_image_diff_to_upper(&image_dir, &upperdir)?;
+                verified.copy_diff_to_upper(&upperdir)?;
+                drop(verified);
+                if nix::unistd::Uid::effective().is_root() {
+                    let mapping = nucleus::isolation::UserNamespaceConfig::root_remapped();
+                    // The state root is private. The setup process holds a cwd in
+                    // this parent and only needs search permission after remapping.
+                    std::fs::set_permissions(&overlay_dir, std::fs::Permissions::from_mode(0o711))?;
+                    for path in [&upperdir, &workdir] {
+                        nix::unistd::chown(
+                            path,
+                            Some(nix::unistd::Uid::from_raw(mapping.uid_mappings[0].host_id)),
+                            Some(nix::unistd::Gid::from_raw(mapping.gid_mappings[0].host_id)),
+                        )?;
+                    }
+                }
                 config = config.with_rootfs_overlay(upperdir, workdir);
 
                 println!("{}", config.id);
@@ -2928,9 +2872,6 @@ fn try_main() -> Result<i32> {
                     .with_allowed_tcp_ports(egress_tcp_ports)
                     .with_allowed_udp_ports(egress_udp_ports);
                 config = config.with_egress_policy(policy);
-            } else if service_mode == ServiceMode::Production && !gvisor_host_network {
-                // Default deny-all egress for production services
-                config = config.with_egress_policy(EgressPolicy::deny_all());
             }
 
             // Readiness probe (mutually exclusive options)

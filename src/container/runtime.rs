@@ -6,19 +6,18 @@ use crate::container::{
 use crate::error::{NucleusError, Result, StateTransition};
 use crate::filesystem::{
     audit_mounts, bind_mount_host_paths, bind_mount_rootfs, copy_workspace_in, create_dev_nodes,
-    create_minimal_fs, device_node_spec, mask_proc_paths, mount_gpu_passthrough, mount_home_tmpfs,
-    mount_procfs, mount_provider_configs, mount_secrets_inmemory, mount_volumes, mount_workspace,
-    overlay_mount_rootfs, resolve_gpu_devices, snapshot_context_dir, switch_root,
-    sync_workspace_out, validate_production_rootfs_path, verify_context_manifest,
-    verify_rootfs_attestation, DeviceNodeSpec, FilesystemState, GpuDeviceSet, LazyContextPopulator,
-    TmpfsMount,
+    create_minimal_fs, device_node_spec, mask_proc_paths, mount_gpu_passthrough, mount_home_tmpfs, mount_procfs,
+    mount_provider_configs, mount_secrets_inmemory, mount_volumes, mount_workspace,
+    open_overlay_dirs, overlay_mount_rootfs_pinned, resolve_gpu_devices, snapshot_context_dir,
+    switch_root, sync_workspace_out, validate_production_rootfs_path, verify_context_manifest,
+    verify_rootfs_attestation, DeviceNodeSpec, FilesystemState, GpuDeviceSet, LazyContextPopulator, TmpfsMount,
 };
 use crate::isolation::{NamespaceManager, UserNamespaceMapper};
 use crate::network::{BridgeDriver, BridgeNetwork, NatBackend, NetworkMode, UserspaceNetwork};
 use crate::resources::{Cgroup, ResourceStats};
 use crate::security::{
-    CapabilityManager, GVisorRuntime, LandlockManager, NativeSeccomp, OciContainerState, OciHooks,
-    SeccompDenyLogger, SeccompTraceReader, SecurityState,
+    CapabilityManager, GVisorRuntime, LandlockManager, NativeLandlock, NativeSeccomp,
+    OciContainerState, OciHooks, SeccompDenyLogger, SeccompTraceReader, SecurityState,
 };
 use crate::telemetry::{CleanupEvent, ContainerControlEvent, EventSink, ExitStatusEvent};
 use caps::{CapSet, Capability, CapsHashSet};
@@ -72,6 +71,7 @@ pub struct CreatedContainer {
     pub(super) deny_logger: Option<SeccompDenyLogger>,
     pub(super) exec_fifo_path: Option<PathBuf>,
     mapped_gvisor_base: Option<PathBuf>,
+    _landlock_handoff: Option<crate::security::landlock_handoff::LandlockHandoff>,
     pub(super) native_console_master: Option<OwnedFd>,
     pub(super) event_sink: Option<EventSink>,
     pub(super) _lifecycle_span: tracing::Span,
@@ -674,6 +674,58 @@ impl Container {
         Ok(())
     }
 
+    fn native_landlock_policy(
+        config: &ContainerConfig,
+        gpu_device_set: Option<&GpuDeviceSet>,
+    ) -> Result<NativeLandlock> {
+        if let Some(ref policy_path) = config.landlock_policy {
+            let policy: crate::security::LandlockPolicy = crate::security::load_toml_policy(
+                policy_path,
+                config.landlock_policy_sha256.as_deref(),
+            )?;
+            // H4: Reject write+execute on same path in production
+            if config.service_mode == ServiceMode::Production {
+                policy.validate_production()?;
+            }
+            Ok(NativeLandlock::Custom(policy))
+        } else {
+            let mut landlock_mgr = LandlockManager::new();
+            landlock_mgr.assert_minimum_abi(config.service_mode == ServiceMode::Production)?;
+            landlock_mgr.set_workspace_access(
+                config.workspace.is_read_only(),
+                config.workspace.allow_execute,
+            );
+            landlock_mgr.add_rw_path(&config.home.to_string_lossy());
+            // Register volume mount destinations so Landlock permits access to them
+            for provider_config in &config.provider_configs {
+                let provider_dest = crate::filesystem::normalize_provider_config_destination(
+                    &config.home,
+                    &provider_config.dest,
+                )?;
+                if provider_config.read_only {
+                    landlock_mgr.add_ro_path(&provider_dest.to_string_lossy());
+                } else {
+                    landlock_mgr.add_rw_path(&provider_dest.to_string_lossy());
+                }
+            }
+            for vol in &config.volumes {
+                if vol.read_only {
+                    landlock_mgr.add_ro_path(&vol.dest.to_string_lossy());
+                } else {
+                    landlock_mgr.add_rw_path(&vol.dest.to_string_lossy());
+                }
+            }
+            // GPU device nodes must be reachable (read+write) by the workload.
+            // Driver support files are read-only inputs.
+            if let Some(set) = gpu_device_set {
+                for node in &set.nodes {
+                    landlock_mgr.add_gpu_device(&node.to_string_lossy());
+                }
+            }
+            Ok(NativeLandlock::Default(landlock_mgr))
+        }
+    }
+
     fn create_internal(&self, defer_exec_until_start: bool) -> Result<CreatedContainer> {
         let lifecycle_span = info_span!(
             "container.lifecycle",
@@ -707,6 +759,9 @@ impl Container {
         let mut config = self.config.clone();
         Self::configure_user_namespace(&mut config, is_root)?;
 
+        if matches!(config.network, NetworkMode::Bridge(_)) && config.egress_policy.is_none() {
+            config.egress_policy = Some(crate::network::EgressPolicy::deny_all());
+        }
         // Validate service-mode invariants before anything else.
         config.validate_strict_agent_mode()?;
         config.validate_production_mode()?;
@@ -752,6 +807,10 @@ impl Container {
         // Compile once in the host filesystem before the parent and workload diverge.
         let native_seccomp = (!config.use_gvisor)
             .then(|| NativeSeccomp::from_config(&config))
+            .transpose()?;
+
+        let native_landlock = (!config.use_gvisor)
+            .then(|| Self::native_landlock_policy(&config, gpu_device_set.as_ref()))
             .transpose()?;
 
         // Create state manager, honoring --root override if set
@@ -843,18 +902,22 @@ impl Container {
             }
         };
 
-        if let Some(set) = &gpu_device_set {
+        let device_filter = gpu_device_set.as_ref().map(|set| crate::container::SavedDeviceFilter {
+            gpu: set.device_specs(),
+            supervisor: Self::gvisor_supervisor_device_specs(&config),
+            include_tty: config.terminal,
+        });
+        if let Some(filter) = &device_filter {
             if let Some(cgroup) = &cgroup_opt {
                 // The deny-by-default filter also governs the runsc supervisor,
                 // which the parent attaches to this cgroup before the sandbox
                 // starts. Allow the selected platform backend's required host
                 // devices (e.g. /dev/kvm for KVM) so the sandbox can boot; the
                 // workload inside the sandbox still cannot reach them.
-                let supervisor_specs = Self::gvisor_supervisor_device_specs(&config);
                 cgroup.install_gpu_device_allowlist(
-                    &set.device_specs(),
-                    &supervisor_specs,
-                    config.terminal,
+                    &filter.gpu,
+                    &filter.supervisor,
+                    filter.include_tty,
                     config.allow_degraded_security,
                 )?;
             } else if config.allow_degraded_security {
@@ -920,6 +983,9 @@ impl Container {
         // tracing guards before fork to minimize deadlock risk from locks held
         // by other threads (tracing, allocator). The Tokio runtime is not yet
         // started at this point, so async thread contention is not a concern.
+        let landlock_channel = (!config.use_gvisor)
+            .then(std::os::unix::net::UnixStream::pair)
+            .transpose()?;
         Self::assert_single_threaded_for_fork("container create fork")?;
         // From the fork onward the container lifecycle owns the FIFO. Setup
         // failures before this point (including GPU enforcement) remove it.
@@ -1029,6 +1095,20 @@ impl Container {
                     });
                     state.pids_max = config.limits.pids_max;
                     state.native_seccomp = native_seccomp;
+                    let landlock_handoff = if let Some((parent, child_end)) = landlock_channel {
+                        drop(child_end);
+                        let path = state_mgr
+                            .exec_fifo_path(&config.id)?
+                            .with_extension("landlock");
+                        let handoff = crate::security::landlock_handoff::LandlockHandoff::start(
+                            &path, parent,
+                        )?;
+                        state.landlock_socket = Some(path.canonicalize()?);
+                        Some(handoff)
+                    } else {
+                        None
+                    };
+                    state.gpu_device_filter = device_filter;
                     state.environment = config.environment.iter().cloned().collect();
                     state.workdir = config.workdir.display().to_string();
                     state.config_hash = config.config_hash;
@@ -1072,41 +1152,25 @@ impl Container {
                     )?;
 
                     if let NetworkMode::Bridge(ref bridge_config) = config.network {
-                        match BridgeDriver::setup_with_id(
+                        let net = BridgeDriver::setup_with_id(
                             target_pid,
                             bridge_config,
                             &config.id,
                             is_root,
                             config.user_ns_config.is_some(),
-                        ) {
-                            Ok(net) => {
-                                if let Some(ref egress) = config.egress_policy {
-                                    if let Err(e) = net.apply_egress_policy(
-                                        target_pid,
-                                        egress,
-                                        config.user_ns_config.is_some(),
-                                    ) {
-                                        if config.service_mode.enforces_strict_isolation() {
-                                            return Err(NucleusError::NetworkError(format!(
-                                                "Failed to apply egress policy: {}",
-                                                e
-                                            )));
-                                        }
-                                        warn!("Failed to apply egress policy: {}", e);
-                                    }
-                                }
-                                if let Some(ref broker) = config.credential_broker {
-                                    Self::probe_credential_broker(broker)?;
-                                }
-                                network_driver = Some(net);
-                            }
-                            Err(e) => {
-                                if config.service_mode.enforces_strict_isolation() {
-                                    return Err(e);
-                                }
-                                warn!("Failed to set up bridge networking: {}", e);
-                            }
+                        )?;
+                        net.apply_egress_policy(
+                            target_pid,
+                            config
+                                .egress_policy
+                                .as_ref()
+                                .expect("bridge policy initialized before fork"),
+                            config.user_ns_config.is_some(),
+                        )?;
+                        if let Some(ref broker) = config.credential_broker {
+                            Self::probe_credential_broker(broker)?;
                         }
+                        network_driver = Some(net);
                     }
 
                     Self::send_sync_byte(
@@ -1122,6 +1186,7 @@ impl Container {
                     let mapped_gvisor_base =
                         runtime_base_override.filter(|_| is_root && gvisor_needs_precreated_userns);
                     Ok(CreatedContainer {
+                        _landlock_handoff: landlock_handoff,
                         mapped_gvisor_base,
                         config,
                         state_mgr,
@@ -1171,6 +1236,8 @@ impl Container {
                 match temp_container.setup_and_exec(
                     gpu_device_set.as_ref(),
                     native_seccomp.as_ref(),
+                    native_landlock.as_ref(),
+                    landlock_channel.map(|(_, child_end)| child_end),
                     Some(ready_write),
                     userns_request_write,
                     userns_ack_read,
@@ -1228,6 +1295,8 @@ impl Container {
         &self,
         gpu_device_set: Option<&GpuDeviceSet>,
         native_seccomp: Option<&NativeSeccomp>,
+        native_landlock: Option<&NativeLandlock>,
+        landlock_channel: Option<std::os::unix::net::UnixStream>,
         ready_pipe: Option<OwnedFd>,
         userns_request_pipe: Option<OwnedFd>,
         userns_ack_pipe: Option<OwnedFd>,
@@ -1310,6 +1379,20 @@ impl Container {
 
         // 1. Create namespaces in child and optionally configure user mapping.
         let mut namespace_mgr = NamespaceManager::new(self.config.namespaces.clone());
+        // unshare translates the current directory into the new mount namespace.
+        // Reach the per-image directory while privileged, then open its children
+        // on that namespace's mounts (overlayfs rejects foreign mount fds).
+        let mut original_cwd = None;
+        if let Some(overlay) = self.config.rootfs_overlay.as_ref() {
+            if let Some(parent) = overlay
+                .upperdir
+                .parent()
+                .filter(|p| Some(*p) == overlay.workdir.parent() && !p.as_os_str().is_empty())
+            {
+                original_cwd = Some(std::fs::File::open(".")?);
+                nix::unistd::chdir(parent)?;
+            }
+        }
         namespace_mgr.unshare_namespaces()?;
         if self.config.user_ns_config.is_some() {
             let request_fd = userns_request_pipe.as_ref().ok_or_else(|| {
@@ -1334,6 +1417,28 @@ impl Container {
             )?;
             Self::become_userns_root_for_setup(None)?;
         }
+
+        let overlay_dirs = self
+            .config
+            .rootfs_overlay
+            .as_ref()
+            .map(|overlay| {
+                if let Some(cwd) = original_cwd.as_ref() {
+                    let upper = overlay.upperdir.file_name().ok_or_else(|| {
+                        NucleusError::FilesystemError("Missing upper directory name".into())
+                    })?;
+                    let work = overlay.workdir.file_name().ok_or_else(|| {
+                        NucleusError::FilesystemError("Missing work directory name".into())
+                    })?;
+                    let dirs = open_overlay_dirs(Path::new(upper), Path::new(work))?;
+                    nix::unistd::fchdir(cwd)?;
+                    Ok(dirs)
+                } else {
+                    open_overlay_dirs(&overlay.upperdir, &overlay.workdir)
+                }
+            })
+            .transpose()?;
+        drop(original_cwd);
 
         // CLONE_NEWPID only applies to children created after unshare().
         // Create a child that will become PID 1 in the new namespace and exec the workload.
@@ -1423,17 +1528,12 @@ impl Container {
             if self.config.verify_rootfs_attestation {
                 verify_rootfs_attestation(rootfs_path)?;
             }
-            let overlay = self.config.rootfs_overlay.as_ref().ok_or_else(|| {
+            let (upper, work) = overlay_dirs.ok_or_else(|| {
                 NucleusError::FilesystemError(
                     "rootfs overlay mode missing prepared upper/work dirs".to_string(),
                 )
             })?;
-            overlay_mount_rootfs(
-                &container_root,
-                rootfs_path,
-                &overlay.upperdir,
-                &overlay.workdir,
-            )?;
+            overlay_mount_rootfs_pinned(&container_root, rootfs_path, &upper, &work)?;
             true
         } else {
             false
@@ -1444,15 +1544,25 @@ impl Container {
 
         // 5. Create device nodes and standard tmpfs mounts under /dev
         let dev_path = container_root.join("dev");
+        let dev_target = crate::filesystem::mount_target(&container_root, Path::new("dev"), true)?;
         if let Some(prepared_dev) = &prepared_dev {
             nix::mount::mount(
                 Some(prepared_dev),
-                &dev_path,
+                &crate::filesystem::fd_path(&dev_target),
                 None::<&str>,
                 nix::mount::MsFlags::MS_BIND,
                 None::<&str>,
             )?;
         } else {
+            if rootfs_overlay_mounted {
+                nix::mount::mount(
+                    Some("tmpfs"),
+                    &crate::filesystem::fd_path(&dev_target),
+                    Some("tmpfs"),
+                    nix::mount::MsFlags::MS_NOSUID | nix::mount::MsFlags::MS_NOEXEC,
+                    Some("mode=0755,size=1m"),
+                )?;
+            }
             create_dev_nodes(&dev_path, self.config.terminal)?;
         }
 
@@ -1494,6 +1604,24 @@ impl Container {
         // Filesystem: Mounted -> Populated
         if let Some(context_dir) = &self.config.context_dir {
             let context_dest = container_root.join("context");
+            if rootfs_overlay_mounted
+                && matches!(
+                    self.config.context_mode,
+                    crate::filesystem::ContextMode::Copy
+                )
+            {
+                let target =
+                    crate::filesystem::mount_target(&container_root, Path::new("context"), true)?;
+                nix::mount::mount(
+                    Some("tmpfs"),
+                    &crate::filesystem::fd_path(&target),
+                    Some("tmpfs"),
+                    nix::mount::MsFlags::MS_NOSUID
+                        | nix::mount::MsFlags::MS_NODEV
+                        | nix::mount::MsFlags::MS_NOEXEC,
+                    Some("mode=0755,size=1g"),
+                )?;
+            }
             LazyContextPopulator::populate(&self.config.context_mode, context_dir, &context_dest)?;
             if let Some(expected) = &context_manifest {
                 verify_context_manifest(expected, &context_dest)?;
@@ -1568,7 +1696,7 @@ impl Container {
         let proc_path = container_root.join("proc");
         let production_mode = self.config.service_mode == ServiceMode::Production;
         let hide_pids = production_mode;
-        let procfs_best_effort = is_rootless && !production_mode;
+        let procfs_best_effort = is_rootless && !production_mode && !rootfs_overlay_mounted;
         mount_procfs(
             &proc_path,
             procfs_best_effort,
@@ -1641,10 +1769,7 @@ impl Container {
                 policy_path,
                 self.config.caps_policy_sha256.as_deref(),
             )?;
-            // H3: Reject dangerous capabilities in production mode
-            if self.config.service_mode == ServiceMode::Production {
-                policy.validate_production()?;
-            }
+            // apply validates every retained set before changing process capabilities.
             policy.apply(&mut cap_mgr)?;
             // Identity switch after custom policy (caps may already be restricted)
             Self::apply_process_identity_to_current_process(
@@ -1752,6 +1877,17 @@ impl Container {
             self.config.service_mode == ServiceMode::Production,
         )?;
 
+        // Transfer the applied kernel ruleset before seccomp may disable sendmsg.
+        let channel = landlock_channel.ok_or_else(|| {
+            NucleusError::LandlockError("Missing Landlock handoff channel".into())
+        })?;
+        let landlock_applied = native_landlock
+            .ok_or_else(|| NucleusError::LandlockError("Missing launch Landlock policy".into()))?
+            .apply(allow_degraded_security, &channel)?;
+        // The PID-namespace intermediary may still have a dup of this socket.
+        channel.shutdown(std::net::Shutdown::Write)?;
+        drop(channel);
+
         // 13. Apply seccomp filter (trace, profile-from-file, or built-in allowlist)
         // Security: CapabilitiesDropped -> SeccompApplied
         use crate::container::config::SeccompMode;
@@ -1807,53 +1943,6 @@ impl Container {
             warn!("Seccomp not enforced; container is running with degraded hardening");
         }
 
-        // 14. Apply Landlock policy (from policy file or default hardcoded rules)
-        let landlock_applied = if let Some(ref policy_path) = self.config.landlock_policy {
-            let policy: crate::security::LandlockPolicy = crate::security::load_toml_policy(
-                policy_path,
-                self.config.landlock_policy_sha256.as_deref(),
-            )?;
-            // H4: Reject write+execute on same path in production
-            if self.config.service_mode == ServiceMode::Production {
-                policy.validate_production()?;
-            }
-            policy.apply(allow_degraded_security)?
-        } else {
-            let mut landlock_mgr = LandlockManager::new();
-            landlock_mgr.assert_minimum_abi(self.config.service_mode == ServiceMode::Production)?;
-            landlock_mgr.set_workspace_access(
-                self.config.workspace.is_read_only(),
-                self.config.workspace.allow_execute,
-            );
-            landlock_mgr.add_rw_path(&self.config.home.to_string_lossy());
-            // Register volume mount destinations so Landlock permits access to them
-            for provider_config in &self.config.provider_configs {
-                let provider_dest = crate::filesystem::normalize_provider_config_destination(
-                    &self.config.home,
-                    &provider_config.dest,
-                )?;
-                if provider_config.read_only {
-                    landlock_mgr.add_ro_path(&provider_dest.to_string_lossy());
-                } else {
-                    landlock_mgr.add_rw_path(&provider_dest.to_string_lossy());
-                }
-            }
-            for vol in &self.config.volumes {
-                if vol.read_only {
-                    landlock_mgr.add_ro_path(&vol.dest.to_string_lossy());
-                } else {
-                    landlock_mgr.add_rw_path(&vol.dest.to_string_lossy());
-                }
-            }
-            // GPU device nodes must be reachable (read+write) by the workload.
-            // Driver support files are read-only inputs.
-            if let Some(set) = gpu_device_set {
-                for node in &set.nodes {
-                    landlock_mgr.add_gpu_device(&node.to_string_lossy());
-                }
-            }
-            landlock_mgr.apply_container_policy_with_mode(allow_degraded_security)?
-        };
         if seccomp_applied && landlock_applied {
             sec_state = sec_state.transition(SecurityState::LandlockApplied)?;
             if self.config.seccomp_mode == SeccompMode::Trace {
@@ -2999,7 +3088,7 @@ mod tests {
             "setup_and_exec must derive an explicit production-mode guard for procfs hardening"
         );
         assert!(
-            fn_body.contains("let procfs_best_effort = is_rootless && !production_mode;"),
+            fn_body.contains("let procfs_best_effort = is_rootless && !production_mode && !rootfs_overlay_mounted;"),
             "rootless best-effort procfs fallback must be disabled in production mode"
         );
         assert!(

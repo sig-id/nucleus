@@ -1,13 +1,15 @@
 use crate::checkpoint::metadata::CheckpointMetadata;
 use crate::checkpoint::state::CheckpointState;
-use crate::container::ContainerState;
+use crate::container::{ContainerState, ContainerStateManager, ContainerStateParams, OciStatus};
 use crate::error::{NucleusError, Result, StateTransition};
+use crate::resources::Cgroup;
 use nix::unistd::Uid;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::Builder;
@@ -151,6 +153,9 @@ impl CriuRuntime {
 
         let images_dir = Self::prepare_checkpoint_dir(output_dir)?;
 
+        // A successful dump may terminate the original tree and trigger cgroup cleanup.
+        let metadata = CheckpointMetadata::from_state(state)?;
+
         // Run criu dump
         let mut cmd = Command::new(&self.binary_path);
         cmd.arg("dump")
@@ -191,8 +196,7 @@ impl CriuRuntime {
             )));
         }
 
-        // Write metadata
-        let metadata = CheckpointMetadata::from_state(state)?;
+        // Publish metadata for this completed dump.
         metadata.save(output_dir)?;
         Self::write_checkpoint_hmac(output_dir)?;
 
@@ -207,6 +211,16 @@ impl CriuRuntime {
     ///
     /// State transitions: None -> Restoring -> Restored (or Restoring -> None on failure)
     pub fn restore(&mut self, input_dir: &Path) -> Result<u32> {
+        Ok(self
+            .restore_registered(input_dir, &ContainerStateManager::new()?)?
+            .pid)
+    }
+
+    pub fn restore_registered(
+        &mut self,
+        input_dir: &Path,
+        state_mgr: &ContainerStateManager,
+    ) -> Result<ContainerState> {
         // Requires root
         if !nix::unistd::Uid::effective().is_root() {
             return Err(NucleusError::CheckpointError(
@@ -214,6 +228,7 @@ impl CriuRuntime {
             ));
         }
 
+        Self::verify_checkpoint_hmac(input_dir)?;
         // Load and validate metadata
         let metadata = CheckpointMetadata::load(input_dir)?;
         info!(
@@ -229,9 +244,23 @@ impl CriuRuntime {
             )));
         }
 
-        Self::verify_checkpoint_hmac(input_dir)?;
-
-        // State transition: None -> Restoring
+        let launch = metadata.launch_state.ok_or_else(|| NucleusError::CheckpointError(
+            "This checkpoint lacks the original workload identity. Create a new checkpoint before restoring.".into()
+        ))?;
+        if metadata.cgroup_path.is_some() && metadata.resource_limits.is_none() {
+            return Err(NucleusError::CheckpointError(
+                "Missing original cgroup limits".into(),
+            ));
+        }
+        let id = crate::container::generate_container_id()?;
+        let mut cgroup = Cgroup::create(&format!("nucleus-{id}"))?;
+        if let Some(limits) = &metadata.resource_limits {
+            cgroup.set_limits(&limits.to_resource_limits())?;
+        }
+        if let Some(filter) = &launch.gpu_device_filter {
+            cgroup.install_gpu_device_allowlist(&filter.gpu, &filter.supervisor, filter.include_tty, false)?;
+        }
+        let membership = cgroup.membership_file()?;
         self.state = self.state.transition(CheckpointState::Restoring)?;
 
         // Capture the restored init PID explicitly.
@@ -244,8 +273,26 @@ impl CriuRuntime {
         let pidfile_path = pidfile.path().to_path_buf();
 
         // Run criu restore
-        let output = Command::new(&self.binary_path)
+        let mut cmd = Command::new(&self.binary_path);
+        // SAFETY: the child only writes one byte to a pre-opened cgroup v2 fd.
+        // Kernel migration of PID 0 moves this child before exec or any CRIU fork.
+        unsafe {
+            cmd.pre_exec(move || {
+                nix::unistd::write(&membership, b"0")
+                    .map_err(std::io::Error::from)
+                    .and_then(|n| {
+                        if n == 1 {
+                            Ok(())
+                        } else {
+                            Err(std::io::ErrorKind::WriteZero.into())
+                        }
+                    })
+            });
+        }
+        let output = cmd
             .arg("restore")
+            .arg("--manage-cgroups=ignore")
+            .arg("--restore-detached")
             .arg("--images-dir")
             .arg(&images_dir)
             .arg("--shell-job")
@@ -274,40 +321,46 @@ impl CriuRuntime {
             )));
         }
 
-        // State transition: Restoring -> Restored
+        let pid = Self::parse_pidfile(&fs::read_to_string(&pidfile_path)?)
+            .filter(|pid| *pid > 1 && *pid <= i32::MAX as u32)
+            .ok_or_else(|| {
+                NucleusError::CheckpointError("Missing valid restored init PID".into())
+            })?;
+        if !fs::read_to_string(cgroup.path().join("cgroup.procs"))?
+            .lines()
+            .any(|line| line.parse() == Ok(pid))
+        {
+            return Err(NucleusError::CheckpointError(
+                "Restored init is outside its cgroup".into(),
+            ));
+        }
+        let mut state = ContainerState::new(ContainerStateParams {
+            id,
+            name: format!("{}-restored", launch.name),
+            pid,
+            command: launch.command,
+            memory_limit: launch.memory_limit,
+            cpu_limit: launch.cpu_limit,
+            using_gvisor: launch.using_gvisor,
+            rootless: launch.rootless,
+            cgroup_path: Some(cgroup.path().display().to_string()),
+            process_uid: launch.process_uid,
+            process_gid: launch.process_gid,
+            additional_gids: launch.additional_gids,
+        });
+        state.creator_uid = launch.creator_uid;
+        state.environment = launch.environment;
+        state.workdir = launch.workdir;
+        state.pids_max = launch.pids_max;
+        // A checkpoint cannot carry a live kernel ruleset fd across restore.
+        // Leave attach/probes unavailable until a fresh native launch.
+        state.native_seccomp = launch.native_seccomp;
+        state.gpu_device_filter = launch.gpu_device_filter;
+        state.status = OciStatus::Running;
+        state_mgr.save_state(&state)?;
+        cgroup.leave_registered();
         self.state = self.state.transition(CheckpointState::Restored)?;
-
-        // Parse restored PID from pidfile, with output fallback for compatibility.
-        let pid_text = fs::read_to_string(&pidfile_path).unwrap_or_default();
-        if let Some(pid) = Self::parse_pidfile(&pid_text) {
-            info!("Restore complete, new PID: {}", pid);
-            return Ok(pid);
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if let Some(pid) = Self::parse_pid_text(&stdout) {
-            info!("Restore complete, new PID: {}", pid);
-            return Ok(pid);
-        }
-
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if let Some(pid) = Self::parse_pid_text(&stderr) {
-            info!("Restore complete, new PID: {}", pid);
-            return Ok(pid);
-        }
-
-        Err(NucleusError::CheckpointError(format!(
-            "Failed to parse restored PID from CRIU output (pidfile='{}', stdout='{}', stderr='{}')",
-            pid_text.trim(),
-            stdout.trim(),
-            stderr.trim()
-        )))
-    }
-
-    fn parse_pid_text(text: &str) -> Option<u32> {
-        text.split(|c: char| !c.is_ascii_digit())
-            .filter(|tok| !tok.is_empty())
-            .find_map(|tok| tok.parse::<u32>().ok())
+        Ok(state)
     }
 
     fn parse_pidfile(text: &str) -> Option<u32> {
@@ -412,10 +465,9 @@ impl CriuRuntime {
         let key = Self::load_or_create_checkpoint_hmac_key()?;
         let actual = Self::compute_checkpoint_hmac(dir, &key)?;
         if actual != expected {
-            return Err(NucleusError::CheckpointError(format!(
-                "Checkpoint integrity verification failed: HMAC mismatch (expected {}, got {})",
-                expected, actual
-            )));
+            return Err(NucleusError::CheckpointError(
+                "Checkpoint integrity verification failed: HMAC mismatch".into(),
+            ));
         }
 
         info!("Checkpoint integrity verified");
@@ -811,21 +863,167 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_pid_text_plain() {
-        assert_eq!(CriuRuntime::parse_pid_text("1234\n"), Some(1234));
-    }
-
-    #[test]
-    fn test_parse_pid_text_embedded() {
+    #[ignore = "requires root and writable cgroup v2"]
+    fn restore_helper_and_descendants_inherit_limits_and_saved_identity() {
+        use crate::checkpoint::CheckpointMetadata;
+        use crate::container::{ContainerState, ContainerStateManager, ContainerStateParams};
+        let _lock = checkpoint_key_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let _key = CheckpointKeyEnvGuard::set(&temp.path().join("keydir/key"));
+        let input = temp.path().join("checkpoint");
+        CriuRuntime::prepare_checkpoint_dir(&input).unwrap();
+        let mut original = ContainerState::new(ContainerStateParams {
+            id: "old".into(),
+            name: "fixture".into(),
+            pid: std::process::id(),
+            command: vec![],
+            memory_limit: None,
+            cpu_limit: None,
+            using_gvisor: false,
+            rootless: false,
+            cgroup_path: None,
+            process_uid: 1234,
+            process_gid: 4321,
+            additional_gids: vec![2000],
+        });
+        original.creator_uid = 2345;
+        let mut metadata = CheckpointMetadata::from_state(&original).unwrap();
+        metadata.resource_limits = Some(crate::checkpoint::CheckpointResourceLimits {
+            pids_max: Some(8),
+            cpu_period_us: 100_000,
+            memory_bytes: None,
+            memory_high: None,
+            memory_swap_max: None,
+            cpu_quota_us: None,
+            cpu_weight: None,
+            io_limits: vec![],
+        });
+        metadata.save(&input).unwrap();
+        CriuRuntime::write_checkpoint_hmac(&input).unwrap();
+        let helper = temp.path().join("restore-fixture");
+        // Model CRIU's detached tree. Check the helper's cgroup before it forks.
+        fs::write(
+            &helper,
+            r#"#!/bin/sh
+set -eu
+read -r membership < /proc/self/cgroup
+group=${membership#0::}
+case "$group" in */nucleus-*) ;; *) exit 10 ;; esac
+read -r max < "/sys/fs/cgroup$group/pids.max"
+test "$max" = 8
+while test "$1" != --pidfile; do shift; done
+(while :; do :; done) </dev/null >/dev/null 2>&1 &
+echo "$!" > "$2"
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
+        let manager = ContainerStateManager::with_state_dir(temp.path().join("state")).unwrap();
+        let mut runtime = CriuRuntime {
+            binary_path: helper,
+            state: crate::checkpoint::CheckpointState::None,
+        };
+        let state = runtime.restore_registered(&input, &manager).unwrap();
+        let persisted = manager.load_state(&state.id).unwrap();
         assert_eq!(
-            CriuRuntime::parse_pid_text("restored successfully pid=5678"),
-            Some(5678)
+            (
+                persisted.creator_uid,
+                persisted.process_uid,
+                persisted.process_gid
+            ),
+            (2345, 1234, 4321)
         );
+        assert_eq!(persisted.additional_gids, [2000]);
+        let group = PathBuf::from(state.cgroup_path.unwrap());
+        assert!(fs::read_to_string(group.join("cgroup.procs"))
+            .unwrap()
+            .lines()
+            .any(|pid| pid == state.pid.to_string()));
+        fs::write(group.join("cgroup.kill"), "1").unwrap();
+        for _ in 0..100 {
+            if fs::remove_dir(&group).is_ok() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("restore test cgroup remained populated");
     }
 
     #[test]
-    fn test_parse_pid_text_missing() {
-        assert_eq!(CriuRuntime::parse_pid_text("no pid here"), None);
+    #[ignore = "requires CRIU, root and writable cgroup v2"]
+    fn real_criu_round_trip_preserves_nonroot_identity() {
+        use crate::container::{ContainerState, ContainerStateManager, ContainerStateParams};
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+        let _lock = checkpoint_key_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let _key = CheckpointKeyEnvGuard::set(&temp.path().join("keydir/key"));
+        let mut runtime = CriuRuntime::new().unwrap();
+        let mut command = Command::new("/bin/sleep");
+        command
+            .arg("60")
+            .uid(1234)
+            .gid(4321)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        unsafe {
+            command.pre_exec(|| {
+                nix::unistd::setsid()
+                    .map(|_| ())
+                    .map_err(std::io::Error::from)
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        let original = ContainerState::new(ContainerStateParams {
+            id: "fixture".into(),
+            name: "fixture".into(),
+            pid: child.id(),
+            command: vec!["/bin/sleep".into()],
+            memory_limit: None,
+            cpu_limit: None,
+            using_gvisor: false,
+            rootless: false,
+            cgroup_path: None,
+            process_uid: 1234,
+            process_gid: 4321,
+            additional_gids: Vec::new(),
+        });
+        let checkpoint = temp.path().join("checkpoint");
+        let result = runtime.checkpoint(&original, &checkpoint, false);
+        if result.is_err() {
+            let _ = child.kill();
+        }
+        child.wait().unwrap();
+        result.unwrap();
+        let manager = ContainerStateManager::with_state_dir(temp.path().join("state")).unwrap();
+        let restored = CriuRuntime::new()
+            .unwrap()
+            .restore_registered(&checkpoint, &manager)
+            .unwrap();
+        let status = fs::read_to_string(format!("/proc/{}/status", restored.pid)).unwrap();
+        let group = PathBuf::from(restored.cgroup_path.as_ref().unwrap());
+        fs::write(group.join("cgroup.kill"), "1").unwrap();
+        assert_eq!((restored.process_uid, restored.process_gid), (1234, 4321));
+        assert!(
+            status
+                .lines()
+                .any(|line| line.starts_with("Uid:")
+                    && line.split_whitespace().nth(1) == Some("1234"))
+        );
+        assert!(
+            status
+                .lines()
+                .any(|line| line.starts_with("Gid:")
+                    && line.split_whitespace().nth(1) == Some("4321"))
+        );
+        for _ in 0..100 {
+            if fs::remove_dir(&group).is_ok() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("restored cgroup remained populated");
     }
 
     #[test]

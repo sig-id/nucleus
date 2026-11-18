@@ -460,7 +460,7 @@ nucleus image run ./worker.nucleus-image -- /bin/cat /tmp/result
 
 `nucleus image commit` requires a container launched with `--rootfs-mode
 overlay`; overlay rootfs mode is currently native-runtime only and production
-mode rejects it. Runtime-committed images are signed with a host-local HMAC key.
+mode rejects it. Runtime-committed images require a host-local HMAC signature even in the Nix store. Unsigned Nix-built manifests may reference only a base image. Overlay data comes from the image-local `diff/` directory.
 Use `--image-key-file PATH` or set `NUCLEUS_IMAGE_HMAC_KEY_FILE` to pin that key
 path; otherwise Nucleus creates an owner-only key under `/var/lib/nucleus` for
 root or the user's data directory for non-root runs. Use the same key path when
@@ -1052,7 +1052,7 @@ the CLI `nucleus image commit` workflow.
 | Bridge DNS | Defaults to 8.8.8.8/8.8.4.4 | Must be configured explicitly unless credential broker mode disables DNS | Must be configured explicitly unless credential broker mode disables DNS |
 | Rootfs | Host bind mounts unless `--rootfs` (optionally with `--rootfs-mode overlay`) or `--agent-toolchain-rootfs` is supplied | Host bind mounts unless `--rootfs` (optionally with `--rootfs-mode overlay`) or `--agent-toolchain-rootfs` is supplied | Pre-built Nix closure (`--rootfs`) or build-time `mkImage` image without an overlay diff |
 | Workspace | Optional `/workspace`; bind/copy-in-out for agents | Optional `/workspace`; bind/copy-in-out for agents | Optional, non-executable unless read-only or policy-specific |
-| Egress policy | Optional | Optional | Deny-all default where enforceable; unavailable with `gvisor-host` |
+| Bridge egress policy | Deny-all by default | Deny-all by default | Deny-all by default |
 | Memory limit | Optional | Optional | Required |
 | PID 1 init | Direct exec | Direct exec | Mini-init with zombie reaping + signal forwarding |
 | Workload uid/gid | Container root maps to host UID/GID 100000 by default when launched as root | User namespace remapping required when running as host root | Configurable post-setup drop via `--user` / `--group` |
@@ -1073,7 +1073,7 @@ Landlock and all-capabilities-dropped posture.
 
 ## Egress Policy
 
-When production bridge mode runs without `--egress-allow` or `--egress-domain`, Nucleus installs a strict deny-all OUTPUT policy, including DNS.
+Native bridge networking defaults to deny-all in every service mode, including DNS. IPv4 allowlists apply to IPv4 only. The IPv6 OUTPUT policy permits loopback only. Bridge setup or firewall installation failure aborts launch.
 When `--egress-allow` or `--egress-domain` is specified, Nucleus applies iptables OUTPUT chain rules inside the container's network namespace:
 
 1. Allow loopback traffic
@@ -1153,7 +1153,7 @@ When using gVisor (`--runtime gvisor`), the network mode is selected explicitly:
 | `bridge` | `sandbox` | gVisor netstack uses the interface and routes in the Nucleus-prepared network namespace |
 | `gvisor-host` | `host` | gVisor hostinet mode; omits the OCI network namespace and requires `--allow-host-network` |
 
-Nucleus requires a versioned runsc release of **20260831.0 or later** for gVisor launches. The Nix package includes runsc 20261116.0 and its matching sidecars. Bridge netstack sends packets at the link layer, so Nucleus rejects gVisor bridge configurations that request its iptables `OUTPUT` egress policy, including credential broker policies.
+Nucleus requires a versioned runsc release of **20260831.0 or later** for gVisor launches. The Nix package includes runsc 20261116.0 and its matching sidecars. Bridge netstack sends packets at the link layer. Nucleus therefore rejects gVisor bridge launches, including the default deny-all policy. Use native bridge for enforced egress, `--network none` for isolation, or explicitly opt into gVisor host networking.
 
 The `gvisor-host` mode is intentionally separate from native `host` networking. Native `host` remains a direct host namespace mode. `gvisor-host` keeps the gVisor runtime boundary, but weakens network isolation by letting runsc hostinet use the host network stack. Because there is no Nucleus-owned network namespace in this mode, Nucleus egress policy is unavailable with `gvisor-host`.
 
@@ -1202,8 +1202,11 @@ Events include a container start record and a final summary record. The records 
 - `--seccomp-profile-sha256 <hex>` verifies the profile's SHA-256 hash before loading.
 - `--seccomp-mode trace|enforce` switches between trace (record all syscalls) and enforce (default).
 - `--seccomp-log <path>` writes NDJSON syscall trace when in trace mode.
+- Capability policy files in all service modes reject dangerous capabilities, including `NET_ADMIN`, `SYS_RESOURCE` and `MKNOD`.
 - `--caps-policy <path>` loads a TOML capability policy (replaces default drop-all).
 - `--caps-policy-sha256 <hex>` verifies the capability policy hash.
+- Native bind mounts require Linux 5.12 or later for recursive mount attributes.
+- Native attach and probes require the live supervisor’s original kernel Landlock ruleset and the saved seccomp policy. These helpers fail closed for legacy and restored containers without a live ruleset. Restore requires a signed checkpoint containing the original workload identity.
 - `--landlock-policy <path>` loads a TOML Landlock filesystem policy (replaces default rules).
 - `--landlock-policy-sha256 <hex>` verifies the Landlock policy hash.
 - `--verify-context-integrity` hashes the source context tree before launch and verifies the populated `/context` tree matches.

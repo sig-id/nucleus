@@ -15,7 +15,7 @@ use std::os::unix::fs::FileTypeExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::container::{GpuPassthroughConfig, GpuVendor, ProcessIdentity};
 use crate::error::{NucleusError, Result};
@@ -83,7 +83,7 @@ impl GpuDeviceSet {
 }
 
 /// A single device node's identity for the cgroup device allowlist.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DeviceNodeSpec {
     pub is_block: bool,
     pub major: u32,
@@ -611,61 +611,13 @@ pub(crate) fn mount_gpu_support(
     set: &GpuDeviceSet,
     config: &GpuPassthroughConfig,
 ) -> Result<Vec<PathBuf>> {
-    use nix::mount::{mount, MsFlags};
-    let bind_flags = MsFlags::MS_BIND | MsFlags::MS_REC;
     let mut bound_support = Vec::new();
     // Driver support files (NVIDIA /proc, lib dirs, ICD JSON; ROCm /opt/rocm).
     for support in support_paths(set, config.bind_driver_libraries) {
         let rel = support.strip_prefix("/").unwrap_or(support.as_path());
-        let target = root.join(rel);
-        if let Some(parent) = target.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if support.is_dir() {
-            let _ = std::fs::create_dir_all(&target);
-        } else {
-            // Create a placeholder regular file so the bind has a mountpoint.
-            let _ = std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&target);
-        }
-
-        mount(
-            Some(&support),
-            &target,
-            None::<&str>,
-            bind_flags,
-            None::<&str>,
-        )
-        .map_err(|e| {
-            NucleusError::FilesystemError(format!(
-                "Failed to bind GPU support {:?} -> {:?}: {}",
-                support, target, e
-            ))
-        })?;
-
-        // Remount read-only: device drivers and ICD manifests are read-only inputs.
-        mount(
-            None::<&str>,
-            &target,
-            None::<&str>,
-            bind_flags | MsFlags::MS_REMOUNT | MsFlags::MS_RDONLY,
-            None::<&str>,
-        )
-        .map_err(|e| {
-            // Read-only remount is best-effort: some NVIDIA proc files are
-            // writable by the driver; warn but keep the rw bind.
-            warn!(
-                "Failed to remount GPU support {:?} read-only: {} (leaving rw)",
-                target, e
-            );
-            NucleusError::FilesystemError(format!("read-only remount failed: {}", e))
-        })
-        .ok();
-
-        bound_support.push(target.strip_prefix(root).unwrap_or(&target).to_path_buf());
+        let target = super::mount_target(root, rel, support.is_dir())?;
+        super::bind_tree(&support, &target, support.is_dir(), super::READ_ONLY)?;
+        bound_support.push(rel.to_path_buf());
         debug!("Bound GPU support {:?}", support);
     }
 

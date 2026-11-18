@@ -54,7 +54,7 @@ pub struct CapSetPolicy {
 }
 
 /// Capabilities that are too dangerous for container workloads.
-/// These must be explicitly rejected in production mode.
+/// Rejected in every workload service mode.
 const DANGEROUS_CAPABILITIES: &[Capability] = &[
     Capability::CAP_SYS_ADMIN,
     Capability::CAP_SYS_MODULE,
@@ -69,6 +69,9 @@ const DANGEROUS_CAPABILITIES: &[Capability] = &[
     Capability::CAP_LINUX_IMMUTABLE,
     Capability::CAP_BPF,
     Capability::CAP_PERFMON,
+    Capability::CAP_NET_ADMIN,
+    Capability::CAP_SYS_RESOURCE,
+    Capability::CAP_MKNOD,
     Capability::CAP_NET_RAW,
     Capability::CAP_SETUID,
     Capability::CAP_SETGID,
@@ -76,10 +79,12 @@ const DANGEROUS_CAPABILITIES: &[Capability] = &[
 ];
 
 impl CapsPolicy {
-    /// Validate that the policy does not retain dangerous capabilities
-    /// in production mode.
+    /// Validate a policy without applying it.
     pub fn validate_production(&self) -> Result<()> {
-        let sets = self.resolve_sets()?;
+        self.resolve_sets().map(|_| ())
+    }
+
+    fn validate_sets(sets: &CapabilitySets) -> Result<()> {
         let all_kept: Vec<&Capability> = sets
             .bounding
             .iter()
@@ -96,8 +101,7 @@ impl CapsPolicy {
         }
         if !rejected.is_empty() {
             return Err(NucleusError::ConfigError(format!(
-                "Capability policy retains dangerous capabilities in production mode: [{}]. \
-                 These must be removed for production workloads.",
+                "Capability policy retains dangerous capabilities: [{}].",
                 rejected.join(", ")
             )));
         }
@@ -137,13 +141,15 @@ impl CapsPolicy {
         extend_unique(&mut permitted, &inheritable);
         extend_unique(&mut permitted, &ambient);
 
-        Ok(CapabilitySets {
+        let sets = CapabilitySets {
             bounding,
             permitted,
             effective,
             inheritable,
             ambient,
-        })
+        };
+        Self::validate_sets(&sets)?;
+        Ok(sets)
     }
 
     /// Resolve all keep lists into a deduplicated set of Capability values.
@@ -332,21 +338,21 @@ keep = ["NET_BIND_SERVICE"]
     fn test_ambient_caps_promote_into_inheritable_and_permitted() {
         let toml = r#"
 [ambient]
-keep = ["NET_RAW"]
+keep = ["NET_BIND_SERVICE"]
 "#;
         let policy: CapsPolicy = toml::from_str(toml).unwrap();
         let resolved = policy.resolve_sets().unwrap();
 
-        assert_eq!(resolved.ambient, vec![Capability::CAP_NET_RAW]);
-        assert_eq!(resolved.inheritable, vec![Capability::CAP_NET_RAW]);
-        assert_eq!(resolved.permitted, vec![Capability::CAP_NET_RAW]);
+        assert_eq!(resolved.ambient, vec![Capability::CAP_NET_BIND_SERVICE]);
+        assert_eq!(resolved.inheritable, vec![Capability::CAP_NET_BIND_SERVICE]);
+        assert_eq!(resolved.permitted, vec![Capability::CAP_NET_BIND_SERVICE]);
     }
 
     #[test]
     fn test_validate_production_rejects_newly_classified_dangerous_caps() {
         let toml = r#"
 [bounding]
-keep = ["NET_RAW", "SETUID", "SETGID", "FOWNER"]
+keep = ["NET_RAW", "SETUID", "SETGID", "FOWNER", "MKNOD", "NET_ADMIN", "SYS_RESOURCE"]
 "#;
         let policy: CapsPolicy = toml::from_str(toml).unwrap();
 
@@ -356,5 +362,8 @@ keep = ["NET_RAW", "SETUID", "SETGID", "FOWNER"]
         assert!(msg.contains("CAP_SETUID"));
         assert!(msg.contains("CAP_SETGID"));
         assert!(msg.contains("CAP_FOWNER"));
+        for cap in ["CAP_MKNOD", "CAP_NET_ADMIN", "CAP_SYS_RESOURCE"] {
+            assert!(msg.contains(cap));
+        }
     }
 }

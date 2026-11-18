@@ -54,6 +54,20 @@ pub(crate) fn apply_egress_policy(
         .iter()
         .chain(resolved_domain_cidrs.iter());
 
+    // The bridge allowlist uses IPv4 CIDRs. Close the entire other address
+    // family before releasing the workload, including when DNS is allowed.
+    let ip6t = BridgeNetwork::resolve_bin("ip6tables")?;
+    for args in [
+        &["-P", "OUTPUT", "DROP"][..],
+        &["-F", "OUTPUT"],
+        &["-A", "OUTPUT", "-o", "lo", "-j", "ACCEPT"],
+    ] {
+        if join_userns {
+            netns::exec_in_user_netns(pid, &ip6t, "ip6tables", args)?;
+        } else {
+            netns::exec_in_netns(pid, &ip6t, "ip6tables", args)?;
+        }
+    }
     let ipt = BridgeNetwork::resolve_bin("iptables")?;
     let exec = |args: &[&str]| {
         if join_userns {
@@ -136,6 +150,46 @@ pub(crate) fn apply_egress_policy(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "requires a private network namespace, netfilter and iptables/ip6tables"]
+    fn deny_all_sets_both_kernel_output_policies() {
+        use std::os::unix::process::CommandExt;
+        match unsafe { nix::unistd::fork().unwrap() } {
+            nix::unistd::ForkResult::Parent { child } => assert_eq!(
+                nix::sys::wait::waitpid(child, None).unwrap(),
+                nix::sys::wait::WaitStatus::Exited(child, 0)
+            ),
+            nix::unistd::ForkResult::Child => {
+                nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNET).unwrap();
+                super::apply_egress_policy(
+                    std::process::id(),
+                    &[],
+                    &super::EgressPolicy::deny_all(),
+                    false,
+                )
+                .unwrap();
+                for name in ["iptables", "ip6tables"] {
+                    let tool = super::BridgeNetwork::resolve_bin(name).unwrap();
+                    let output = std::process::Command::new(tool)
+                        .arg0(name)
+                        .args(["-S", "OUTPUT"])
+                        .output()
+                        .unwrap();
+                    assert!(output.status.success());
+                    let rules = String::from_utf8(output.stdout).unwrap();
+                    assert!(rules.lines().any(|line| line == "-P OUTPUT DROP"));
+                    assert!(rules
+                        .lines()
+                        .any(|line| line == "-A OUTPUT -o lo -j ACCEPT"));
+                    if name == "ip6tables" {
+                        assert_eq!(rules.lines().count(), 2);
+                    }
+                }
+                std::process::exit(0);
+            }
+        }
+    }
+
     #[test]
     fn test_egress_policy_preserves_iptables_applet_argv0() {
         let source = include_str!("egress.rs");
