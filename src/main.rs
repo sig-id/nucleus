@@ -695,6 +695,10 @@ const RUN_CONFIG_PATH_CONFLICTS: &[&str] = &[
     "credential_broker_no_proxy_env",
     "dns",
     "nat_backend",
+    "bridge_name",
+    "bridge_subnet",
+    "egress_dns",
+    "egress_log_denied",
     "health_cmd",
     "health_interval",
     "health_retries",
@@ -787,6 +791,10 @@ const RUN_CONFIG_FD_CONFLICTS: &[&str] = &[
     "credential_broker_no_proxy_env",
     "dns",
     "nat_backend",
+    "bridge_name",
+    "bridge_subnet",
+    "egress_dns",
+    "egress_log_denied",
     "health_cmd",
     "health_interval",
     "health_retries",
@@ -1061,6 +1069,22 @@ enum Commands {
         /// DNS servers (repeatable). Required for bridge mode in production.
         #[arg(long)]
         dns: Vec<String>,
+
+        /// Kernel bridge interface for this network.
+        #[arg(long, default_value = "nucleus0")]
+        bridge_name: String,
+
+        /// IPv4 subnet used by the bridge.
+        #[arg(long, default_value = "10.0.42.0/24")]
+        bridge_subnet: String,
+
+        /// Permit DNS egress to the explicitly configured resolvers.
+        #[arg(long, requires = "dns")]
+        egress_dns: bool,
+
+        /// Log denied egress packets (requires host net.netfilter.nf_log_all_netns=1).
+        #[arg(long)]
+        egress_log_denied: bool,
 
         /// Native bridge NAT backend: auto, kernel, or userspace.
         #[arg(long = "nat-backend", default_value = "auto")]
@@ -1523,6 +1547,10 @@ struct RunConfig {
     credential_broker_no_proxy_env: bool,
     dns: Vec<String>,
     nat_backend: NatBackend,
+    bridge_name: String,
+    bridge_subnet: String,
+    egress_dns: bool,
+    egress_log_denied: bool,
     health_cmd: Option<String>,
     health_interval: Option<u64>,
     health_retries: Option<u32>,
@@ -1622,6 +1650,10 @@ impl Default for RunConfig {
             credential_broker_no_proxy_env: false,
             dns: Vec::new(),
             nat_backend: NatBackend::Auto,
+            bridge_name: "nucleus0".into(),
+            bridge_subnet: "10.0.42.0/24".into(),
+            egress_dns: false,
+            egress_log_denied: false,
             health_cmd: None,
             health_interval: None,
             health_retries: None,
@@ -2192,6 +2224,10 @@ fn try_main() -> Result<i32> {
             credential_broker_no_proxy_env,
             dns,
             nat_backend,
+            bridge_name,
+            bridge_subnet,
+            egress_dns,
+            egress_log_denied,
             health_cmd,
             health_interval,
             health_retries,
@@ -2304,6 +2340,10 @@ fn try_main() -> Result<i32> {
                     credential_broker_no_proxy_env,
                     dns,
                     nat_backend,
+                    bridge_name,
+                    bridge_subnet,
+                    egress_dns,
+                    egress_log_denied,
                     health_cmd,
                     health_interval,
                     health_retries,
@@ -2506,6 +2546,10 @@ fn try_main() -> Result<i32> {
                 credential_broker_no_proxy_env,
                 dns,
                 nat_backend,
+                bridge_name,
+                bridge_subnet,
+                egress_dns,
+                egress_log_denied,
                 health_cmd,
                 health_interval,
                 health_retries,
@@ -2598,6 +2642,14 @@ fn try_main() -> Result<i32> {
                 info!("Swap enabled");
             }
 
+            if (egress_dns || egress_log_denied) && !matches!(network, NetworkModeArg::Bridge) {
+                return Err(NucleusError::ConfigError(
+                    "DNS and denied-packet egress settings require bridge networking".into(),
+                ));
+            }
+            if egress_dns && (dns.is_empty() || credential_broker.is_some()) {
+                return Err(NucleusError::ConfigError("--egress-dns requires explicit resolvers and is incompatible with broker-only egress".into()));
+            }
             let net_mode = match network {
                 NetworkModeArg::None => NetworkMode::None,
                 NetworkModeArg::Host => NetworkMode::Host,
@@ -2614,12 +2666,14 @@ fn try_main() -> Result<i32> {
                             service_mode.label()
                         )));
                     }
-                    let mut bridge_config = if dns.is_empty() {
-                        BridgeConfig::default().with_public_dns()
-                    } else {
-                        BridgeConfig::default().with_dns(dns.clone())
-                    }
-                    .with_nat_backend(nat_backend);
+                    let mut bridge_config = BridgeConfig {
+                        bridge_name,
+                        subnet: bridge_subnet,
+                        dns: dns.clone(),
+                        nat_backend,
+                        ..BridgeConfig::default()
+                    };
+                    bridge_config.validate()?;
                     // Parse port forwards
                     for spec in &publish {
                         let pf = PortForward::parse(spec)?;
@@ -2831,11 +2885,7 @@ fn try_main() -> Result<i32> {
                 config = config.with_landlock_policy_sha256(sha256);
             }
 
-            // Egress policy: in production mode, set deny-all by default for
-            // network namespaces where Nucleus can enforce it. Domain entries
-            // resolve to IPv4 rules before the namespace-local iptables policy
-            // is installed. gvisor-host is explicit hostinet and cannot be
-            // constrained by namespace-local iptables rules.
+            // Hostinet cannot enforce a workload-local firewall.
             let gvisor_host_network = matches!(config.network, NetworkMode::GVisorHost);
             if let Some(endpoint) = credential_broker {
                 if gvisor_host_network {
@@ -2858,7 +2908,8 @@ fn try_main() -> Result<i32> {
                 let broker = CredentialBrokerConfig::parse_endpoint(&endpoint)
                     .map_err(NucleusError::ConfigError)?
                     .with_proxy_env(!credential_broker_no_proxy_env);
-                let policy = broker.egress_policy();
+                let mut policy = broker.egress_policy();
+                policy.log_denied = egress_log_denied;
                 config = config
                     .with_credential_broker(broker)
                     .with_egress_policy(policy);
@@ -2866,18 +2917,26 @@ fn try_main() -> Result<i32> {
                 return Err(NucleusError::ConfigError(
                     "--credential-broker-no-proxy-env requires --credential-broker".to_string(),
                 ));
-            } else if !egress_allow.is_empty() || !egress_domains.is_empty() {
+            } else if !egress_allow.is_empty()
+                || !egress_domains.is_empty()
+                || egress_dns
+                || egress_log_denied
+            {
                 if gvisor_host_network {
                     return Err(NucleusError::ConfigError(
                         "--egress-allow/--egress-domain cannot be enforced with --network gvisor-host"
                             .to_string(),
                     ));
                 }
-                let policy = EgressPolicy::default()
-                    .with_allowed_cidrs(egress_allow)
-                    .with_allowed_domains(egress_domains)
-                    .with_allowed_tcp_ports(egress_tcp_ports)
-                    .with_allowed_udp_ports(egress_udp_ports);
+                let policy = EgressPolicy {
+                    allow_dns: egress_dns,
+                    log_denied: egress_log_denied,
+                    ..EgressPolicy::default()
+                }
+                .with_allowed_cidrs(egress_allow)
+                .with_allowed_domains(egress_domains)
+                .with_allowed_tcp_ports(egress_tcp_ports)
+                .with_allowed_udp_ports(egress_udp_ports);
                 config = config.with_egress_policy(policy);
             }
 
@@ -3403,6 +3462,10 @@ mod tests {
             credential_broker_no_proxy_env: true,
             dns: vec!["8.8.8.8".to_string()],
             nat_backend: NatBackend::Kernel,
+            bridge_name: "nucleus0".into(),
+            bridge_subnet: "10.0.42.0/24".into(),
+            egress_dns: false,
+            egress_log_denied: false,
             health_cmd: Some("curl -f http://127.0.0.1/health".to_string()),
             health_interval: Some(5),
             health_retries: Some(2),
@@ -3520,6 +3583,10 @@ mod tests {
             credential_broker_no_proxy_env: false,
             dns: Vec::new(),
             nat_backend: NatBackend::Auto,
+            bridge_name: "nucleus0".into(),
+            bridge_subnet: "10.0.42.0/24".into(),
+            egress_dns: false,
+            egress_log_denied: false,
             health_cmd: None,
             health_interval: None,
             health_retries: None,

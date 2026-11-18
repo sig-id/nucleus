@@ -257,7 +257,7 @@ mod tests {
         assert!(policy.allowed_domains.is_empty());
         assert!(policy.allowed_tcp_ports.is_empty());
         assert!(policy.allowed_udp_ports.is_empty());
-        assert!(policy.log_denied);
+        assert!(!policy.log_denied);
         assert!(!policy.allow_dns);
     }
 
@@ -268,8 +268,8 @@ mod tests {
         assert!(policy.allowed_domains.is_empty());
         assert!(policy.allowed_tcp_ports.is_empty());
         assert!(policy.allowed_udp_ports.is_empty());
-        assert!(policy.log_denied);
-        assert!(policy.allow_dns);
+        assert!(!policy.log_denied);
+        assert!(!policy.allow_dns);
     }
 
     #[test]
@@ -336,7 +336,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "set NUCLEUS_RUN_PRIVILEGED_E2E=1; requires root, kernel bridge networking, iptables, bash, and coreutils timeout"]
+    #[ignore = "set NUCLEUS_RUN_PRIVILEGED_E2E=1; requires root, kernel bridge networking, nftables, bash, and coreutils timeout"]
     fn test_credential_broker_e2e_allows_only_broker_endpoint() {
         if env::var_os("NUCLEUS_RUN_PRIVILEGED_E2E").is_none() {
             eprintln!("set NUCLEUS_RUN_PRIVILEGED_E2E=1 to run privileged broker e2e");

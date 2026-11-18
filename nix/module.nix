@@ -97,6 +97,9 @@ let
         description = "Native bridge NAT backend selection.";
       };
 
+      egressDns = mkEnableOption "DNS egress to the configured resolvers";
+      egressLogDenied = mkEnableOption "kernel logging for denied egress (requires net.netfilter.nf_log_all_netns=1)";
+
       egressAllow = mkOption {
         type = types.listOf types.str;
         default = [ ];
@@ -114,8 +117,7 @@ let
         example = [ "api.example.com" ];
         description = ''
           Allowed exact egress domains. Nucleus resolves each domain to IPv4
-          /32 rules at container startup; wildcard and suffix matching are not
-          supported.
+          addresses on the host and refreshes expiring grants while the container runs.
         '';
       };
 
@@ -475,6 +477,8 @@ let
         ]
         ++ lib.optionals (containerCfg.network == "bridge") [ "--nat-backend" (e containerCfg.natBackend) ]
         ++ (lib.concatMap (d: [ "--dns" (e d) ]) containerCfg.dns)
+        ++ optional containerCfg.egressDns "--egress-dns"
+        ++ optional containerCfg.egressLogDenied "--egress-log-denied"
         ++ (lib.concatMap (c: [ "--egress-allow" (e c) ]) containerCfg.egressAllow)
         ++ (lib.concatMap (d: [ "--egress-domain" (e d) ]) containerCfg.egressDomains)
         ++ (lib.concatMap (p: [ "--egress-tcp-port" (e (toString p)) ]) containerCfg.egressTcpPorts)
@@ -533,7 +537,7 @@ let
       wantedBy = [ "multi-user.target" ];
 
       path = lib.optionals (containerCfg.runtime == "gvisor") [ gvisor ]
-        ++ lib.optionals (containerCfg.network == "bridge") [ pkgs.iptables pkgs.slirp4netns ];
+        ++ lib.optionals (containerCfg.network == "bridge") [ pkgs.nftables pkgs.iptables pkgs.slirp4netns ];
 
       serviceConfig = {
         Type = if containerCfg.sdNotify then "notify" else "simple";
@@ -574,7 +578,7 @@ let
       wants = [ "network-online.target" ];
       wantedBy = [ "multi-user.target" ];
 
-      path = [ pkgs.iptables pkgs.slirp4netns ] ++ lib.optionals (pkgs ? gvisor) [ gvisor ];
+      path = [ pkgs.nftables pkgs.iptables pkgs.slirp4netns ] ++ lib.optionals (pkgs ? gvisor) [ gvisor ];
 
       serviceConfig = {
         Type = "oneshot";

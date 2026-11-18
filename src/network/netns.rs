@@ -1,123 +1,117 @@
-//! Network namespace helpers replacing external `nsenter` usage.
-//!
-//! * [`in_netns`] – enter a netns via `setns()` in a scoped thread to run
-//!   native Rust code (e.g. netlink operations) inside a container's network
-//!   namespace.
-//! * [`exec_in_netns`] – fork+setns+exec a program (e.g. `iptables`) inside
-//!   a container's network namespace using `Command::pre_exec`.
-
+//! Pin both namespace handles from one proc directory before touching the network.
 use crate::error::{NucleusError, Result};
+use nix::sched::{setns, CloneFlags};
 use nix::unistd::{setresgid, setresuid, Gid, Uid};
+use std::fs::File;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 
-/// Run a closure inside the network namespace of `pid`.
-///
-/// Spawns a scoped thread that calls `setns(CLONE_NEWNET)` before invoking `f`.
-/// The thread joins before this function returns, so `f` may borrow from the
-/// caller's stack.
-pub fn in_netns<F, R>(pid: u32, f: F) -> Result<R>
-where
-    F: FnOnce() -> Result<R> + Send,
-    R: Send,
-{
-    let ns_path = format!("/proc/{}/ns/net", pid);
-    let ns_file = std::fs::File::open(&ns_path).map_err(|e| {
-        NucleusError::NetworkError(format!("failed to open netns for PID {}: {}", pid, e))
-    })?;
-
-    std::thread::scope(|scope| {
-        scope
-            .spawn(|| {
-                nix::sched::setns(&ns_file, nix::sched::CloneFlags::CLONE_NEWNET).map_err(|e| {
-                    NucleusError::NetworkError(format!("setns(CLONE_NEWNET): {}", e))
-                })?;
-                f()
-            })
-            .join()
-            .map_err(|_| NucleusError::NetworkError("netns worker thread panicked".to_string()))?
-    })
+pub(super) struct Namespaces {
+    pub net: File,
+    pub user: Option<File>,
+    pub mapped_root: Option<u32>,
 }
 
-/// Execute a program inside the network namespace of `pid`.
-///
-/// Uses `Command::pre_exec` to call `setns(CLONE_NEWNET)` in the child
-/// process after fork, before exec. This is the replacement for
-/// `nsenter -t <pid> -n <program> <args...>`.
-///
-/// `program` should be an absolute path (e.g. from `resolve_bin`). `arg0`
-/// must be the helper applet name expected by multi-call binaries.
-pub(crate) fn exec_in_netns(pid: u32, program: &str, arg0: &str, args: &[&str]) -> Result<()> {
-    exec_in_namespaces(pid, false, program, arg0, args)
-}
-
-/// Execute a program inside the user+network namespaces of `pid`.
-///
-/// For rootless containers, network administration inside the target netns
-/// requires first joining the target user namespace, matching the ordering used
-/// by `nsenter -U -n`.
-pub(crate) fn exec_in_user_netns(pid: u32, program: &str, arg0: &str, args: &[&str]) -> Result<()> {
-    exec_in_namespaces(pid, true, program, arg0, args)
-}
-
-fn exec_in_namespaces(
-    pid: u32,
-    enter_userns: bool,
-    program: &str,
-    arg0: &str,
-    args: &[&str],
-) -> Result<()> {
-    let userns_file = if enter_userns {
-        let userns_path = format!("/proc/{}/ns/user", pid);
-        Some(std::fs::File::open(&userns_path).map_err(|e| {
-            NucleusError::NetworkError(format!("failed to open userns for PID {}: {}", pid, e))
-        })?)
-    } else {
-        None
-    };
-
-    let ns_path = format!("/proc/{}/ns/net", pid);
-    let ns_file = std::fs::File::open(&ns_path).map_err(|e| {
-        NucleusError::NetworkError(format!("failed to open netns for PID {}: {}", pid, e))
-    })?;
-
-    // SAFETY: The pre_exec closure runs after fork() in the child process.
-    // setns() is a single syscall and is async-signal-safe.  ns_file is a
-    // valid open fd inherited by the child.
-    let mut command = Command::new(program);
-    command.arg0(arg0);
-
-    let output = unsafe {
-        command
-            .args(args)
-            .pre_exec(move || {
-                if let Some(ref userns) = userns_file {
-                    nix::sched::setns(userns, nix::sched::CloneFlags::CLONE_NEWUSER)
-                        .map_err(std::io::Error::other)?;
-                    setresgid(Gid::from_raw(0), Gid::from_raw(0), Gid::from_raw(0))
-                        .map_err(std::io::Error::other)?;
-                    setresuid(Uid::from_raw(0), Uid::from_raw(0), Uid::from_raw(0))
-                        .map_err(std::io::Error::other)?;
-                }
-                nix::sched::setns(&ns_file, nix::sched::CloneFlags::CLONE_NEWNET)
-                    .map_err(std::io::Error::other)
-            })
-            .output()
-    }
-    .map_err(|e| {
-        NucleusError::NetworkError(format!("exec {} in netns({}): {}", program, pid, e))
-    })?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(NucleusError::NetworkError(format!(
-            "{} {:?} failed in netns({}): {}",
-            program,
-            args,
-            pid,
-            stderr.trim()
-        )));
+impl Namespaces {
+    pub fn open(pid: u32, user: bool) -> Result<Self> {
+        let proc = File::open(format!("/proc/{pid}"))?;
+        let directory = format!("/proc/self/fd/{}", proc.as_raw_fd());
+        let net = File::open(format!("{directory}/ns/net"))?;
+        let current = std::fs::metadata("/proc/thread-self/ns/net")?;
+        let target = net.metadata()?;
+        if (current.dev(), current.ino()) == (target.dev(), target.ino()) {
+            return Err(NucleusError::NetworkError(
+                "Bridge networking requires a private workload network namespace".into(),
+            ));
+        }
+        let user = user
+            .then(|| File::open(format!("{directory}/ns/user")))
+            .transpose()?;
+        let mapped_root = if let Some(ns) = &user {
+            let current = std::fs::metadata("/proc/thread-self/ns/user")?;
+            let target = ns.metadata()?;
+            if (current.dev(), current.ino()) == (target.dev(), target.ino()) {
+                return Err(NucleusError::NetworkError(
+                    "Expected a separate workload user namespace".into(),
+                ));
+            }
+            let map = std::fs::read_to_string(format!("{directory}/uid_map"))?;
+            Some(
+                map.lines()
+                    .find_map(|line| {
+                        let mut fields = line.split_whitespace();
+                        (fields.next()? == "0")
+                            .then(|| fields.next()?.parse::<u32>().ok())
+                            .flatten()
+                    })
+                    .filter(|uid| *uid != 0)
+                    .ok_or_else(|| {
+                        NucleusError::NetworkError(
+                            "Workload UID 0 must map to a nonzero host UID".into(),
+                        )
+                    })?,
+            )
+        } else {
+            None
+        };
+        Ok(Self {
+            net,
+            user,
+            mapped_root,
+        })
     }
 
-    Ok(())
+    pub fn enter_user(&self) -> std::io::Result<()> {
+        if let Some(user) = &self.user {
+            if Uid::effective().is_root() {
+                nix::unistd::setgroups(&[])?;
+            }
+            setns(user, CloneFlags::CLONE_NEWUSER)?;
+            let gid = Gid::from_raw(0);
+            let uid = Uid::from_raw(0);
+            setresgid(gid, gid, gid)?;
+            setresuid(uid, uid, uid)?;
+        }
+        Ok(())
+    }
+
+    pub fn command(&self, program: &str) -> Result<Command> {
+        let net = self.net.try_clone()?;
+        let user = self.user.as_ref().map(File::try_clone).transpose()?;
+        let ns = Self {
+            net,
+            user,
+            mapped_root: self.mapped_root,
+        };
+        let mut command = Command::new(program);
+        command.env_clear();
+        // Only namespace and credential syscalls run between fork and exec.
+        unsafe {
+            command.pre_exec(move || {
+                ns.enter_user()?;
+                setns(&ns.net, CloneFlags::CLONE_NEWNET)?;
+                Ok(())
+            });
+        }
+        Ok(command)
+    }
+
+    pub fn configure<F>(&self, configure: F) -> Result<()>
+    where
+        F: FnOnce() -> Result<()> + Send,
+    {
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    setns(&self.net, CloneFlags::CLONE_NEWNET).map_err(|e| {
+                        NucleusError::NetworkError(format!("enter pinned network namespace: {e}"))
+                    })?;
+                    configure()
+                })
+                .join()
+                .map_err(|_| NucleusError::NetworkError("netns worker panicked".into()))?
+        })
+    }
 }

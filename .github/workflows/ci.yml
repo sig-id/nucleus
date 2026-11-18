@@ -45,11 +45,16 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: sudo
         run: cargo test --locked --lib filesystem::target::tests::recursive_bind_restricts_nested_mounts -- --ignored --exact
 
-      - name: Verify dual-stack egress and restore cgroup inheritance
+      - name: Install networking test dependencies
+        run: sudo apt-get install -y nftables
+
+      - name: Verify bridge isolation, dual-stack egress and restore cgroup inheritance
         env:
           RUSTC_WRAPPER: ""
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: sudo
         run: |
+          cargo test --locked --lib network::egress::tests::domain_refresh_withdraws_protected_results_and_expires_without_supervisor -- --ignored --exact
+          cargo test --locked --lib network::bridge::tests::isolated_bridge_routes_only_intended_traffic -- --ignored --exact
           cargo test --locked --lib network::egress::tests::deny_all_sets_both_kernel_output_policies -- --ignored --exact
           cargo test --locked --lib checkpoint::criu::tests::restore_helper_and_descendants_inherit_limits_and_saved_identity -- --ignored --exact
 

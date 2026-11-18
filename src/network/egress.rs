@@ -1,207 +1,332 @@
-use super::{netns, BridgeNetwork, EgressPolicy};
+use super::{firewall, netlink, netns::Namespaces, BridgeConfig, EgressPolicy};
 use crate::error::{NucleusError, Result};
-use std::net::{IpAddr, ToSocketAddrs};
-use tracing::{debug, info};
+use std::collections::BTreeSet;
+use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::Duration;
 
-fn resolve_domain_cidrs(domains: &[String]) -> Result<Vec<String>> {
-    let mut cidrs = Vec::new();
+fn public_destination(ip: Ipv4Addr, bridge: &BridgeConfig) -> Result<bool> {
+    let [a, b, c, _] = ip.octets();
+    // Reject special-use and non-unicast ranges before installing any result.
+    let special = a == 0
+        || a == 10
+        || a == 127
+        || a >= 224
+        || (a == 100 && (64..128).contains(&b))
+        || (a == 169 && b == 254)
+        || (a == 172 && (16..32).contains(&b))
+        || (a == 192 && (b == 168 || (b == 0 && (c == 0 || c == 2)) || (b == 88 && c == 99)))
+        || (a == 198 && (b == 18 || b == 19 || (b == 51 && c == 100)))
+        || (a == 203 && b == 0 && c == 113);
+    Ok(!special
+        && !bridge
+            .contains_ipv4(ip)
+            .map_err(NucleusError::NetworkError)?
+        && !netlink::is_addr_in_use(&ip)?)
+}
 
+fn resolve(domains: &[String], bridge: &BridgeConfig) -> Result<BTreeSet<Ipv4Addr>> {
+    let mut ips = BTreeSet::new();
     for domain in domains {
-        crate::network::config::validate_egress_domain(domain)
-            .map_err(|e| NucleusError::NetworkError(format!("Invalid egress domain: {}", e)))?;
-
-        let mut resolved_any_ipv4 = false;
-        let addrs = (domain.as_str(), 0).to_socket_addrs().map_err(|e| {
-            NucleusError::NetworkError(format!(
-                "Failed to resolve egress domain '{}': {}",
-                domain, e
-            ))
-        })?;
-
-        for addr in addrs {
-            if let IpAddr::V4(ip) = addr.ip() {
-                resolved_any_ipv4 = true;
-                cidrs.push(format!("{}/32", ip));
+        super::validate_egress_domain(domain).map_err(NucleusError::NetworkError)?;
+        let mut found = false;
+        for address in (domain.as_str(), 0).to_socket_addrs()? {
+            if let IpAddr::V4(ip) = address.ip() {
+                if !public_destination(ip, bridge)? {
+                    return Err(NucleusError::NetworkError(format!(
+                        "Domain {domain} returned a protected destination {ip}"
+                    )));
+                }
+                ips.insert(ip);
+                found = true;
             }
         }
-
-        if !resolved_any_ipv4 {
+        if !found {
             return Err(NucleusError::NetworkError(format!(
-                "Egress domain '{}' resolved no IPv4 addresses",
-                domain
+                "No eligible IPv4 addresses for {domain}"
             )));
         }
     }
-
-    cidrs.sort();
-    cidrs.dedup();
-    Ok(cidrs)
+    Ok(ips)
 }
 
-pub(crate) fn apply_egress_policy(
-    pid: u32,
-    dns: &[String],
-    policy: &EgressPolicy,
-    join_userns: bool,
-) -> Result<()> {
-    for cidr in &policy.allowed_cidrs {
-        crate::network::config::validate_egress_cidr(cidr)
-            .map_err(|e| NucleusError::NetworkError(format!("Invalid egress CIDR: {}", e)))?;
+fn allow_destination(rules: &mut String, dest: &str, policy: &EgressPolicy) {
+    if policy.allowed_tcp_ports.is_empty() && policy.allowed_udp_ports.is_empty() {
+        rules.push_str(&format!("ip daddr {dest} accept\n"));
     }
-    let resolved_domain_cidrs = resolve_domain_cidrs(&policy.allowed_domains)?;
-    let allowed_cidrs = policy
-        .allowed_cidrs
-        .iter()
-        .chain(resolved_domain_cidrs.iter());
-
-    // The bridge allowlist uses IPv4 CIDRs. Close the entire other address
-    // family before releasing the workload, including when DNS is allowed.
-    let ip6t = BridgeNetwork::resolve_bin("ip6tables")?;
-    for args in [
-        &["-P", "OUTPUT", "DROP"][..],
-        &["-F", "OUTPUT"],
-        &["-A", "OUTPUT", "-o", "lo", "-j", "ACCEPT"],
+    for (proto, ports) in [
+        ("tcp", &policy.allowed_tcp_ports),
+        ("udp", &policy.allowed_udp_ports),
     ] {
-        if join_userns {
-            netns::exec_in_user_netns(pid, &ip6t, "ip6tables", args)?;
-        } else {
-            netns::exec_in_netns(pid, &ip6t, "ip6tables", args)?;
+        if !ports.is_empty() {
+            let ports = ports
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            rules.push_str(&format!(
+                "ip daddr {dest} {proto} dport {{ {ports} }} accept\n"
+            ));
         }
     }
-    let ipt = BridgeNetwork::resolve_bin("iptables")?;
-    let exec = |args: &[&str]| {
-        if join_userns {
-            netns::exec_in_user_netns(pid, &ipt, "iptables", args)
-        } else {
-            netns::exec_in_netns(pid, &ipt, "iptables", args)
-        }
-    };
+}
 
-    exec(&["-P", "OUTPUT", "DROP"])?;
-    exec(&["-F", "OUTPUT"])?;
-    exec(&["-A", "OUTPUT", "-o", "lo", "-j", "ACCEPT"])?;
-    exec(&[
-        "-A",
-        "OUTPUT",
-        "-m",
-        "conntrack",
-        "--ctstate",
-        "ESTABLISHED,RELATED",
-        "-j",
-        "ACCEPT",
-    ])?;
-
-    if policy.allow_dns {
-        for dns in dns {
-            exec(&[
-                "-A", "OUTPUT", "-p", "udp", "-d", dns, "--dport", "53", "-j", "ACCEPT",
-            ])?;
-            exec(&[
-                "-A", "OUTPUT", "-p", "tcp", "-d", dns, "--dport", "53", "-j", "ACCEPT",
-            ])?;
-        }
+fn replace_domains(set: &str, ips: &BTreeSet<Ipv4Addr>) -> String {
+    let mut rules = format!("flush set inet nucleus_egress {set}\n");
+    if !ips.is_empty() {
+        let elements = ips
+            .iter()
+            .map(Ipv4Addr::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        rules.push_str(&format!(
+            "add element inet nucleus_egress {set} {{ {elements} }}\n"
+        ));
     }
+    rules
+}
 
-    for cidr in allowed_cidrs {
-        if policy.allowed_tcp_ports.is_empty() && policy.allowed_udp_ports.is_empty() {
-            exec(&["-A", "OUTPUT", "-d", cidr, "-j", "ACCEPT"])?;
-        } else {
-            for port in &policy.allowed_tcp_ports {
-                let port_s = port.to_string();
-                exec(&[
-                    "-A", "OUTPUT", "-p", "tcp", "-d", cidr, "--dport", &port_s, "-j", "ACCEPT",
-                ])?;
-            }
-            for port in &policy.allowed_udp_ports {
-                let port_s = port.to_string();
-                exec(&[
-                    "-A", "OUTPUT", "-p", "udp", "-d", cidr, "--dport", &port_s, "-j", "ACCEPT",
-                ])?;
-            }
-        }
+// Dropping the sender stops the worker. Kernel timeouts close the grant even
+// when the host resolver hangs or the supervisor exits unexpectedly.
+struct DomainRefresh {
+    _stop: mpsc::Sender<()>,
+}
+
+#[derive(Default)]
+pub(super) struct GuestFirewall {
+    refresh: Mutex<Option<DomainRefresh>>,
+}
+
+impl GuestFirewall {
+    pub fn apply(
+        &self,
+        ns: Arc<Namespaces>,
+        bridge: &BridgeConfig,
+        policy: &EgressPolicy,
+    ) -> Result<()> {
+        let mut worker = self
+            .refresh
+            .lock()
+            .map_err(|_| NucleusError::NetworkError("egress worker lock poisoned".into()))?;
+        *worker = install(ns, bridge, policy)?;
+        Ok(())
     }
+}
 
-    if policy.log_denied {
-        exec(&[
-            "-A",
-            "OUTPUT",
-            "-m",
-            "limit",
-            "--limit",
-            "5/min",
-            "-j",
-            "LOG",
-            "--log-prefix",
-            "nucleus-egress-denied: ",
-        ])?;
+fn install(
+    ns: Arc<Namespaces>,
+    bridge: &BridgeConfig,
+    policy: &EgressPolicy,
+) -> Result<Option<DomainRefresh>> {
+    bridge.validate()?;
+    if policy.allow_dns && bridge.dns.is_empty() {
+        return Err(NucleusError::NetworkError(
+            "DNS egress requires configured resolvers".into(),
+        ));
     }
-
-    exec(&["-P", "OUTPUT", "DROP"])?;
-
-    info!(
-        "Egress policy applied: {} allowed CIDRs, {} allowed domains",
-        policy.allowed_cidrs.len(),
-        policy.allowed_domains.len()
+    if policy.log_denied
+        && std::fs::read_to_string("/proc/sys/net/netfilter/nf_log_all_netns")
+            .unwrap_or_default()
+            .trim()
+            != "1"
+    {
+        return Err(NucleusError::NetworkError(
+            "Denied-packet kernel logging requires host net.netfilter.nf_log_all_netns=1".into(),
+        ));
+    }
+    let ips = resolve(&policy.allowed_domains, bridge)?;
+    // A delayed refresh from a previous policy cannot populate the new set.
+    static NEXT_SET: AtomicU64 = AtomicU64::new(0);
+    let set = format!("domains_{}", NEXT_SET.fetch_add(1, Ordering::Relaxed));
+    let mut rules = format!(
+        r#"add table inet nucleus_egress
+delete table inet nucleus_egress
+table inet nucleus_egress {{
+  set {set} {{ type ipv4_addr; flags timeout; timeout 60s; }}
+  chain output {{
+    type filter hook output priority filter; policy drop;
+    oifname "lo" accept
+    meta nfproto ipv4 ct direction reply ct state established,related accept
+"#
     );
-    debug!("Egress policy details: {:?}", policy);
-
-    Ok(())
+    if policy.allow_dns {
+        for dns in &bridge.dns {
+            for proto in ["udp", "tcp"] {
+                rules.push_str(&format!("ip daddr {dns} {proto} dport 53 accept\n"));
+            }
+        }
+    }
+    for cidr in &policy.allowed_cidrs {
+        super::validate_egress_cidr(cidr).map_err(NucleusError::NetworkError)?;
+        allow_destination(&mut rules, cidr, policy);
+    }
+    if !policy.allowed_domains.is_empty() {
+        allow_destination(&mut rules, &format!("@{set}"), policy);
+    }
+    if policy.log_denied {
+        rules.push_str("limit rate 5/minute log prefix \"nucleus-egress-denied: \"\n");
+    }
+    rules.push_str("counter drop\n}\n}\n");
+    rules.push_str(&replace_domains(&set, &ips));
+    firewall::transact(Some(&ns), &rules)?;
+    if policy.allowed_domains.is_empty() {
+        return Ok(None);
+    }
+    let names = policy.allowed_domains.clone();
+    let bridge = bridge.clone();
+    let (stop, rx) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("nucleus-egress-dns".into())
+        .spawn(move || {
+            while matches!(
+                rx.recv_timeout(Duration::from_secs(30)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ) {
+                let ips = resolve(&names, &bridge).unwrap_or_else(|e| {
+                    tracing::warn!("Withdrawing DNS egress grants: {e}");
+                    BTreeSet::new()
+                });
+                if let Err(e) = firewall::transact(Some(&ns), &replace_domains(&set, &ips)) {
+                    tracing::warn!("Cannot refresh DNS egress grants: {e}");
+                }
+            }
+        })?;
+    Ok(Some(DomainRefresh { _stop: stop }))
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
-    #[ignore = "requires a private network namespace, netfilter and iptables/ip6tables"]
-    fn deny_all_sets_both_kernel_output_policies() {
-        use std::os::unix::process::CommandExt;
-        match unsafe { nix::unistd::fork().unwrap() } {
-            nix::unistd::ForkResult::Parent { child } => assert_eq!(
-                nix::sys::wait::waitpid(child, None).unwrap(),
-                nix::sys::wait::WaitStatus::Exited(child, 0)
-            ),
-            nix::unistd::ForkResult::Child => {
-                nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNET).unwrap();
-                super::apply_egress_policy(
-                    std::process::id(),
-                    &[],
-                    &super::EgressPolicy::deny_all(),
-                    false,
-                )
-                .unwrap();
-                for name in ["iptables", "ip6tables"] {
-                    let tool = super::BridgeNetwork::resolve_bin(name).unwrap();
-                    let output = std::process::Command::new(tool)
-                        .arg0(name)
-                        .args(["-S", "OUTPUT"])
-                        .output()
-                        .unwrap();
-                    assert!(output.status.success());
-                    let rules = String::from_utf8(output.stdout).unwrap();
-                    assert!(rules.lines().any(|line| line == "-P OUTPUT DROP"));
-                    assert!(rules
-                        .lines()
-                        .any(|line| line == "-A OUTPUT -o lo -j ACCEPT"));
-                    if name == "ip6tables" {
-                        assert_eq!(rules.lines().count(), 2);
-                    }
-                }
-                std::process::exit(0);
-            }
+    fn domain_answers_cannot_grant_special_or_bridge_addresses() {
+        let bridge = BridgeConfig {
+            subnet: "9.8.7.0/24".into(),
+            ..Default::default()
+        };
+        for ip in [
+            "169.254.169.254",
+            "10.0.0.1",
+            "9.8.7.1",
+            "100.64.0.1",
+            "127.0.0.1",
+            "224.0.0.1",
+            "255.255.255.255",
+        ] {
+            assert!(!public_destination(ip.parse().unwrap(), &bridge).unwrap());
         }
     }
 
     #[test]
-    fn test_egress_policy_preserves_iptables_applet_argv0() {
-        let source = include_str!("egress.rs");
-        let implementation = source.split("#[cfg(test)]").next().unwrap();
+    #[ignore = "requires private mount and network namespaces, nftables and CAP_NET_ADMIN"]
+    fn domain_refresh_withdraws_protected_results_and_expires_without_supervisor() {
+        use nix::mount::{mount, MsFlags};
+        use nix::sched::{unshare, CloneFlags};
+        use std::io::Write;
+        use std::path::Path;
+        std::thread::spawn(|| {
+            unshare(CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWNET).unwrap();
+            mount(
+                None::<&str>,
+                "/",
+                None::<&str>,
+                MsFlags::MS_REC | MsFlags::MS_PRIVATE,
+                None::<&str>,
+            )
+            .unwrap();
+            let mut hosts = tempfile::NamedTempFile::new().unwrap();
+            writeln!(hosts, "93.184.216.34 allow.nucleus.test").unwrap();
+            mount(
+                Some(hosts.path()),
+                Path::new("/etc/hosts"),
+                None::<&str>,
+                MsFlags::MS_BIND,
+                None::<&str>,
+            )
+            .unwrap();
+            let ns = Arc::new(Namespaces {
+                net: std::fs::File::open("/proc/thread-self/ns/net").unwrap(),
+                user: None,
+                mapped_root: None,
+            });
+            let nft = super::super::BridgeNetwork::resolve_bin("nft").unwrap();
+            let list = || {
+                let out = ns
+                    .command(&nft)
+                    .unwrap()
+                    .args(["list", "table", "inet", "nucleus_egress"])
+                    .output()
+                    .unwrap();
+                assert!(out.status.success());
+                String::from_utf8(out.stdout).unwrap()
+            };
+            let policy =
+                EgressPolicy::default().with_allowed_domains(vec!["allow.nucleus.test".into()]);
+            let firewall = GuestFirewall::default();
+            firewall
+                .apply(ns.clone(), &BridgeConfig::default(), &policy)
+                .unwrap();
+            assert!(list().contains("93.184.216.34"));
+            std::fs::write(hosts.path(), "169.254.169.254 allow.nucleus.test\n").unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(50);
+            while list().contains("93.184.216.34") {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "stale grant survived the refresh"
+                );
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            assert!(!list().contains("169.254.169.254"));
+            std::fs::write(hosts.path(), "93.184.216.34 allow.nucleus.test\n").unwrap();
+            firewall
+                .apply(ns.clone(), &BridgeConfig::default(), &policy)
+                .unwrap();
+            drop(firewall);
+            assert!(list().contains("93.184.216.34"));
+            let deadline = std::time::Instant::now() + Duration::from_secs(75);
+            while list().contains("93.184.216.34") {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "kernel failed to expire DNS grant"
+                );
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        })
+        .join()
+        .unwrap();
+    }
 
-        assert!(
-            implementation.contains("exec_in_user_netns(pid, &ipt, \"iptables\", args)"),
-            "rootless egress policy must preserve iptables argv[0] inside the target namespaces"
-        );
-        assert!(
-            implementation.contains("exec_in_netns(pid, &ipt, \"iptables\", args)"),
-            "privileged egress policy must preserve iptables argv[0] inside the target netns"
-        );
+    #[test]
+    #[ignore = "requires private netns, nftables and CAP_NET_ADMIN"]
+    fn deny_all_sets_both_kernel_output_policies() {
+        std::thread::spawn(|| {
+            nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNET).unwrap();
+            let ns = Arc::new(Namespaces {
+                net: std::fs::File::open("/proc/thread-self/ns/net").unwrap(),
+                user: None,
+                mapped_root: None,
+            });
+            GuestFirewall::default()
+                .apply(
+                    ns.clone(),
+                    &BridgeConfig::default(),
+                    &EgressPolicy::deny_all(),
+                )
+                .unwrap();
+            let nft = super::super::BridgeNetwork::resolve_bin("nft").unwrap();
+            let out = ns
+                .command(&nft)
+                .unwrap()
+                .args(["list", "chain", "inet", "nucleus_egress", "output"])
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+            let listing = String::from_utf8(out.stdout).unwrap();
+            assert!(listing.contains("policy drop;") && listing.contains("oifname \"lo\" accept"));
+            assert!(!listing.contains("dport 53"));
+        })
+        .join()
+        .unwrap();
     }
 }

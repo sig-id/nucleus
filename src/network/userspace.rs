@@ -1,17 +1,18 @@
+use super::netns::Namespaces;
 use super::{
     egress, BridgeConfig, BridgeNetwork, EgressPolicy, NatBackend, NetworkState, PortForward,
 };
 use crate::error::{NucleusError, Result, StateTransition};
-use nix::fcntl::{fcntl, FcntlArg, FdFlag};
 use serde_json::json;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
-use std::os::unix::process::ExitStatusExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 const SLIRP_TAP_NAME: &str = "tap0";
 
@@ -29,11 +30,23 @@ impl BridgeDriver {
         host_is_root: bool,
         rootless: bool,
     ) -> Result<Self> {
+        Self::setup_with_id_and_broker(pid, config, container_id, host_is_root, rootless, None)
+    }
+
+    pub(crate) fn setup_with_id_and_broker(
+        pid: u32,
+        config: &BridgeConfig,
+        container_id: &str,
+        host_is_root: bool,
+        rootless: bool,
+        broker: Option<&super::CredentialBrokerConfig>,
+    ) -> Result<Self> {
         match config.selected_nat_backend(host_is_root, rootless) {
-            NatBackend::Kernel => Ok(Self::Kernel(BridgeNetwork::setup_with_id(
+            NatBackend::Kernel => Ok(Self::Kernel(BridgeNetwork::setup_for(
                 pid,
                 config,
                 container_id,
+                broker,
             )?)),
             NatBackend::Userspace => Ok(Self::Userspace(UserspaceNetwork::setup_with_id(
                 pid,
@@ -52,11 +65,11 @@ impl BridgeDriver {
         &self,
         pid: u32,
         policy: &EgressPolicy,
-        rootless: bool,
+        _rootless: bool,
     ) -> Result<()> {
         match self {
             Self::Kernel(net) => net.apply_egress_policy(pid, policy),
-            Self::Userspace(net) => net.apply_egress_policy(pid, policy, rootless),
+            Self::Userspace(net) => net.apply_egress_policy(pid, policy, _rootless),
         }
     }
 
@@ -74,17 +87,15 @@ pub struct UserspaceNetwork {
     guest_ip: String,
     container_id: String,
     api_socket_path: PathBuf,
-    runtime_dir: PathBuf,
+    _runtime_dir: tempfile::TempDir,
+    namespaces: std::sync::Arc<Namespaces>,
+    firewall: egress::GuestFirewall,
     exit_signal: Option<OwnedFd>,
     child: Child,
     state: NetworkState,
 }
 
 impl UserspaceNetwork {
-    pub(crate) fn default_dns_server(subnet: &str) -> Result<String> {
-        Self::dns_ip_from_subnet(subnet)
-    }
-
     pub fn setup_with_id(
         pid: u32,
         config: &BridgeConfig,
@@ -100,59 +111,40 @@ impl UserspaceNetwork {
         let mut state = NetworkState::Unconfigured;
         state = state.transition(NetworkState::Configuring)?;
 
-        let runtime_dir = Self::runtime_dir(container_id);
-        Self::ensure_runtime_dir(&runtime_dir)?;
-        let api_socket_path = runtime_dir.join("slirp4netns.sock");
-
+        if !rootless {
+            return Err(NucleusError::NetworkError(
+                "Userspace NAT requires a remapped workload user namespace".into(),
+            ));
+        }
+        let namespaces = std::sync::Arc::new(Namespaces::open(pid, true)?);
+        let runtime_dir = Self::runtime_dir(host_is_root)?;
+        if host_is_root {
+            nix::unistd::chown(
+                runtime_dir.path(),
+                namespaces.mapped_root.map(nix::unistd::Uid::from_raw),
+                None,
+            )
+            .map_err(|e| {
+                NucleusError::NetworkError(format!("assign slirp socket directory: {e}"))
+            })?;
+        }
+        let api_socket_path = runtime_dir.path().join("api.sock");
         let slirp = BridgeNetwork::resolve_bin("slirp4netns")?;
-        // Keep slirp4netns inside the container user namespace whenever the
-        // container is rootless/root-remapped, even when Nucleus itself runs as
-        // host root. slirp4netns processes untrusted guest network traffic, so
-        // omitting --userns-path would run that helper as host root in the
-        // initial user namespace.
-        let needs_userns = Self::should_join_userns(host_is_root, rootless);
-
-        let slirp_path = Path::new(&slirp);
-        let (child, exit_write) = match Self::spawn_slirp(
-            slirp_path,
-            pid,
+        let (child, exit_write) = Self::spawn_slirp(
+            Path::new(&slirp),
             config,
-            needs_userns,
+            namespaces.clone(),
             &api_socket_path,
-            true,
-        ) {
-            Ok(result) => result,
-            Err(e) => {
-                warn!(
-                    "slirp4netns sandbox failed ({}), retrying without --enable-sandbox",
-                    e
-                );
-                // The sandbox uses pivot_root(2) which can fail in constrained
-                // environments (e.g. QEMU test VMs, nested containers) where
-                // mount propagation or /tmp restrictions prevent the pivot.
-                // Retry without --enable-sandbox while preserving user namespace
-                // confinement for rootless/root-remapped containers.
-                let _ = std::fs::remove_file(&api_socket_path);
-                Self::spawn_slirp(
-                    slirp_path,
-                    pid,
-                    config,
-                    needs_userns,
-                    &api_socket_path,
-                    false,
-                )
-                .inspect_err(|_| {
-                    let _ = std::fs::remove_dir_all(&runtime_dir);
-                })?
-            }
-        };
+        )?;
 
         let mut network = Self {
             config: config.clone(),
             guest_ip: guest_ip.to_string(),
             container_id: container_id.to_string(),
             api_socket_path,
-            runtime_dir,
+            _runtime_dir: runtime_dir,
+            namespaces,
+            firewall: Default::default(),
             exit_signal: Some(exit_write),
             child,
             state,
@@ -175,27 +167,17 @@ impl UserspaceNetwork {
 
     pub fn apply_egress_policy(
         &self,
-        pid: u32,
+        _pid: u32,
         policy: &EgressPolicy,
-        rootless: bool,
+        _rootless: bool,
     ) -> Result<()> {
-        egress::apply_egress_policy(pid, &self.effective_dns_servers(), policy, rootless)
+        self.firewall
+            .apply(self.namespaces.clone(), &self.config, policy)
     }
 
     pub fn cleanup(mut self) -> Result<()> {
         self.state = self.state.transition(NetworkState::Cleaned)?;
-        self.stop_child()?;
-        self.cleanup_runtime_dir();
-        Ok(())
-    }
-
-    fn effective_dns_servers(&self) -> Vec<String> {
-        if self.config.dns.is_empty() {
-            vec![Self::dns_ip_from_subnet(&self.config.subnet)
-                .unwrap_or_else(|_| "10.0.2.3".to_string())]
-        } else {
-            self.config.dns.clone()
-        }
+        self.stop_child()
     }
 
     fn configure_port_forwards(&mut self) -> Result<()> {
@@ -365,23 +347,11 @@ impl UserspaceNetwork {
             }
         }
 
-        self.cleanup_runtime_dir();
         self.state = NetworkState::Cleaned;
         debug!(
             "Userspace NAT cleaned up (best-effort via drop) for container {}",
             self.container_id
         );
-    }
-
-    fn cleanup_runtime_dir(&self) {
-        if let Err(e) = std::fs::remove_dir_all(&self.runtime_dir) {
-            if self.runtime_dir.exists() {
-                warn!(
-                    "Failed to remove slirp4netns runtime dir {:?}: {}",
-                    self.runtime_dir, e
-                );
-            }
-        }
     }
 
     fn validate_userspace_config(config: &BridgeConfig, guest_ip: &str) -> Result<()> {
@@ -409,40 +379,56 @@ impl UserspaceNetwork {
         Ok(())
     }
 
-    fn should_join_userns(_host_is_root: bool, rootless: bool) -> bool {
-        rootless
-    }
-
     fn spawn_slirp(
         slirp_bin: &Path,
-        pid: u32,
         config: &BridgeConfig,
-        needs_userns: bool,
+        ns: std::sync::Arc<Namespaces>,
         api_socket_path: &Path,
-        enable_sandbox: bool,
     ) -> Result<(Child, OwnedFd)> {
-        let (ready_read, ready_write) = nix::unistd::pipe()
-            .map_err(|e| NucleusError::NetworkError(format!("ready pipe: {}", e)))?;
-        let (exit_read, exit_write) = nix::unistd::pipe()
-            .map_err(|e| NucleusError::NetworkError(format!("exit pipe: {}", e)))?;
-        Self::clear_cloexec(&ready_write)?;
-        Self::clear_cloexec(&exit_read)?;
-
-        let args = Self::command_args(
-            pid,
-            config,
-            needs_userns,
-            api_socket_path,
+        let (ready_read, ready_write) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)?;
+        let (exit_read, exit_write) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)?;
+        let inherited = [
             ready_write.as_raw_fd(),
             exit_read.as_raw_fd(),
-            enable_sandbox,
-        );
-
-        let mut child = Command::new(slirp_bin)
-            .args(&args)
+            ns.net.as_raw_fd(),
+        ];
+        let mut command = Command::new(slirp_bin);
+        command.env_clear().args([
+            "--configure",
+            "--enable-sandbox",
+            "--enable-seccomp",
+            "--disable-host-loopback",
+            "--disable-dns",
+            "--netns-type=path",
+            "--cidr",
+            &config.subnet,
+            "--ready-fd",
+            &inherited[0].to_string(),
+            "--exit-fd",
+            &inherited[1].to_string(),
+        ]);
+        if !config.port_forwards.is_empty() {
+            command.arg("--api-socket").arg(api_socket_path);
+        }
+        command
+            .arg(format!("/proc/self/fd/{}", inherited[2]))
+            .arg(SLIRP_TAP_NAME);
+        // Enter the remapped user namespace before exec, including when the
+        // launcher is host root. Keep these three descriptors only in this child.
+        unsafe {
+            command.pre_exec(move || {
+                ns.enter_user()?;
+                for fd in inherited {
+                    if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
+        let mut child = command
             .spawn()
-            .map_err(|e| NucleusError::NetworkError(format!("spawn slirp4netns: {}", e)))?;
-
+            .map_err(|e| NucleusError::NetworkError(format!("spawn confined slirp4netns: {e}")))?;
         drop(ready_write);
         drop(exit_read);
 
@@ -456,98 +442,48 @@ impl UserspaceNetwork {
         }
     }
 
-    fn command_args(
-        pid: u32,
-        config: &BridgeConfig,
-        join_userns: bool,
-        api_socket_path: &Path,
-        ready_fd: i32,
-        exit_fd: i32,
-        enable_sandbox: bool,
-    ) -> Vec<String> {
-        let mut args = vec![
-            "--configure".to_string(),
-            "--ready-fd".to_string(),
-            ready_fd.to_string(),
-            "--exit-fd".to_string(),
-            exit_fd.to_string(),
-            "--api-socket".to_string(),
-            api_socket_path.display().to_string(),
-            "--cidr".to_string(),
-            config.subnet.clone(),
-            "--disable-host-loopback".to_string(),
-        ];
-
-        if enable_sandbox {
-            args.push("--enable-sandbox".to_string());
-        }
-
-        if !config.dns.is_empty() {
-            args.push("--disable-dns".to_string());
-        }
-
-        if join_userns {
-            args.push("--userns-path".to_string());
-            args.push(format!("/proc/{}/ns/user", pid));
-        }
-
-        args.push(pid.to_string());
-        args.push(SLIRP_TAP_NAME.to_string());
-        args
-    }
-
-    fn runtime_dir(container_id: &str) -> PathBuf {
-        let base = if nix::unistd::Uid::effective().is_root() {
-            PathBuf::from("/run/nucleus/userspace-net")
+    fn runtime_dir(root: bool) -> Result<tempfile::TempDir> {
+        let base = if root {
+            PathBuf::from("/run")
         } else {
-            dirs::runtime_dir()
-                .map(|dir| dir.join("nucleus/userspace-net"))
-                .or_else(|| dirs::data_local_dir().map(|dir| dir.join("nucleus/userspace-net")))
-                .unwrap_or_else(|| std::env::temp_dir().join("nucleus-userspace-net"))
+            dirs::runtime_dir().unwrap_or_else(|| PathBuf::from("/tmp"))
         };
-        base.join(container_id)
-    }
-
-    fn ensure_runtime_dir(path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                NucleusError::NetworkError(format!(
-                    "create userspace-net parent dir {:?}: {}",
-                    parent, e
-                ))
-            })?;
+        let meta = std::fs::symlink_metadata(&base)?;
+        let euid = nix::unistd::Uid::effective().as_raw();
+        let private = meta.uid() == euid && meta.mode() & 0o022 == 0;
+        let sticky_tmp =
+            base == Path::new("/tmp") && meta.uid() == 0 && meta.mode() & libc::S_ISVTX != 0;
+        if !base.is_absolute()
+            || base.canonicalize()? != base
+            || !meta.is_dir()
+            || !(private || sticky_tmp)
+        {
+            return Err(NucleusError::NetworkError(format!(
+                "Untrusted slirp runtime directory {base:?}"
+            )));
         }
-        std::fs::create_dir_all(path).map_err(|e| {
-            NucleusError::NetworkError(format!("create userspace-net dir {:?}: {}", path, e))
-        })?;
+        for parent in base.ancestors().skip(1) {
+            let meta = std::fs::symlink_metadata(parent)?;
+            let sticky =
+                parent == Path::new("/tmp") && meta.uid() == 0 && meta.mode() & libc::S_ISVTX != 0;
+            if !meta.is_dir()
+                || (meta.uid() != 0 && meta.uid() != euid)
+                || (meta.mode() & 0o022 != 0 && !sticky)
+            {
+                return Err(NucleusError::NetworkError(format!(
+                    "Untrusted slirp runtime parent {parent:?}"
+                )));
+            }
+        }
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
-            NucleusError::NetworkError(format!(
-                "secure userspace-net dir permissions for {:?}: {}",
-                path, e
-            ))
-        })?;
-        Ok(())
-    }
-
-    fn clear_cloexec(fd: &OwnedFd) -> Result<()> {
-        let flags = fcntl(fd, FcntlArg::F_GETFD).map_err(|e| {
-            NucleusError::NetworkError(format!("fcntl(F_GETFD) on fd {}: {}", fd.as_raw_fd(), e))
-        })?;
-        let fd_flags = FdFlag::from_bits_truncate(flags);
-        let new_flags = fd_flags & !FdFlag::FD_CLOEXEC;
-        fcntl(fd, FcntlArg::F_SETFD(new_flags)).map_err(|e| {
-            NucleusError::NetworkError(format!("fcntl(F_SETFD) on fd {}: {}", fd.as_raw_fd(), e))
-        })?;
-        Ok(())
+        Ok(tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .prefix("nx-slirp-")
+            .tempdir_in(base)?)
     }
 
     fn guest_ip_from_subnet(subnet: &str) -> Result<String> {
         Self::offset_ip_from_subnet(subnet, 100).map(|ip| ip.to_string())
-    }
-
-    fn dns_ip_from_subnet(subnet: &str) -> Result<String> {
-        Self::offset_ip_from_subnet(subnet, 3).map(|ip| ip.to_string())
     }
 
     fn offset_ip_from_subnet(subnet: &str, offset: u32) -> Result<std::net::Ipv4Addr> {
@@ -627,46 +563,18 @@ mod tests {
     }
 
     #[test]
-    fn test_slirp_command_args_disable_builtin_dns_when_explicit_dns_is_set() {
-        let cfg = BridgeConfig::default().with_dns(vec!["1.1.1.1".to_string()]);
-        let args = UserspaceNetwork::command_args(
-            4242,
-            &cfg,
+    fn root_without_user_namespace_cannot_start_slirp() {
+        assert!(UserspaceNetwork::setup_with_id(
+            std::process::id(),
+            &BridgeConfig::default(),
+            "test",
             true,
-            Path::new("/tmp/slirp.sock"),
-            5,
-            6,
-            true,
-        );
-
-        assert!(args.iter().any(|arg| arg == "--disable-dns"));
-        assert!(args.iter().any(|arg| arg == "--userns-path"));
-    }
-
-    #[test]
-    fn test_slirp_userns_join_is_kept_for_root_remapped_hosts() {
-        assert!(UserspaceNetwork::should_join_userns(true, true));
-        assert!(UserspaceNetwork::should_join_userns(false, true));
-        assert!(!UserspaceNetwork::should_join_userns(true, false));
-        assert!(!UserspaceNetwork::should_join_userns(false, false));
-    }
-
-    #[test]
-    fn test_slirp_command_args_keep_userns_without_sandbox() {
-        let cfg = BridgeConfig::default();
-        let args = UserspaceNetwork::command_args(
-            4242,
-            &cfg,
-            true,
-            Path::new("/tmp/slirp.sock"),
-            5,
-            6,
-            false,
-        );
-
-        assert!(!args.iter().any(|arg| arg == "--enable-sandbox"));
-        assert!(args.iter().any(|arg| arg == "--userns-path"));
-        assert!(args.iter().any(|arg| arg == "/proc/4242/ns/user"));
+            false
+        )
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("remapped workload user namespace"));
     }
 
     #[test]

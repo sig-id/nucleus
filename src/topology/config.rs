@@ -151,6 +151,8 @@ pub struct ServiceDef {
     /// DNS servers
     #[serde(default)]
     pub dns: Vec<String>,
+    #[serde(default)]
+    pub egress_dns: bool,
 
     /// Native bridge NAT backend.
     #[serde(default = "default_nat_backend")]
@@ -358,6 +360,31 @@ impl TopologyConfig {
             }
         }
 
+        let mut ranges: Vec<(&str, crate::network::BridgeConfig, std::net::Ipv4Addr)> = Vec::new();
+        for (name, network) in &self.networks {
+            let bridge = crate::network::BridgeConfig {
+                subnet: network.subnet.clone(),
+                ..Default::default()
+            };
+            bridge.validate()?;
+            let gateway = bridge
+                .gateway_ipv4()
+                .map_err(crate::error::NucleusError::ConfigError)?;
+            for (other, other_bridge, other_gateway) in &ranges {
+                let overlaps = bridge
+                    .contains_ipv4(*other_gateway)
+                    .map_err(crate::error::NucleusError::ConfigError)?
+                    || other_bridge
+                        .contains_ipv4(gateway)
+                        .map_err(crate::error::NucleusError::ConfigError)?;
+                if overlaps {
+                    return Err(crate::error::NucleusError::ConfigError(format!(
+                        "Network {name} overlaps {other}"
+                    )));
+                }
+            }
+            ranges.push((name, bridge, gateway));
+        }
         // Validate dependencies reference existing services
         for (name, svc) in &self.services {
             for dep in &svc.depends_on {
@@ -389,6 +416,18 @@ impl TopologyConfig {
                 }
             }
 
+            if svc.networks.len() > 1 {
+                return Err(crate::error::NucleusError::ConfigError(format!(
+                    "Service {name} currently supports one network attachment"
+                )));
+            }
+            if svc.egress_dns
+                && (svc.dns.is_empty()
+                    || svc.credential_broker.is_some()
+                    || svc.networks.is_empty())
+            {
+                return Err(crate::error::NucleusError::ConfigError(format!("Service {name} requires a bridge and explicit DNS resolvers for DNS egress, without broker-only egress")));
+            }
             // Validate networks reference existing network defs
             for net in &svc.networks {
                 if !self.networks.contains_key(net) {
@@ -489,7 +528,12 @@ impl TopologyConfig {
     /// Get the config hash for change detection (using service definitions).
     pub fn service_config_hash(&self, service_name: &str) -> Option<u64> {
         self.services.get(service_name).and_then(|svc| {
-            let json = serde_json::to_vec(svc).ok()?;
+            let networks: Vec<_> = svc
+                .networks
+                .iter()
+                .map(|name| self.networks.get(name))
+                .collect();
+            let json = serde_json::to_vec(&(svc, networks)).ok()?;
             let digest = Sha256::digest(&json);
             let mut bytes = [0u8; 8];
             bytes.copy_from_slice(&digest[..8]);

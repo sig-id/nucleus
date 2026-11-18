@@ -230,7 +230,7 @@
 
         gvisor = pkgs.callPackage ./nix/gvisor.nix { };
         gvisorRuntimePkgs = lib.optionals pkgs.stdenv.hostPlatform.isLinux [ gvisor ];
-        networkRuntimePkgs = lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.iptables pkgs.slirp4netns ];
+        networkRuntimePkgs = lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.nftables pkgs.iptables pkgs.slirp4netns ];
         runtimePath = lib.makeBinPath (gvisorRuntimePkgs ++ networkRuntimePkgs);
 
         rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
@@ -267,6 +267,8 @@
           ${if pkgs.stdenv.hostPlatform.isLinux then "NUCLEUS_PACKAGED_RUNSC" else null} =
             "${gvisor}/bin/runsc";
           NUCLEUS_PACKAGED_NIX_STORE = "${pkgs.nix}/bin/nix-store";
+          ${if pkgs.stdenv.hostPlatform.isLinux then "NUCLEUS_PACKAGED_NFT" else null} = "${pkgs.nftables}/bin/nft";
+          ${if pkgs.stdenv.hostPlatform.isLinux then "NUCLEUS_PACKAGED_SLIRP" else null} = "${pkgs.slirp4netns}/bin/slirp4netns";
           pname = "nucleus";
           version = "0.4.0";
           strictDeps = true;
