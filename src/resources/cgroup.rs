@@ -554,6 +554,12 @@ impl Cgroup {
     /// base `/dev` nodes plus the bound GPU devices, so a compromised workload
     /// cannot reach other host devices even if it creates a device node.
     ///
+    /// `supervisor_specs` lists host devices required by the gVisor supervisor
+    /// itself (e.g. `/dev/kvm` for the KVM platform backend). The parent
+    /// attaches the runsc process to this cgroup before the sandbox starts, so
+    /// those entries are required for runsc to boot; the sandboxed workload
+    /// still cannot reach them.
+    ///
     /// `best_effort` matches `--allow-degraded-security`: when `true`, a kernel
     /// or capability limitation degrades to a warning rather than failing the
     /// launch, because the filesystem layer (only bound device nodes exist in
@@ -561,12 +567,13 @@ impl Cgroup {
     pub fn install_gpu_device_allowlist(
         &self,
         gpu_specs: &[crate::filesystem::DeviceNodeSpec],
+        supervisor_specs: &[crate::filesystem::DeviceNodeSpec],
         include_tty: bool,
         best_effort: bool,
     ) -> Result<bool> {
         use crate::resources::{base_device_specs, install_device_allowlist, DeviceAllowSpec};
         let mut specs: Vec<DeviceAllowSpec> = base_device_specs(include_tty);
-        for dev in gpu_specs {
+        for dev in supervisor_specs.iter().chain(gpu_specs) {
             specs.push(DeviceAllowSpec {
                 is_block: dev.is_block,
                 major: dev.major,

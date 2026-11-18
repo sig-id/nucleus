@@ -6,11 +6,12 @@ use crate::container::{
 use crate::error::{NucleusError, Result, StateTransition};
 use crate::filesystem::{
     audit_mounts, bind_mount_host_paths, bind_mount_rootfs, copy_workspace_in, create_dev_nodes,
-    create_minimal_fs, mask_proc_paths, mount_gpu_passthrough, mount_home_tmpfs, mount_procfs,
-    mount_provider_configs, mount_secrets_inmemory, mount_volumes, mount_workspace,
+    create_minimal_fs, device_node_spec, mask_proc_paths, mount_gpu_passthrough, mount_home_tmpfs,
+    mount_procfs, mount_provider_configs, mount_secrets_inmemory, mount_volumes, mount_workspace,
     overlay_mount_rootfs, resolve_gpu_devices, snapshot_context_dir, switch_root,
     sync_workspace_out, validate_production_rootfs_path, verify_context_manifest,
-    verify_rootfs_attestation, FilesystemState, GpuDeviceSet, LazyContextPopulator, TmpfsMount,
+    verify_rootfs_attestation, DeviceNodeSpec, FilesystemState, GpuDeviceSet, LazyContextPopulator,
+    TmpfsMount,
 };
 use crate::isolation::{NamespaceManager, UserNamespaceMapper};
 use crate::network::{BridgeDriver, BridgeNetwork, NatBackend, NetworkMode, UserspaceNetwork};
@@ -231,6 +232,26 @@ impl Container {
                 config.network,
                 NetworkMode::Bridge(_) | NetworkMode::GVisorHost
             )
+    }
+
+    /// Host device nodes the gVisor supervisor must be allowed to open, for
+    /// the cgroup device allowlist installed on GPU launches.
+    ///
+    /// The allowlist is deny-by-default and applies to the runsc process that
+    /// the parent attaches to the container cgroup before acknowledging
+    /// setup, so without these entries a KVM-backend sandbox could never open
+    /// `/dev/kvm` to start. The workload inside the sandbox still cannot reach
+    /// these host devices.
+    fn gvisor_supervisor_device_specs(config: &ContainerConfig) -> Vec<DeviceNodeSpec> {
+        if !config.use_gvisor {
+            return Vec::new();
+        }
+        config
+            .gvisor_platform
+            .supervisor_host_devices()
+            .iter()
+            .filter_map(|path| device_node_spec(Path::new(path)))
+            .collect()
     }
 
     fn prepare_runtime_base_override(
@@ -771,8 +792,15 @@ impl Container {
 
         if let Some(set) = &gpu_device_set {
             if let Some(cgroup) = &cgroup_opt {
+                // The deny-by-default filter also governs the runsc supervisor,
+                // which the parent attaches to this cgroup before the sandbox
+                // starts. Allow the selected platform backend's required host
+                // devices (e.g. /dev/kvm for KVM) so the sandbox can boot; the
+                // workload inside the sandbox still cannot reach them.
+                let supervisor_specs = Self::gvisor_supervisor_device_specs(&config);
                 cgroup.install_gpu_device_allowlist(
                     &set.device_specs(),
+                    &supervisor_specs,
                     config.terminal,
                     config.allow_degraded_security,
                 )?;

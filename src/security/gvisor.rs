@@ -63,6 +63,21 @@ impl GVisorPlatform {
             Self::Ptrace => "ptrace",
         }
     }
+
+    /// Host device nodes the runsc supervisor itself must open for this
+    /// platform backend.
+    ///
+    /// The container cgroup's device allowlist is deny-by-default and also
+    /// governs the supervisor process, which the parent attaches to the
+    /// cgroup before the sandbox starts. These entries keep the selected
+    /// backend functional; the workload inside the sandbox still cannot
+    /// reach these host devices.
+    pub fn supervisor_host_devices(self) -> &'static [&'static str] {
+        match self {
+            Self::Kvm => &["/dev/kvm"],
+            Self::Systrap | Self::Ptrace => &[],
+        }
+    }
 }
 
 /// Options for running an OCI bundle with gVisor.
@@ -1747,5 +1762,11 @@ mod tests {
             4242,
             1000
         ));
+    }
+    #[test]
+    fn supervisor_host_devices_cover_kvm_backend_only() {
+        assert_eq!(GVisorPlatform::Kvm.supervisor_host_devices(), &["/dev/kvm"]);
+        assert!(GVisorPlatform::Systrap.supervisor_host_devices().is_empty());
+        assert!(GVisorPlatform::Ptrace.supervisor_host_devices().is_empty());
     }
 }

@@ -90,6 +90,26 @@ pub struct DeviceNodeSpec {
     pub minor: u32,
 }
 
+/// Identity of an existing host device node, or `None` when the path is
+/// absent or not a character/block device.
+///
+/// Used for supervisor-required host devices (e.g. `/dev/kvm` for the gVisor
+/// KVM backend), whose major/minor numbers must be discovered on the host
+/// rather than assumed.
+pub fn device_node_spec(path: &Path) -> Option<DeviceNodeSpec> {
+    let meta = fs::metadata(path).ok()?;
+    let file_type = meta.file_type();
+    if !file_type.is_char_device() && !file_type.is_block_device() {
+        return None;
+    }
+    let rdev = meta.rdev();
+    Some(DeviceNodeSpec {
+        is_block: file_type.is_block_device(),
+        major: major_of(rdev),
+        minor: minor_of(rdev),
+    })
+}
+
 /// Extract the major number from a `st_rdev` value (Linux `MAJOR` macro).
 pub fn major_of(rdev: u64) -> u32 {
     // MAJOR(dev) = ((dev >> 8) & 0xfff) | ((dev >> 32) & 0xfffff000)
