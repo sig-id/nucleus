@@ -6,7 +6,7 @@ Thank you for your interest in contributing to Nucleus!
 
 ### Prerequisites
 
-- Rust 1.74 or later
+- Rust 1.100 or later (the repository pins 1.100.0)
 - Linux kernel 5.x+ (required for cgroups v2, namespaces)
 - (Optional) Apalache for running TLA+ model checking tests
 - (Optional) Nix for reproducible development environment

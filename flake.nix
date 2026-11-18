@@ -233,11 +233,11 @@
             ./nix/patches/gvisor-runsc-real-exe-path.patch
           ];
         });
-        gvisorRuntimePkgs = lib.optionals pkgs.stdenv.isLinux [ gvisor ];
-        networkRuntimePkgs = lib.optionals pkgs.stdenv.isLinux [ pkgs.iptables pkgs.slirp4netns ];
+        gvisorRuntimePkgs = lib.optionals pkgs.stdenv.hostPlatform.isLinux [ gvisor ];
+        networkRuntimePkgs = lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.iptables pkgs.slirp4netns ];
         runtimePath = lib.makeBinPath (gvisorRuntimePkgs ++ networkRuntimePkgs);
 
-        rustToolchain = pkgs.rust-bin.stable.latest.default;
+        rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
         craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 
         # Check if Cargo.lock exists
@@ -278,7 +278,7 @@
 
           buildInputs = [
             pkgs.openssl
-          ] ++ lib.optionals pkgs.stdenv.isDarwin [
+          ] ++ lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
             pkgs.libiconv
           ];
         };
@@ -291,24 +291,24 @@
           inherit cargoArtifacts;
           nativeCheckInputs = gvisorRuntimePkgs;
           nativeBuildInputs = commonArgs.nativeBuildInputs ++ [ pkgs.makeWrapper ];
-          postFixup = lib.optionalString pkgs.stdenv.isLinux ''
+          postFixup = lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
             wrapProgram $out/bin/nucleus --prefix PATH : "${runtimePath}"
           '';
         }) else null;
 
         # Apalache - TLA+ model checker
-        apalacheVersion = "0.52.2";
+        apalacheVersion = "0.63.0";
         apalache = pkgs.stdenv.mkDerivation {
           pname = "apalache";
           version = apalacheVersion;
 
           src = pkgs.fetchurl {
             url = "https://github.com/apalache-mc/apalache/releases/download/v${apalacheVersion}/apalache-${apalacheVersion}.tgz";
-            sha256 = "e0ebea7e45c8f99df8d92f2755101dda84ab71df06d1ec3a21955d3b53a886e2";
+            sha256 = "a756e96af249bf33cd7629667a49472cb26ac8227c48583da139b414834d59df";
           };
 
           nativeBuildInputs = [ pkgs.makeWrapper ];
-          buildInputs = [ pkgs.jdk17_headless ];
+          buildInputs = [ pkgs.jdk21_headless ];
 
           dontConfigure = true;
           dontBuild = true;
@@ -324,8 +324,8 @@
             cp -r src/bin $out/share/apalache/
 
             makeWrapper $out/share/apalache/bin/apalache-mc $out/bin/apalache-mc \
-              --set JAVA_HOME "${pkgs.jdk17_headless}" \
-              --prefix PATH : "${pkgs.jdk17_headless}/bin"
+              --set JAVA_HOME "${pkgs.jdk21_headless}" \
+              --prefix PATH : "${pkgs.jdk21_headless}/bin"
           '';
         };
 
