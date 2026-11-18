@@ -9,8 +9,8 @@ use crate::security::{
     load_json_policy, GVisorNetworkMode, GVisorOciRunOptions, GVisorRuntime, OciBundle, OciConfig,
     OciMount, OciSeccomp,
 };
-use nix::unistd::{Gid, Uid};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use nix::unistd::Uid;
+use std::os::unix::fs::PermissionsExt;
 use tracing::info;
 
 use super::{config::ServiceMode, runtime::Container};
@@ -75,6 +75,7 @@ impl Container {
     /// Set up container with gVisor and exec.
     pub(super) fn setup_and_exec_gvisor(
         &self,
+        artifact_base: std::path::PathBuf,
         precreated_userns: bool,
         gpu_device_set: Option<&GpuDeviceSet>,
     ) -> Result<()> {
@@ -88,6 +89,7 @@ impl Container {
             })?
         };
 
+        let gvisor = gvisor.with_prepared_base(artifact_base);
         self.setup_and_exec_gvisor_oci(&gvisor, precreated_userns, gpu_device_set)
     }
 
@@ -112,8 +114,7 @@ impl Container {
             // enforce its own sandbox process model after startup.
             oci_config = oci_config.with_no_new_privileges(false);
         }
-        let artifact_dir = Self::gvisor_artifact_dir(&self.config.id);
-        Self::ensure_secure_gvisor_artifact_dir(&artifact_dir)?;
+        let artifact_dir = gvisor.prepare_artifact_dir(&self.config.id)?;
         let context_manifest = if self.config.verify_context_integrity {
             self.config
                 .context_dir
@@ -268,12 +269,13 @@ impl Container {
         if !self.config.secrets.is_empty() {
             let secret_stage_dir = artifact_dir.join("secrets-stage");
             Self::mount_gvisor_secret_stage_tmpfs(&secret_stage_dir)?;
-            Self::apply_secret_dir_identity(&secret_stage_dir, &self.config.process_identity)?;
+
             let staged_secrets = Self::stage_gvisor_secret_files(
                 &secret_stage_dir,
                 &self.config.secrets,
                 &self.config.process_identity,
             )?;
+            Self::apply_secret_dir_identity(&secret_stage_dir, &self.config.process_identity)?;
             oci_config =
                 oci_config.with_inmemory_secret_mounts(&secret_stage_dir, &staged_secrets)?;
         }
@@ -302,11 +304,6 @@ impl Container {
             GVisorNetworkMode::None => oci_config,
         };
 
-        // Pass OCI hooks into the gVisor config.json so gVisor executes them
-        if let Some(ref hooks) = self.config.hooks {
-            oci_config = oci_config.with_hooks(hooks.clone());
-        }
-
         // GPU passthrough (gVisor): emit OCI device entries + driver support
         // binds + NVIDIA env. runsc owns device node creation and the cgroup
         // device rules inside its sandbox.
@@ -322,10 +319,14 @@ impl Container {
             .config
             .bundle_dir
             .clone()
-            .unwrap_or_else(|| Self::gvisor_bundle_path(&self.config.id));
+            .unwrap_or_else(|| artifact_dir.join("bundle"));
         let oci_mounts = oci_config.mounts.clone();
         let bundle = OciBundle::new(bundle_path, oci_config);
-        bundle.create()?;
+        if precreated_userns {
+            bundle.create_in_trusted_parent()?;
+        } else {
+            bundle.create()?;
+        }
 
         let rootfs = bundle.rootfs_path();
         create_minimal_fs(&rootfs)?;
@@ -412,109 +413,6 @@ impl Container {
             })?;
             let file = mount.mount_type == "bind" && std::path::Path::new(&mount.source).is_file();
             crate::filesystem::mount_target(rootfs, relative, !file)?;
-        }
-
-        Ok(())
-    }
-
-    pub(super) fn gvisor_artifact_dir(container_id: &str) -> std::path::PathBuf {
-        Self::gvisor_artifact_base().join(container_id)
-    }
-
-    pub(super) fn gvisor_bundle_path(container_id: &str) -> std::path::PathBuf {
-        Self::gvisor_artifact_dir(container_id).join("bundle")
-    }
-
-    fn gvisor_secret_stage_dir(container_id: &str) -> std::path::PathBuf {
-        Self::gvisor_artifact_dir(container_id).join("secrets-stage")
-    }
-
-    fn gvisor_artifact_base() -> std::path::PathBuf {
-        if let Some(path) =
-            std::env::var_os("NUCLEUS_GVISOR_ARTIFACT_BASE").filter(|path| !path.is_empty())
-        {
-            return std::path::PathBuf::from(path);
-        }
-
-        // Rootless bridge setup temporarily becomes uid 0 inside a user
-        // namespace; XDG_RUNTIME_DIR still points at the service-owned host
-        // runtime dir and must win over the host-root default.
-        if !Uid::effective().is_root() || std::env::var_os("XDG_RUNTIME_DIR").is_some() {
-            if let Some(dir) = dirs::runtime_dir() {
-                return dir.join("nucleus-gvisor");
-            }
-        }
-
-        if Uid::effective().is_root() {
-            std::path::PathBuf::from("/run/nucleus-gvisor")
-        } else {
-            std::env::temp_dir().join(format!("nucleus-gvisor-{}", Uid::effective().as_raw()))
-        }
-    }
-
-    fn ensure_secure_gvisor_artifact_dir(path: &std::path::Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            Self::ensure_secure_gvisor_dir(parent, "gVisor artifact base")?;
-        }
-        Self::ensure_secure_gvisor_dir(path, "gVisor artifact dir")
-    }
-
-    fn ensure_secure_gvisor_dir(path: &std::path::Path, label: &str) -> Result<()> {
-        match std::fs::symlink_metadata(path) {
-            Ok(meta) if meta.file_type().is_symlink() => {
-                return Err(NucleusError::FilesystemError(format!(
-                    "Refusing symlink {} {:?}",
-                    label, path
-                )));
-            }
-            Ok(_) | Err(_) => {}
-        }
-
-        std::fs::create_dir_all(path).map_err(|e| {
-            NucleusError::FilesystemError(format!("Failed to create {} {:?}: {}", label, path, e))
-        })?;
-
-        let metadata = std::fs::metadata(path).map_err(|e| {
-            NucleusError::FilesystemError(format!("Failed to stat {} {:?}: {}", label, path, e))
-        })?;
-        let mode = metadata.permissions().mode() & 0o777;
-        let owner = metadata.uid();
-        let euid = Uid::effective().as_raw();
-        if owner != euid {
-            // Under a non-trivial user namespace (keep-id / auto), our own
-            // files appear under a non-root container uid. Reclaim a stale
-            // artifact dir owned by a mapped uid by chowning it to container
-            // root; reject anything owned by an unmapped (foreign) uid.
-            if crate::isolation::uid_is_mapped_in_current_userns(owner)
-                && Uid::effective().is_root()
-            {
-                nix::unistd::chown(
-                    path,
-                    Some(Uid::from_raw(0)),
-                    Some(Gid::from_raw(0)),
-                )
-                .map_err(|e| {
-                    NucleusError::FilesystemError(format!(
-                        "Failed to reclaim {} {:?}: {}",
-                        label, path, e
-                    ))
-                })?;
-            } else {
-                return Err(NucleusError::FilesystemError(format!(
-                    "{} {:?} is owned by uid {} (expected {})",
-                    label, path, owner, euid
-                )));
-            }
-        }
-        if mode & 0o077 != 0 {
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(
-                |e| {
-                    NucleusError::FilesystemError(format!(
-                        "Failed to secure {} permissions {:?}: {}",
-                        label, path, e
-                    ))
-                },
-            )?;
         }
 
         Ok(())
@@ -671,22 +569,13 @@ impl Container {
     }
 
     pub(super) fn cleanup_gvisor_artifacts(container_id: &str) -> Result<()> {
-        let artifact_dir = Self::gvisor_artifact_dir(container_id);
-        let secret_stage_dir = Self::gvisor_secret_stage_dir(container_id);
-
-        if secret_stage_dir.exists() {
-            match nix::mount::umount2(&secret_stage_dir, nix::mount::MntFlags::MNT_DETACH) {
-                Ok(()) => {}
-                Err(nix::errno::Errno::EINVAL) | Err(nix::errno::Errno::ENOENT) => {}
-                Err(e) => {
-                    return Err(NucleusError::FilesystemError(format!(
-                        "Failed to unmount gVisor secret stage {:?}: {}",
-                        secret_stage_dir, e
-                    )));
-                }
-            }
+        let artifact_dir = GVisorRuntime::artifact_dir(container_id)?;
+        if !artifact_dir.try_exists()? {
+            return Ok(());
         }
-
+        crate::filesystem::trusted_directory(&artifact_dir, false)?;
+        // Secret and bind staging mounts lived in the child's private mount
+        // namespace and expired with it. Cleanup never resolves a mount target.
         if artifact_dir.exists() {
             std::fs::remove_dir_all(&artifact_dir).map_err(|e| {
                 NucleusError::FilesystemError(format!(
@@ -759,27 +648,5 @@ mod tests {
             ServiceMode::Agent,
             false
         ));
-    }
-
-    #[test]
-    fn test_ensure_secure_gvisor_artifact_dir_sets_owner_only_permissions() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let artifact_dir = temp.path().join("artifacts").join("container-a");
-
-        Container::ensure_secure_gvisor_artifact_dir(&artifact_dir).unwrap();
-
-        let parent_mode = std::fs::metadata(artifact_dir.parent().unwrap())
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
-        let artifact_mode = std::fs::metadata(&artifact_dir)
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
-
-        assert_eq!(parent_mode, 0o700);
-        assert_eq!(artifact_mode, 0o700);
     }
 }

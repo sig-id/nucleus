@@ -6,7 +6,9 @@ mod mount;
 mod state;
 mod target;
 mod tmpfs;
+mod trusted_dir;
 pub(crate) use target::*;
+pub(crate) use trusted_dir::trusted_directory;
 mod workspace;
 
 pub use attestation::*;
