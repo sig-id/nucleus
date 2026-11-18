@@ -30,7 +30,6 @@ use nucleus::topology::{
 };
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use tracing::info;
@@ -65,25 +64,6 @@ impl Drop for ScopedEnvVar {
         match &self.previous {
             Some(value) => std::env::set_var(self.key, value),
             None => std::env::remove_var(self.key),
-        }
-    }
-}
-
-struct ImageRunOverlayGuard {
-    path: PathBuf,
-    armed: bool,
-}
-
-impl ImageRunOverlayGuard {
-    fn new(path: PathBuf) -> Self {
-        Self { path, armed: true }
-    }
-}
-
-impl Drop for ImageRunOverlayGuard {
-    fn drop(&mut self) {
-        if self.armed && self.path.exists() {
-            let _ = std::fs::remove_dir_all(&self.path);
         }
     }
 }
@@ -2087,71 +2067,11 @@ fn try_main() -> Result<i32> {
                     config = config.with_state_root(root.clone());
                 }
 
-                let state_mgr = ContainerStateManager::new_with_root(state_root.clone())?;
-                let overlay_dir = state_mgr.rootfs_overlay_dir_path(&config.id)?;
-                if overlay_dir.exists() {
-                    return Err(NucleusError::ConfigError(format!(
-                        "Image run overlay directory already exists: {}",
-                        overlay_dir.display()
-                    )));
-                }
-                std::fs::create_dir(&overlay_dir).map_err(|e| {
-                    NucleusError::FilesystemError(format!(
-                        "Failed to create image run overlay dir {:?}: {}",
-                        overlay_dir, e
-                    ))
-                })?;
-                let _overlay_guard = ImageRunOverlayGuard::new(overlay_dir.clone());
-                std::fs::set_permissions(&overlay_dir, std::fs::Permissions::from_mode(0o700))
-                    .map_err(|e| {
-                        NucleusError::FilesystemError(format!(
-                            "Failed to secure image run overlay dir {:?}: {}",
-                            overlay_dir, e
-                        ))
-                    })?;
-                let upperdir = overlay_dir.join("upper");
-                let workdir = overlay_dir.join("work");
-                std::fs::create_dir(&upperdir).map_err(|e| {
-                    NucleusError::FilesystemError(format!(
-                        "Failed to create image run upperdir {:?}: {}",
-                        upperdir, e
-                    ))
-                })?;
-                std::fs::create_dir(&workdir).map_err(|e| {
-                    NucleusError::FilesystemError(format!(
-                        "Failed to create image run workdir {:?}: {}",
-                        workdir, e
-                    ))
-                })?;
-                verified.copy_diff_to_upper(&upperdir)?;
-                drop(verified);
-                if nix::unistd::Uid::effective().is_root() {
-                    let mapping = nucleus::isolation::UserNamespaceConfig::root_remapped();
-                    // The state root is private. The setup process holds a cwd in
-                    // this parent and only needs search permission after remapping.
-                    std::fs::set_permissions(&overlay_dir, std::fs::Permissions::from_mode(0o711))?;
-                    // The imported layer carries container-relative ownership
-                    // from the image. Translate it into the namespace mapping so
-                    // nonzero service identities keep access to their own data
-                    // as remapped host identities; unmapped owners are left as-is.
-                    image::remap_layer_ownership(
-                        &upperdir,
-                        &mapping.uid_mappings[0],
-                        &mapping.gid_mappings[0],
-                    )?;
-                    nix::unistd::chown(
-                        &workdir,
-                        Some(nix::unistd::Uid::from_raw(mapping.uid_mappings[0].host_id)),
-                        Some(nix::unistd::Gid::from_raw(mapping.gid_mappings[0].host_id)),
-                    )?;
-                }
-                config = config.with_rootfs_overlay(upperdir, workdir);
-
                 println!("{}", config.id);
                 let event_sink =
                     nucleus::telemetry::EventSink::from_cli(events_fd, events_jsonl.as_deref())?;
                 let container = Container::new(config).with_event_sink(event_sink);
-                container.run()
+                container.run_image(verified)
             }
             ImageCommands::Inspect {
                 image,

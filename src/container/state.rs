@@ -74,6 +74,13 @@ pub struct ContainerState {
     /// Whether using rootless mode
     pub rootless: bool,
 
+    #[serde(default)]
+    pub allocated_root_remap: bool,
+
+    /// Namespace mapping used to interpret host ownership of the overlay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_ns_config: Option<crate::isolation::UserNamespaceConfig>,
+
     /// cgroup path
     pub cgroup_path: Option<String>,
 
@@ -200,6 +207,8 @@ impl ContainerState {
             cpu_limit: params.cpu_limit,
             using_gvisor: params.using_gvisor,
             rootless: params.rootless,
+            user_ns_config: None,
+            allocated_root_remap: false,
             cgroup_path: params.cgroup_path,
             pids_max: None,
             native_seccomp: None,

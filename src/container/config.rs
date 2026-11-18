@@ -714,6 +714,7 @@ pub struct ContainerConfig {
 
     /// User namespace configuration (for rootless mode)
     pub user_ns_config: Option<UserNamespaceConfig>,
+    pub(crate) allocated_root_remap: bool,
 
     /// Hostname to set in UTS namespace (optional)
     pub hostname: Option<String>,
@@ -953,6 +954,7 @@ impl ContainerConfig {
             limits: ResourceLimits::default(),
             namespaces: NamespaceConfig::default(),
             user_ns_config: None,
+            allocated_root_remap: false,
             hostname: Some(name),
             use_gvisor: true,
             trust_level: TrustLevel::default(),
@@ -1012,11 +1014,10 @@ impl ContainerConfig {
     #[must_use]
     pub fn with_rootless(mut self) -> Self {
         self.namespaces.user = true;
-        self.user_ns_config = Some(if nix::unistd::Uid::effective().is_root() {
-            UserNamespaceConfig::root_remapped()
-        } else {
-            UserNamespaceConfig::rootless()
-        });
+        self.allocated_root_remap = false;
+        // Each launch of this config must reserve its own host range.
+        self.user_ns_config =
+            (!nix::unistd::Uid::effective().is_root()).then(UserNamespaceConfig::rootless);
         self
     }
 
@@ -1024,6 +1025,7 @@ impl ContainerConfig {
     #[must_use]
     pub fn with_user_namespace(mut self, config: UserNamespaceConfig) -> Self {
         self.namespaces.user = true;
+        self.allocated_root_remap = false;
         self.user_ns_config = Some(config);
         self
     }
@@ -1613,7 +1615,7 @@ impl ContainerConfig {
             ));
         }
 
-        if let Some(user_ns_config) = &self.user_ns_config {
+        if self.namespaces.user || self.user_ns_config.is_some() {
             if !self.process_identity.additional_gids.is_empty() {
                 return Err(crate::error::NucleusError::ConfigError(
                     "Supplementary groups are currently unsupported with user namespaces"
@@ -1621,11 +1623,14 @@ impl ContainerConfig {
                 ));
             }
 
-            let uid_mapped = user_ns_config.uid_mappings.iter().any(|mapping| {
-                self.process_identity.uid >= mapping.container_id
-                    && self.process_identity.uid
-                        < mapping.container_id.saturating_add(mapping.count)
-            });
+            let uid_mapped =
+                self.user_ns_config
+                    .as_ref()
+                    .map_or(self.process_identity.uid < 65_536, |map| {
+                        map.uid_mappings
+                            .iter()
+                            .any(|m| m.host_id_for(self.process_identity.uid).is_some())
+                    });
             if !uid_mapped {
                 return Err(crate::error::NucleusError::ConfigError(format!(
                     "Process uid {} is not mapped in the configured user namespace",
@@ -1633,11 +1638,14 @@ impl ContainerConfig {
                 )));
             }
 
-            let gid_mapped = user_ns_config.gid_mappings.iter().any(|mapping| {
-                self.process_identity.gid >= mapping.container_id
-                    && self.process_identity.gid
-                        < mapping.container_id.saturating_add(mapping.count)
-            });
+            let gid_mapped =
+                self.user_ns_config
+                    .as_ref()
+                    .map_or(self.process_identity.gid < 65_536, |map| {
+                        map.gid_mappings
+                            .iter()
+                            .any(|m| m.host_id_for(self.process_identity.gid).is_some())
+                    });
             if !gid_mapped {
                 return Err(crate::error::NucleusError::ConfigError(format!(
                     "Process gid {} is not mapped in the configured user namespace",
