@@ -615,6 +615,45 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn custom_clone_profile_intersects_each_allow_rule_with_namespace_mask() {
+        use crate::security::SeccompManager;
+        let profile = tempfile::NamedTempFile::new().unwrap();
+        let contents = serde_json::json!({
+            "defaultAction": "SCMP_ACT_KILL_PROCESS",
+            "syscalls": [
+                {"names":["clone"], "action":"SCMP_ACT_ALLOW", "args":[
+                    {"index":0, "op":"SCMP_CMP_MASKED_EQ", "value":libc::CLONE_THREAD, "valueTwo":libc::CLONE_THREAD},
+                    {"index":1, "op":"SCMP_CMP_NE", "value":0}
+                ]},
+                {"names":["clone"], "action":"SCMP_ACT_ALLOW", "args":[
+                    {"index":0, "op":"SCMP_CMP_EQ", "value":libc::SIGCHLD}
+                ]}
+            ]
+        });
+        std::fs::write(profile.path(), contents.to_string()).unwrap();
+        let program = SeccompManager::compile_profile(profile.path(), None).unwrap();
+        let action = |flags: i32, stack| {
+            bpf_eval(
+                &program,
+                &make_seccomp_data(
+                    libc::SYS_clone as u32,
+                    AUDIT_ARCH_X86_64,
+                    [flags as u64, stack, 0, 0, 0, 0],
+                ),
+            )
+        };
+        assert_eq!(action(libc::CLONE_THREAD | libc::CLONE_VM, 1), RET_ALLOW);
+        assert_eq!(action(libc::SIGCHLD, 0), RET_ALLOW);
+        assert_eq!(action(libc::CLONE_THREAD, 0), RET_KILL);
+        assert_eq!(action(libc::CLONE_VM, 1), RET_KILL);
+        assert_eq!(
+            action(libc::CLONE_THREAD | libc::CLONE_NEWUSER, 1),
+            RET_KILL
+        );
+    }
+
+    #[test]
     fn test_builtin_clone3_returns_enosys() {
         let rules = crate::security::SeccompManager::minimal_filter_for_test(true, &[]);
         assert!(

@@ -324,6 +324,11 @@ impl Cgroup {
         Ok(())
     }
 
+    /// Migrate this helper while its mount and cgroup views are still the host's.
+    pub(crate) fn join_existing(path: &Path) -> Result<()> {
+        Self::write_value_at(path, "cgroup.procs", "0")
+    }
+
     /// Write a value to a cgroup file
     fn write_value(&self, file: &str, value: &str) -> Result<()> {
         Self::write_value_at(&self.path, file, value)
