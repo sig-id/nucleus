@@ -1,3 +1,4 @@
+use super::landlock_policy::LandlockTcp;
 use crate::error::{NucleusError, Result};
 use landlock::{
     Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetError,
@@ -6,16 +7,33 @@ use landlock::{
 use std::path::PathBuf;
 use tracing::{debug, info, warn};
 
-/// Target ABI – covers up to Linux 6.12 features (Truncate, IoctlDev, Refer, etc.).
-/// The landlock crate gracefully degrades for older kernels.
-const TARGET_ABI: ABI = ABI::V5;
+/// ABI 6 adds signal and abstract Unix socket scoping.
+pub(super) const TARGET_ABI: ABI = ABI::V6;
 
-/// Minimum Landlock ABI version required for production mode.
-///
-/// V3 adds LANDLOCK_ACCESS_FS_TRUNCATE which prevents silent data truncation
-/// that V1/V2 cannot control. This is the minimum we consider safe for
-/// production workloads.
-const MINIMUM_PRODUCTION_ABI: ABI = ABI::V3;
+/// Query the active LSM, independent of the crate's compatibility fallback.
+pub(super) fn require_abi(min: u8) -> Result<()> {
+    // LANDLOCK_CREATE_RULESET_VERSION takes a null attribute and zero size.
+    let version = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_create_ruleset,
+            std::ptr::null::<libc::c_void>(),
+            0usize,
+            1u32,
+        )
+    };
+    if version == -1 {
+        return Err(NucleusError::LandlockError(format!(
+            "Cannot query kernel Landlock ABI: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    if version < min.into() {
+        return Err(NucleusError::LandlockError(format!(
+            "Kernel Landlock ABI {version} is below required ABI {min}"
+        )));
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy)]
 #[allow(clippy::enum_variant_names)]
@@ -100,7 +118,7 @@ impl LandlockManager {
     /// Rules:
     /// - `/` (root):         read-only traversal (ReadDir) so path resolution works
     /// - `/bin`, `/usr`:     read + execute (for running agent binaries)
-    /// - `/lib`, `/lib64`:   read (shared libraries)
+    /// - `/lib`, `/lib64`:   read + execute (shared libraries and ELF interpreters)
     /// - `/etc`:             read (config / resolv.conf / nsswitch)
     /// - `/dev`:             read (already minimal device nodes)
     /// - `/proc`:            read (already mounted read-only)
@@ -120,42 +138,12 @@ impl LandlockManager {
     /// Returns Ok(()) if the ABI is sufficient, or Err if the kernel is too old.
     /// In best-effort mode, a too-old kernel is logged but not fatal.
     pub fn assert_minimum_abi(&self, production_mode: bool) -> Result<()> {
-        // Probe the kernel's Landlock ABI version by attempting to create a ruleset
-        // with the minimum ABI's access rights. If the kernel doesn't support the
-        // minimum ABI, the ruleset will be NotEnforced or PartiallyEnforced.
-        let min_access = AccessFs::from_all(MINIMUM_PRODUCTION_ABI);
-        let target_access = AccessFs::from_all(TARGET_ABI);
-
-        // If the minimum access set equals the target, the kernel supports everything
-        // If the minimum is a subset, check that at least the minimum rights are present
-        if min_access != target_access {
-            info!(
-                "Landlock ABI: target={:?}, minimum_production={:?}",
-                TARGET_ABI, MINIMUM_PRODUCTION_ABI
-            );
-        }
-
-        // The actual enforcement check happens in build_and_restrict().
-        // Here we do a lightweight check: if the kernel supports the target ABI,
-        // it certainly supports the minimum. The landlock crate handles this
-        // gracefully, but we want an explicit assertion for production.
-        match Ruleset::default().handle_access(AccessFs::from_all(MINIMUM_PRODUCTION_ABI)) {
-            Ok(_) => {
-                info!("Landlock ABI >= V3 confirmed");
+        match require_abi(TARGET_ABI as u8) {
+            Err(e) if !production_mode => {
+                warn!("{e}");
                 Ok(())
             }
-            Err(e) => {
-                let msg = format!(
-                    "Kernel Landlock ABI is below minimum required version (V3): {}",
-                    e
-                );
-                if production_mode {
-                    Err(ll_err(e))
-                } else {
-                    warn!("{}", msg);
-                    Ok(())
-                }
-            }
+            result => result,
         }
     }
 
@@ -164,13 +152,14 @@ impl LandlockManager {
     /// When `best_effort` is true, failures (e.g. kernel without Landlock) are
     /// logged and execution continues.
     pub fn apply_container_policy_with_mode(&mut self, best_effort: bool) -> Result<bool> {
-        self.apply_with_handoff(best_effort, None)
+        self.apply_with_handoff(best_effort, None, &LandlockTcp::default())
     }
 
     pub(crate) fn apply_with_handoff(
         &mut self,
         best_effort: bool,
         handoff: Option<&std::os::unix::net::UnixStream>,
+        tcp: &LandlockTcp,
     ) -> Result<bool> {
         if self.applied {
             debug!("Landlock policy already applied, skipping");
@@ -179,7 +168,7 @@ impl LandlockManager {
 
         info!("Applying Landlock filesystem policy");
 
-        match self.build_and_restrict(handoff) {
+        match self.build_and_restrict(handoff, tcp) {
             Ok(status) => match status {
                 RulesetStatus::FullyEnforced => {
                     self.applied = true;
@@ -293,9 +282,10 @@ impl LandlockManager {
     fn build_and_restrict(
         &self,
         handoff: Option<&std::os::unix::net::UnixStream>,
+        tcp: &LandlockTcp,
     ) -> Result<RulesetStatus> {
         let access_all = AccessFs::from_all(TARGET_ABI);
-        let access_read = AccessFs::from_read(TARGET_ABI);
+        let access_read = AccessFs::ReadFile | AccessFs::ReadDir;
 
         // Read + execute for binary paths
         let access_read_exec = access_read | AccessFs::Execute;
@@ -306,11 +296,7 @@ impl LandlockManager {
         access_tmp.remove(AccessFs::Execute);
         let access_rw_exec = access_tmp | AccessFs::Execute;
 
-        let mut ruleset = Ruleset::default()
-            .handle_access(access_all)
-            .map_err(ll_err)?
-            .create()
-            .map_err(ll_err)?;
+        let mut ruleset = tcp.create_workload_ruleset()?;
 
         // Root directory: minimal traversal only
         // We add ReadDir so that path resolution through / works
@@ -341,11 +327,11 @@ impl LandlockManager {
             }
         }
 
-        // Shared libraries: read
+        // Include ELF interpreters installed under the library directories.
         for path in &["/lib", "/lib64", "/lib32"] {
             if let Ok(fd) = PathFd::new(path) {
                 ruleset = ruleset
-                    .add_rule(PathBeneath::new(fd, access_read))
+                    .add_rule(PathBeneath::new(fd, access_read_exec))
                     .map_err(ll_err)?;
             }
         }
@@ -526,6 +512,11 @@ fn ll_err(e: RulesetError) -> NucleusError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn minimum_abi_rejects_an_unavailable_kernel_version() {
+        assert!(require_abi(u8::MAX).is_err());
+    }
 
     #[test]
     fn test_landlock_manager_initial_state() {

@@ -17,8 +17,9 @@ use crate::isolation::{NamespaceManager, UserNamespaceMapper};
 use crate::network::{BridgeDriver, BridgeNetwork, NatBackend, NetworkMode, UserspaceNetwork};
 use crate::resources::{Cgroup, ResourceStats};
 use crate::security::{
-    CapabilityManager, GVisorRuntime, LandlockManager, NativeLandlock, NativeSeccomp,
-    OciContainerState, OciHooks, SeccompDenyLogger, SeccompTraceReader, SecurityState,
+    CapabilityManager, CapabilitySets, GVisorRuntime, LandlockManager, NativeLandlock,
+    NativeSeccomp, OciContainerState, OciHooks, SeccompDenyLogger, SeccompTraceReader,
+    SecurityState,
 };
 use crate::telemetry::{CleanupEvent, ContainerControlEvent, EventSink, ExitStatusEvent};
 use caps::{CapSet, Capability, CapsHashSet};
@@ -1395,6 +1396,19 @@ impl Container {
             return self.setup_and_exec_gvisor(gvisor_precreated_userns, gpu_device_set);
         }
 
+        let workload_caps = self
+            .config
+            .caps_policy
+            .as_ref()
+            .map(|path| {
+                let policy: crate::security::CapsPolicy = crate::security::load_toml_policy(
+                    path,
+                    self.config.caps_policy_sha256.as_deref(),
+                )?;
+                policy.resolve_sets()
+            })
+            .transpose()?;
+
         let prepared_dev = if is_rootless && Uid::effective().is_root() {
             let (uid, gid) = Self::host_workload_ids(&self.config)?;
             Some(crate::filesystem::prepare_mapped_dev(
@@ -1445,7 +1459,7 @@ impl Container {
                 "Parent closed user namespace ack pipe before mappings were written",
                 "Failed waiting for parent to finish user namespace mappings",
             )?;
-            Self::become_userns_root_for_setup(None)?;
+            Self::become_userns_root_for_setup(None, workload_caps.as_ref())?;
         }
 
         let overlay_dirs = self
@@ -1775,23 +1789,27 @@ impl Container {
         // so the two-phase approach only applies to the default drop-all path.
         crate::filesystem::restrict_procfs_links()?;
         let mut cap_mgr = CapabilityManager::new();
-        if let Some(ref policy_path) = self.config.caps_policy {
-            let policy: crate::security::CapsPolicy = crate::security::load_toml_policy(
-                policy_path,
-                self.config.caps_policy_sha256.as_deref(),
-            )?;
-            // apply validates every retained set before changing process capabilities.
-            policy.apply(&mut cap_mgr)?;
-            // Identity switch after custom policy (caps may already be restricted)
+        if let Some(sets) = &workload_caps {
+            cap_mgr.prepare_sets(sets)?;
+            let keep_across_uid_change = Uid::effective().is_root()
+                && self.config.process_identity.uid != 0
+                && !sets.permitted.is_empty();
+            if keep_across_uid_change {
+                nix::sys::prctl::set_keepcaps(true)?;
+            }
             Self::apply_process_identity_to_current_process(
                 &self.config.process_identity,
                 self.config.user_ns_config.is_some(),
             )?;
+            if keep_across_uid_change {
+                nix::sys::prctl::set_keepcaps(false)?;
+            }
+            cap_mgr.finish_sets(sets)?;
             audit(
                 &self.config.id,
                 &self.config.name,
                 AuditEventType::CapabilitiesDropped,
-                format!("capability policy applied from {:?}", policy_path),
+                "explicit workload capability sets applied and verified",
             );
         } else {
             // Phase 1: drop bounding set while CAP_SETPCAP is still effective
@@ -1894,7 +1912,7 @@ impl Container {
         })?;
         let landlock_applied = native_landlock
             .ok_or_else(|| NucleusError::LandlockError("Missing launch Landlock policy".into()))?
-            .apply(allow_degraded_security, &channel)?;
+            .apply(allow_degraded_security, &channel, &self.config)?;
         // The PID-namespace intermediary may still have a dup of this socket.
         channel.shutdown(std::net::Shutdown::Write)?;
         drop(channel);
@@ -2201,7 +2219,10 @@ impl Container {
         }
     }
 
-    fn become_userns_root_for_setup(gvisor_network: Option<&NetworkMode>) -> Result<()> {
+    fn become_userns_root_for_setup(
+        gvisor_network: Option<&NetworkMode>,
+        workload: Option<&CapabilitySets>,
+    ) -> Result<()> {
         setresgid(Gid::from_raw(0), Gid::from_raw(0), Gid::from_raw(0)).map_err(|e| {
             NucleusError::NamespaceError(format!(
                 "Failed to become gid 0 inside mapped user namespace: {}",
@@ -2214,7 +2235,7 @@ impl Container {
                 e
             ))
         })?;
-        Self::restore_gvisor_handoff_capabilities(gvisor_network)?;
+        Self::restore_gvisor_handoff_capabilities(gvisor_network, workload)?;
         debug!("Switched setup process to uid/gid 0 inside mapped user namespace");
         Ok(())
     }
@@ -2237,7 +2258,10 @@ impl Container {
         .collect()
     }
 
-    fn restore_gvisor_handoff_capabilities(gvisor_network: Option<&NetworkMode>) -> Result<()> {
+    fn restore_gvisor_handoff_capabilities(
+        gvisor_network: Option<&NetworkMode>,
+        workload: Option<&CapabilitySets>,
+    ) -> Result<()> {
         let mut caps = Self::gvisor_handoff_capabilities();
         if matches!(gvisor_network, Some(NetworkMode::Bridge(_))) {
             // Scoped to the new user namespace: runsc moves interface addresses
@@ -2265,14 +2289,23 @@ impl Container {
                 missing
             )));
         }
-        let extra_permitted: Vec<_> = permitted.difference(&caps).copied().collect();
+        // Native setup retains policy inputs in the upper bounds only. The
+        // workload receives its effective and ambient sets after switching IDs.
+        let mut permitted_limit = caps.clone();
+        let mut bounding_limit = caps.clone();
+        if let Some(sets) = workload {
+            permitted_limit.extend(&sets.permitted);
+            bounding_limit.extend(&sets.bounding);
+            bounding_limit.extend(&sets.inheritable);
+        }
+        let extra_permitted: Vec<_> = permitted.difference(&permitted_limit).copied().collect();
         let bounding = caps::read(None, CapSet::Bounding).map_err(|e| {
             NucleusError::CapabilityError(format!(
                 "Failed to read gVisor handoff bounding capabilities: {}",
                 e
             ))
         })?;
-        let extra_bounding: Vec<_> = bounding.difference(&caps).copied().collect();
+        let extra_bounding: Vec<_> = bounding.difference(&bounding_limit).copied().collect();
         caps::clear(None, CapSet::Ambient).map_err(|e| {
             NucleusError::CapabilityError(format!(
                 "Failed to clear gVisor handoff ambient capabilities: {}",
@@ -2358,7 +2391,7 @@ impl Container {
                 "Parent closed user namespace ack pipe before gVisor handoff mappings were written",
                 "Failed waiting for parent to finish gVisor handoff user namespace mappings",
             )?;
-            Self::become_userns_root_for_setup(Some(&self.config.network))?;
+            Self::become_userns_root_for_setup(Some(&self.config.network), None)?;
             precreated_userns = true;
         }
 
@@ -3269,7 +3302,7 @@ mod tests {
             "gVisor handoff must verify existing permitted capabilities"
         );
         assert!(
-            fn_body.contains("permitted.difference(&caps)")
+            fn_body.contains("permitted.difference(&permitted_limit)")
                 && set_effective < drop_permitted
                 && !fn_body.contains("caps::set(None, CapSet::Permitted"),
             "gVisor handoff must drop extra permitted capabilities without trying to raise permitted"
@@ -3285,7 +3318,7 @@ mod tests {
         let drop_permitted = fn_body.find("caps::drop(None, CapSet::Permitted").unwrap();
         assert!(
             fn_body.contains("caps::read(None, CapSet::Bounding)")
-                && fn_body.contains("bounding.difference(&caps)")
+                && fn_body.contains("bounding.difference(&bounding_limit)")
                 && set_effective < drop_bounding
                 && drop_bounding < drop_permitted,
             "gVisor handoff must drop extra bounding capabilities before exec"

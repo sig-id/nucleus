@@ -278,7 +278,7 @@ pub(crate) fn read_regular_file_nofollow(path: &Path) -> Result<Vec<u8>> {
     Ok(content)
 }
 
-fn decode_mountinfo_field(field: &str) -> String {
+pub(crate) fn decode_mountinfo_field(field: &str) -> String {
     let mut decoded = String::with_capacity(field.len());
     let mut chars = field.chars().peekable();
 

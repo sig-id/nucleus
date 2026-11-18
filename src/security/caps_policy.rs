@@ -55,7 +55,7 @@ pub struct CapSetPolicy {
 
 /// Capabilities that are too dangerous for container workloads.
 /// Rejected in every workload service mode.
-const DANGEROUS_CAPABILITIES: &[Capability] = &[
+pub(super) const DANGEROUS_CAPABILITIES: &[Capability] = &[
     Capability::CAP_SYS_ADMIN,
     Capability::CAP_SYS_MODULE,
     Capability::CAP_SYS_RAWIO,
@@ -129,7 +129,7 @@ impl CapsPolicy {
         }
     }
 
-    fn resolve_sets(&self) -> Result<CapabilitySets> {
+    pub(crate) fn resolve_sets(&self) -> Result<CapabilitySets> {
         let bounding = resolve_cap_list(&self.bounding.keep)?;
         let effective = resolve_cap_list(&self.effective.keep)?;
         let ambient = resolve_cap_list(&self.ambient.keep)?;

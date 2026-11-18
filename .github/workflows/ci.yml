@@ -30,6 +30,15 @@ jobs:
           RUSTC_WRAPPER: ""
         run: cargo clippy --locked --all-targets -- -D warnings
 
+      - name: Verify Landlock scopes, TCP rules, rule aliases and capability readback
+        env:
+          RUSTC_WRAPPER: ""
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: sudo
+        run: |
+          cargo test --locked --lib security::landlock_policy::tests::kernel_enforces_tcp_and_ipc_scopes -- --ignored --exact
+          cargo test --locked --lib security::landlock_policy::tests::production_checks_bind_aliases_on_installed_rule_fds -- --ignored --exact
+          cargo test --locked --lib security::capabilities::tests::custom_capability_sets_are_enforced_by_kernel -- --ignored --exact
+
       - name: Verify recursive bind restrictions
         env:
           RUSTC_WRAPPER: ""
