@@ -408,10 +408,7 @@ impl GVisorRuntime {
         }
 
         // execve - this replaces the current process with runsc
-        nix::unistd::execve::<std::ffi::CString, std::ffi::CString>(&program, &c_args, &c_env)?;
-
-        // Should never reach here
-        Ok(())
+        nix::unistd::execve::<std::ffi::CString, std::ffi::CString>(&program, &c_args, &c_env)?
     }
 
     /// Execute using gVisor with an OCI bundle and explicit network mode.

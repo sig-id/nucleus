@@ -302,9 +302,7 @@ impl ContainerAttach {
             args.map_err(|e| NucleusError::AttachError(format!("Invalid argument: {}", e)))?;
 
         nix::unistd::execve::<CString, CString>(&program, &args, env)
-            .map_err(|e| NucleusError::AttachError(format!("execve failed: {}", e)))?;
-
-        Ok(())
+            .map_err(|e| NucleusError::AttachError(format!("execve failed: {}", e)))?
     }
 
     fn ns_name_to_clone_flag(name: &str) -> libc::c_int {
