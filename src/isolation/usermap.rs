@@ -214,7 +214,7 @@ impl IdMapping {
         // Reject mapping host UID 0 unless explicitly allowed (e.g., root-remapped mode)
         if !allow_host_root && self.host_id == 0 && self.count > 0 {
             return Err(NucleusError::ConfigError(
-                "ID mapping includes host UID/GID 0; use root-remapped mode if intentional"
+                "ID mapping includes host UID/GID 0; use a nonzero host range"
                     .to_string(),
             ));
         }

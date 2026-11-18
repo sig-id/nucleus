@@ -71,6 +71,7 @@ pub struct CreatedContainer {
     pub(super) trace_reader: Option<SeccompTraceReader>,
     pub(super) deny_logger: Option<SeccompDenyLogger>,
     pub(super) exec_fifo_path: Option<PathBuf>,
+    mapped_gvisor_base: Option<PathBuf>,
     pub(super) native_console_master: Option<OwnedFd>,
     pub(super) event_sink: Option<EventSink>,
     pub(super) _lifecycle_span: tracing::Span,
@@ -226,12 +227,13 @@ impl Container {
 
     fn gvisor_needs_precreated_userns(config: &ContainerConfig, host_is_root: bool) -> bool {
         config.use_gvisor
-            && !host_is_root
             && config.user_ns_config.is_some()
-            && matches!(
-                config.network,
-                NetworkMode::Bridge(_) | NetworkMode::GVisorHost
-            )
+            && ((host_is_root && config.service_mode == ServiceMode::Agent)
+                || (!host_is_root
+                    && matches!(
+                        config.network,
+                        NetworkMode::Bridge(_) | NetworkMode::GVisorHost
+                    )))
     }
 
     /// Host device nodes the gVisor supervisor must be allowed to open, for
@@ -310,7 +312,57 @@ impl Container {
             ))
         })?;
 
+        // Setting NUCLEUS_GVISOR_ARTIFACT_BASE only relocates the default
+        // bundle: an explicit --bundle path is used unchanged by
+        // setup_and_exec_gvisor_oci after the child has become the mapped
+        // supervisor. Prepare that directory here, while still host root, so
+        // the demoted child can create and secure the bundle in place.
+        if config.use_gvisor {
+            if let Some(bundle_dir) = config.bundle_dir.as_deref() {
+                Self::prepare_mapped_bundle_dir(bundle_dir, host_uid, host_gid)?;
+            }
+        }
+
         Ok(Some(base))
+    }
+
+    /// Prepare an explicit `--bundle` directory for the mapped gVisor
+    /// supervisor.
+    ///
+    /// Root-launched agent handoffs demote the fork child to the mapped
+    /// supervisor (the host identity of container ID 0) before
+    /// `OciBundle::create` runs against the explicit bundle path. Create the
+    /// directory while still host root and transfer it to the supervisor so
+    /// previously working explicit bundles keep working.
+    fn prepare_mapped_bundle_dir(path: &Path, host_uid: u32, host_gid: u32) -> Result<()> {
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(NucleusError::FilesystemError(format!(
+                    "Refusing symlink explicit gVisor bundle directory {:?}",
+                    path
+                )));
+            }
+            Ok(_) | Err(_) => {}
+        }
+
+        std::fs::create_dir_all(path).map_err(|e| {
+            NucleusError::FilesystemError(format!(
+                "Failed to create explicit gVisor bundle directory {:?}: {}",
+                path, e
+            ))
+        })?;
+        chown(
+            path,
+            Some(Uid::from_raw(host_uid)),
+            Some(Gid::from_raw(host_gid)),
+        )
+        .map_err(|e| {
+            NucleusError::FilesystemError(format!(
+                "Failed to chown explicit gVisor bundle directory {:?} to {}:{}: {}",
+                path, host_uid, host_gid, e
+            ))
+        })?;
+        Ok(())
     }
 
     fn ensure_runtime_parent_dir(path: &std::path::Path) -> Result<()> {
@@ -333,7 +385,6 @@ impl Container {
         config: &mut ContainerConfig,
         runtime_base_override: Option<&Path>,
         host_is_root: bool,
-        needs_external_userns_mapping: bool,
     ) -> Result<()> {
         if config.workspace.mode != WorkspaceMode::CopyInOut {
             return Ok(());
@@ -344,19 +395,23 @@ impl Container {
                 "--workspace-mode copy-in-out requires --workspace".to_string(),
             )
         })?;
-        let parent = runtime_base_override
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| {
-                dirs::runtime_dir()
-                    .map(|d| d.join("nucleus"))
-                    .unwrap_or_else(std::env::temp_dir)
-            });
-        std::fs::create_dir_all(&parent).map_err(|e| {
-            NucleusError::FilesystemError(format!(
-                "Failed to create workspace staging parent {:?}: {}",
-                parent, e
-            ))
-        })?;
+        // A mapped workload may write its runtime base. Keep the parent of a
+        // privileged copy operation under host-root ownership throughout setup.
+        let parent = if host_is_root {
+            let parent = PathBuf::from("/run/nucleus/workspaces");
+            Self::ensure_runtime_parent_dir(&parent)?;
+            parent
+        } else {
+            let parent = runtime_base_override
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| {
+                    dirs::runtime_dir()
+                        .map(|d| d.join("nucleus"))
+                        .unwrap_or_else(std::env::temp_dir)
+                });
+            std::fs::create_dir_all(&parent)?;
+            parent
+        };
 
         let staging = parent.join(format!("workspace-{}", config.id));
         if staging.exists() {
@@ -382,21 +437,9 @@ impl Container {
 
         copy_workspace_in(&source, &staging)?;
 
-        if host_is_root && needs_external_userns_mapping {
-            let user_config = config.user_ns_config.as_ref().ok_or_else(|| {
-                NucleusError::ExecError("Missing user namespace configuration".to_string())
-            })?;
-            let host_uid = Self::mapped_host_id_for_container_id(
-                &user_config.uid_mappings,
-                0,
-                "uid mappings",
-            )?;
-            let host_gid = Self::mapped_host_id_for_container_id(
-                &user_config.gid_mappings,
-                0,
-                "gid mappings",
-            )?;
-            Self::chown_tree_no_symlinks(&staging, host_uid, host_gid)?;
+        if host_is_root {
+            let (uid, gid) = Self::host_workload_ids(config)?;
+            Self::chown_tree_no_symlinks(&staging, uid, gid)?;
         }
 
         config.workspace.staging_path = Some(staging);
@@ -490,13 +533,6 @@ impl Container {
             return Ok(());
         }
 
-        chown(path, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid))).map_err(|e| {
-            NucleusError::FilesystemError(format!(
-                "Failed to chown workspace staging path {:?} to {}:{}: {}",
-                path, uid, gid, e
-            ))
-        })?;
-
         if metadata.is_dir() {
             for entry in std::fs::read_dir(path).map_err(|e| {
                 NucleusError::FilesystemError(format!(
@@ -513,6 +549,14 @@ impl Container {
                 Self::chown_tree_no_symlinks(&entry.path(), uid, gid)?;
             }
         }
+
+        // Give the workload access only after the subtree is ready.
+        chown(path, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid))).map_err(|e| {
+            NucleusError::FilesystemError(format!(
+                "Failed to chown workspace staging path {:?} to {}:{}: {}",
+                path, uid, gid, e
+            ))
+        })?;
 
         Ok(())
     }
@@ -583,6 +627,53 @@ impl Container {
         )))
     }
 
+    fn host_workload_ids(config: &ContainerConfig) -> Result<(u32, u32)> {
+        let identity = &config.process_identity;
+        let Some(mapping) = &config.user_ns_config else {
+            return Ok((identity.uid, identity.gid));
+        };
+        Ok((
+            Self::mapped_host_id_for_container_id(
+                &mapping.uid_mappings,
+                identity.uid,
+                "uid mappings",
+            )?,
+            Self::mapped_host_id_for_container_id(
+                &mapping.gid_mappings,
+                identity.gid,
+                "gid mappings",
+            )?,
+        ))
+    }
+
+    fn configure_user_namespace(config: &mut ContainerConfig, host_is_root: bool) -> Result<()> {
+        use crate::isolation::UserNamespaceConfig;
+
+        if config.user_ns_config.is_none() {
+            let identity = &config.process_identity;
+            if !host_is_root {
+                let workload_uid = (identity.uid != 0).then_some(identity.uid);
+                config.user_ns_config =
+                    Some(UserNamespaceConfig::for_unprivileged_rootless(workload_uid));
+            } else if config.namespaces.user
+                || config.service_mode.requires_user_namespace_mapping()
+                || identity.uid == 0
+                || identity.gid == 0
+                || identity.additional_gids.contains(&0)
+            {
+                info!("Remapping workload IDs in a user namespace");
+                config.user_ns_config = Some(UserNamespaceConfig::root_remapped());
+            }
+        }
+        if let Some(mapping) = &config.user_ns_config {
+            for entry in mapping.uid_mappings.iter().chain(&mapping.gid_mappings) {
+                entry.validate(false)?;
+            }
+            config.namespaces.user = true;
+        }
+        Ok(())
+    }
+
     fn create_internal(&self, defer_exec_until_start: bool) -> Result<CreatedContainer> {
         let lifecycle_span = info_span!(
             "container.lifecycle",
@@ -612,47 +703,9 @@ impl Container {
             ),
         );
 
-        // Auto-detect if we need rootless mode
         let is_root = nix::unistd::Uid::effective().is_root();
         let mut config = self.config.clone();
-
-        if !is_root && config.user_ns_config.is_none() {
-            info!("Not running as root, automatically enabling rootless mode");
-            config.namespaces.user = true;
-            // If the workload requested a non-zero uid, prefer a keep-id mapping
-            // (when /etc/subuid is configured) so that uid is mappable; otherwise
-            // fall back to the historic trivial rootless mapping.
-            let workload_uid = if config.process_identity.uid != 0 {
-                Some(config.process_identity.uid)
-            } else {
-                None
-            };
-            config.user_ns_config =
-                Some(crate::isolation::UserNamespaceConfig::for_unprivileged_rootless(
-                    workload_uid,
-                ));
-        }
-
-        // C2: When running as root without user namespace, enable UID remapping
-        // in strict modes (mandatory) or warn in relaxed agent mode. Without user
-        // namespace, a container escape yields full host root.
-        if is_root && !config.namespaces.user {
-            if config.service_mode.requires_user_namespace_mapping() {
-                info!(
-                    "Running as root in {}: enabling user namespace with UID remapping",
-                    config.service_mode.label()
-                );
-                config.namespaces.user = true;
-                config.user_ns_config =
-                    Some(crate::isolation::UserNamespaceConfig::root_remapped());
-            } else {
-                warn!(
-                    "Running as root WITHOUT user namespace isolation. \
-                     Container processes will run as real host UID 0. \
-                     Use --user-ns, strict-agent mode, or production mode for UID remapping."
-                );
-            }
-        }
+        Self::configure_user_namespace(&mut config, is_root)?;
 
         // Validate service-mode invariants before anything else.
         config.validate_strict_agent_mode()?;
@@ -832,12 +885,7 @@ impl Container {
             is_root,
             needs_external_userns_mapping,
         )?;
-        Self::prepare_workspace_staging(
-            &mut config,
-            runtime_base_override.as_deref(),
-            is_root,
-            needs_external_userns_mapping,
-        )?;
+        Self::prepare_workspace_staging(&mut config, runtime_base_override.as_deref(), is_root)?;
 
         let event_sink = self.event_sink.clone();
         let mut native_pty = if config.terminal && !config.use_gvisor {
@@ -1071,7 +1119,10 @@ impl Container {
                         config.id, target_pid
                     );
 
+                    let mapped_gvisor_base =
+                        runtime_base_override.filter(|_| is_root && gvisor_needs_precreated_userns);
                     Ok(CreatedContainer {
+                        mapped_gvisor_base,
                         config,
                         state_mgr,
                         state,
@@ -1201,16 +1252,37 @@ impl Container {
         let mut fs_state = FilesystemState::Unmounted;
         let mut sec_state = SecurityState::Privileged;
 
-        // gVisor creates the container namespaces. Rootless bridge and
-        // gvisor-host pre-create the user namespace so runsc inherits a mapped
-        // launch context. Bridge also pre-creates a netns for slirp/NAT setup;
-        // gvisor-host intentionally keeps the host netns for runsc hostinet.
+        // Supplementary groups survive creation of a user namespace, even
+        // when their host IDs are absent from gid_map.
+        if is_rootless && Uid::effective().is_root() {
+            nix::unistd::setgroups(&[])?;
+        }
+
+        // Hand off root-launched agents to runsc as mapped root. Unprivileged
+        // bridge and hostinet launches also need the pre-created user namespace.
         if self.config.use_gvisor {
+            let mapped_base = runtime_base_override
+                .as_deref()
+                .filter(|_| Uid::effective().is_root());
             let gvisor_precreated_userns = self.prepare_gvisor_handoff_namespace(
                 userns_request_pipe.as_ref(),
                 userns_ack_pipe.as_ref(),
             )?;
 
+            if let Some(base) = mapped_base {
+                // Both the OCI bundle and runsc state must be owned by the mapped supervisor.
+                // This is the single-threaded fork child, before runsc receives its sanitized env.
+                std::env::set_var("NUCLEUS_GVISOR_ARTIFACT_BASE", base);
+                // Mount secret staging in a namespace owned by the mapped setup process.
+                nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNS)?;
+                nix::mount::mount(
+                    None::<&str>,
+                    "/",
+                    None::<&str>,
+                    nix::mount::MsFlags::MS_REC | nix::mount::MsFlags::MS_PRIVATE,
+                    None::<&str>,
+                )?;
+            }
             if let Some(fd) = ready_pipe {
                 Self::notify_namespace_ready(&fd, std::process::id())?;
             }
@@ -1223,6 +1295,18 @@ impl Container {
             }
             return self.setup_and_exec_gvisor(gvisor_precreated_userns, gpu_device_set);
         }
+
+        let prepared_dev = if is_rootless && Uid::effective().is_root() {
+            let (uid, gid) = Self::host_workload_ids(&self.config)?;
+            Some(crate::filesystem::prepare_mapped_dev(
+                self.config.terminal,
+                gpu_device_set,
+                uid,
+                gid,
+            )?)
+        } else {
+            None
+        };
 
         // 1. Create namespaces in child and optionally configure user mapping.
         let mut namespace_mgr = NamespaceManager::new(self.config.namespaces.clone());
@@ -1248,7 +1332,7 @@ impl Container {
                 "Parent closed user namespace ack pipe before mappings were written",
                 "Failed waiting for parent to finish user namespace mappings",
             )?;
-            Self::become_userns_root_for_setup(false)?;
+            Self::become_userns_root_for_setup(None)?;
         }
 
         // CLONE_NEWPID only applies to children created after unshare().
@@ -1360,16 +1444,30 @@ impl Container {
 
         // 5. Create device nodes and standard tmpfs mounts under /dev
         let dev_path = container_root.join("dev");
-        create_dev_nodes(&dev_path, self.config.terminal)?;
+        if let Some(prepared_dev) = &prepared_dev {
+            nix::mount::mount(
+                Some(prepared_dev),
+                &dev_path,
+                None::<&str>,
+                nix::mount::MsFlags::MS_BIND,
+                None::<&str>,
+            )?;
+        } else {
+            create_dev_nodes(&dev_path, self.config.terminal)?;
+        }
 
         // 5a. GPU passthrough: create private device nodes + bind driver support files.
         if let (Some(set), Some(gpu_config)) = (gpu_device_set, &self.config.gpu) {
-            mount_gpu_passthrough(
-                &container_root,
-                set,
-                gpu_config,
-                &self.config.process_identity,
-            )?;
+            if prepared_dev.is_some() {
+                crate::filesystem::mount_gpu_support(&container_root, set, gpu_config)?;
+            } else {
+                mount_gpu_passthrough(
+                    &container_root,
+                    set,
+                    gpu_config,
+                    &self.config.process_identity,
+                )?;
+            }
         }
 
         // /dev/shm – POSIX shared memory (shm_open). Required by PostgreSQL,
@@ -2003,7 +2101,7 @@ impl Container {
         }
     }
 
-    fn become_userns_root_for_setup(bridge_netstack: bool) -> Result<()> {
+    fn become_userns_root_for_setup(gvisor_network: Option<&NetworkMode>) -> Result<()> {
         setresgid(Gid::from_raw(0), Gid::from_raw(0), Gid::from_raw(0)).map_err(|e| {
             NucleusError::NamespaceError(format!(
                 "Failed to become gid 0 inside mapped user namespace: {}",
@@ -2016,7 +2114,7 @@ impl Container {
                 e
             ))
         })?;
-        Self::restore_gvisor_handoff_capabilities(bridge_netstack)?;
+        Self::restore_gvisor_handoff_capabilities(gvisor_network)?;
         debug!("Switched setup process to uid/gid 0 inside mapped user namespace");
         Ok(())
     }
@@ -2039,18 +2137,20 @@ impl Container {
         .collect()
     }
 
-    fn restore_gvisor_handoff_capabilities(bridge_netstack: bool) -> Result<()> {
+    fn restore_gvisor_handoff_capabilities(gvisor_network: Option<&NetworkMode>) -> Result<()> {
         let mut caps = Self::gvisor_handoff_capabilities();
-        if bridge_netstack {
+        if matches!(gvisor_network, Some(NetworkMode::Bridge(_))) {
             // Scoped to the new user namespace: runsc moves interface addresses
             // into netstack and opens its AF_PACKET link in the private netns.
+            caps.extend([Capability::CAP_NET_ADMIN, Capability::CAP_NET_RAW]);
+        }
+        if matches!(
+            gvisor_network,
+            Some(NetworkMode::Bridge(_) | NetworkMode::None)
+        ) {
             // DirectFS creates a nested identity mapping of UID 0. Linux
             // requires SETFCAP in this parent user namespace to write it.
-            caps.extend([
-                Capability::CAP_NET_ADMIN,
-                Capability::CAP_NET_RAW,
-                Capability::CAP_SETFCAP,
-            ]);
+            caps.insert(Capability::CAP_SETFCAP);
         }
         let permitted = caps::read(None, CapSet::Permitted).map_err(|e| {
             NucleusError::CapabilityError(format!(
@@ -2158,10 +2258,7 @@ impl Container {
                 "Parent closed user namespace ack pipe before gVisor handoff mappings were written",
                 "Failed waiting for parent to finish gVisor handoff user namespace mappings",
             )?;
-            Self::become_userns_root_for_setup(matches!(
-                self.config.network,
-                NetworkMode::Bridge(_)
-            ))?;
+            Self::become_userns_root_for_setup(Some(&self.config.network))?;
             precreated_userns = true;
         }
 
@@ -2395,7 +2492,15 @@ impl CreatedContainer {
         }
 
         if config.use_gvisor {
-            if let Err(e) = Container::cleanup_gvisor_artifacts(&config.id) {
+            let cleanup = if let Some(base) = self.mapped_gvisor_base.as_ref() {
+                // Mounts expired with the child. Never resolve a mapped user's mount paths as host root.
+                std::fs::remove_dir_all(base).map_err(|e| {
+                    NucleusError::FilesystemError(format!("Failed to remove {base:?}: {e}"))
+                })
+            } else {
+                Container::cleanup_gvisor_artifacts(&config.id)
+            };
+            if let Err(e) = cleanup {
                 let msg = format!("gVisor artifact cleanup failed for {}: {}", config.id, e);
                 warn!("{}", msg);
                 cleanup_errors.push(msg);
@@ -2572,6 +2677,41 @@ mod tests {
             }
         }
         &after[..end]
+    }
+
+    #[test]
+    fn privileged_agent_remaps_root_even_with_degraded_security() {
+        let mut config = ContainerConfig::try_new(None, vec!["/bin/sh".into()])
+            .unwrap()
+            .with_allow_degraded_security(true);
+        Container::configure_user_namespace(&mut config, true).unwrap();
+        assert!(config.namespaces.user);
+        assert_eq!(
+            Container::host_workload_ids(&config).unwrap(),
+            (100_000, 100_000)
+        );
+    }
+
+    #[test]
+    fn privileged_agent_preserves_explicit_nonroot_ids() {
+        let mut config = ContainerConfig::try_new(None, vec!["/bin/sh".into()]).unwrap();
+        config.process_identity.uid = 1234;
+        config.process_identity.gid = 2345;
+        Container::configure_user_namespace(&mut config, true).unwrap();
+        assert!(!config.namespaces.user);
+        assert_eq!(Container::host_workload_ids(&config).unwrap(), (1234, 2345));
+    }
+
+    #[test]
+    fn explicit_namespace_map_cannot_include_host_root() {
+        let mut config = ContainerConfig::try_new(None, vec!["/bin/sh".into()]).unwrap();
+        for (uid, gid) in [(0, 100_000), (100_000, 0)] {
+            config.user_ns_config = Some(crate::isolation::UserNamespaceConfig {
+                uid_mappings: vec![crate::isolation::IdMapping::new(0, uid, 1)],
+                gid_mappings: vec![crate::isolation::IdMapping::new(0, gid, 1)],
+            });
+            assert!(Container::configure_user_namespace(&mut config, true).is_err());
+        }
     }
 
     #[test]
@@ -3408,5 +3548,44 @@ mod tests {
             !probe_body.contains("/dev/tcp"),
             "TCP readiness probe must not use /dev/tcp (bash-specific, fails on dash/ash)"
         );
+    }
+    #[test]
+    fn test_mapped_runtime_base_prepares_explicit_bundle_dir() {
+        let source = include_str!("runtime.rs");
+        let fn_body = extract_fn_body(source, "fn prepare_runtime_base_override");
+        assert!(
+            fn_body.contains("prepare_mapped_bundle_dir"),
+            "root remap handoff must prepare explicit --bundle directories for the mapped supervisor"
+        );
+        let helper = extract_fn_body(source, "fn prepare_mapped_bundle_dir");
+        assert!(
+            helper.contains("symlink_metadata") && helper.contains("Refusing symlink"),
+            "explicit bundle preparation must refuse symlinked paths before chowning"
+        );
+    }
+
+    #[test]
+    fn test_prepare_mapped_bundle_dir_creates_and_transfers_ownership() {
+        let temp = tempfile::tempdir().unwrap();
+        let bundle = temp.path().join("explicit-bundle");
+        // chown to the current identity keeps the test rootless-capable.
+        let uid = Uid::effective();
+        let gid = Gid::effective();
+
+        Container::prepare_mapped_bundle_dir(&bundle, uid.as_raw(), gid.as_raw()).unwrap();
+        assert!(bundle.is_dir());
+
+        // Repeated launches must be idempotent.
+        Container::prepare_mapped_bundle_dir(&bundle, uid.as_raw(), gid.as_raw()).unwrap();
+
+        // Symlinked bundle paths are refused before any ownership change.
+        let target = temp.path().join("real-target");
+        std::fs::create_dir(&target).unwrap();
+        let link = temp.path().join("bundle-link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let err = Container::prepare_mapped_bundle_dir(&link, uid.as_raw(), gid.as_raw())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Refusing symlink"));
     }
 }

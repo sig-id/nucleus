@@ -30,6 +30,12 @@ jobs:
           RUSTC_WRAPPER: ""
         run: cargo clippy --locked --all-targets -- -D warnings
 
+      - name: Verify root-run workspace isolation
+        env:
+          RUSTC_WRAPPER: ""
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: sudo
+        run: cargo test --locked --test integration_filesystem tests::root_agent_bind_mount_uses_unprivileged_host_ids -- --ignored --exact
+
       - name: Verify GPU device ownership as root
         env:
           RUSTC_WRAPPER: ""

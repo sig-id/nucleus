@@ -9,6 +9,63 @@ mod tests {
     use std::path::Path;
     use tempfile::TempDir;
 
+    #[test]
+    #[ignore = "requires host root, native namespaces and mount privileges"]
+    fn root_agent_bind_mount_uses_unprivileged_host_ids() {
+        check_root_agent_bind_mount("native");
+    }
+
+    #[test]
+    #[ignore = "requires host root, gVisor and user namespaces"]
+    fn root_gvisor_bind_mount_uses_unprivileged_host_ids() {
+        check_root_agent_bind_mount("gvisor");
+    }
+
+    fn check_root_agent_bind_mount(runtime: &str) {
+        use std::fs;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        use std::process::Command;
+
+        assert!(nix::unistd::Uid::effective().is_root());
+        let workspace = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        fs::set_permissions(workspace.path(), fs::Permissions::from_mode(0o1777)).unwrap();
+        let private = workspace.path().join("root-owned");
+        fs::write(&private, b"fixture\n").unwrap();
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o600)).unwrap();
+        let result = Command::new(env!("CARGO_BIN_EXE_nucleus"))
+            .args(["create", "--root"])
+            .arg(state.path())
+            .args([
+                "--runtime",
+                runtime,
+                "--trust-level",
+                "trusted",
+                "--network",
+                "none",
+                "--pids",
+                "0",
+                "--allow-degraded-security",
+                "--workspace",
+            ])
+            .arg(workspace.path())
+            .args([
+                "--",
+                "/bin/sh",
+                "-ec",
+                "if read -r line </workspace/root-owned; then exit 1; fi; : </dev/null; : > /workspace/created",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let created = fs::metadata(workspace.path().join("created")).unwrap();
+        assert_eq!((created.uid(), created.gid()), (100_000, 100_000));
+    }
+
     // --- ContextPopulator: file copying ---
 
     #[test]

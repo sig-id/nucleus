@@ -413,6 +413,14 @@ pub fn create_minimal_fs(root: &Path) -> Result<()> {
 ///
 /// In rootless mode, device node creation will fail gracefully
 pub fn create_dev_nodes(dev_path: &Path, include_tty: bool) -> Result<()> {
+    create_base_dev_nodes(dev_path, include_tty, None)
+}
+
+fn create_base_dev_nodes(
+    dev_path: &Path,
+    include_tty: bool,
+    owner: Option<(u32, u32)>,
+) -> Result<()> {
     info!("Creating device nodes at {:?}", dev_path);
 
     // Device nodes: (name, type, major, minor)
@@ -437,9 +445,17 @@ pub fn create_dev_nodes(dev_path: &Path, include_tty: bool) -> Result<()> {
 
         match mknod(&path, dev_type, mode, dev) {
             Ok(_) => {
+                if let Some((uid, gid)) = owner {
+                    nix::unistd::chown(
+                        &path,
+                        Some(nix::unistd::Uid::from_raw(uid)),
+                        Some(nix::unistd::Gid::from_raw(gid)),
+                    )?;
+                }
                 info!("Created device node: {:?}", path);
                 created_count += 1;
             }
+            Err(e) if owner.is_some() => return Err(e.into()),
             Err(e) => {
                 // In rootless mode, mknod fails - this is expected
                 warn!(
@@ -459,6 +475,59 @@ pub fn create_dev_nodes(dev_path: &Path, include_tty: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Prepare a private device filesystem while the native setup child can still
+/// mknod. A user-namespace tmpfs is nodev. This mount is inherited through
+/// unshare and disappears with the child's mount namespace.
+pub(crate) fn prepare_mapped_dev(
+    include_tty: bool,
+    gpu: Option<&super::GpuDeviceSet>,
+    uid: u32,
+    gid: u32,
+) -> Result<PathBuf> {
+    use nix::sched::{unshare, CloneFlags};
+    use nix::sys::stat::umask;
+
+    unshare(CloneFlags::CLONE_NEWNS)?;
+    mount(
+        None::<&str>,
+        "/",
+        None::<&str>,
+        MsFlags::MS_REC | MsFlags::MS_PRIVATE,
+        None::<&str>,
+    )?;
+    // /run/nucleus is the root-owned runtime parent. Concurrent children
+    // share only the empty mountpoint, each has its own tmpfs.
+    let stage = Path::new("/run/nucleus/device-stage");
+    std::fs::create_dir_all(stage)?;
+    mount(
+        Some("tmpfs"),
+        stage,
+        Some("tmpfs"),
+        MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC,
+        Some("size=1m,mode=0755"),
+    )?;
+    // Only this single-threaded setup child sees the temporary mask. On
+    // preparation errors the child exits before executing a workload.
+    let prior_mask = umask(Mode::from_bits_truncate(0o022));
+    let dev = stage.join("dev");
+    std::fs::create_dir(&dev)?;
+    create_base_dev_nodes(&dev, include_tty, Some((uid, gid)))?;
+    if let Some(set) = gpu {
+        super::create_gpu_nodes(
+            stage,
+            set,
+            &crate::container::ProcessIdentity {
+                uid,
+                gid,
+                additional_gids: vec![],
+            },
+        )?;
+    }
+    std::fs::create_dir(dev.join("shm"))?;
+    umask(prior_mask);
+    Ok(dev)
 }
 
 /// Bind mount a pre-built rootfs (e.g. a Nix store closure) into the container.

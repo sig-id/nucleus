@@ -1008,7 +1008,11 @@ impl ContainerConfig {
     #[must_use]
     pub fn with_rootless(mut self) -> Self {
         self.namespaces.user = true;
-        self.user_ns_config = Some(UserNamespaceConfig::rootless());
+        self.user_ns_config = Some(if nix::unistd::Uid::effective().is_root() {
+            UserNamespaceConfig::root_remapped()
+        } else {
+            UserNamespaceConfig::rootless()
+        });
         self
     }
 
@@ -2849,8 +2853,8 @@ mod tests {
             .unwrap()
             .with_rootless()
             .with_process_identity(ProcessIdentity {
-                uid: 1000,
-                gid: 1000,
+                uid: 100_000,
+                gid: 100_000,
                 additional_gids: Vec::new(),
             });
 
