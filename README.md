@@ -80,7 +80,7 @@ noise rather than a guaranteed speedup.
 - **Zero-overhead isolation** – Direct use of cgroups, namespaces, pivot_root, capabilities, seccomp, and Landlock
 - **Memory-backed filesystems** – Container disk mapped to tmpfs, pre-populated with agent context
 - **gVisor integration** – Optional application kernel for enhanced security, including networked service mode
-- **OCI runtime-spec subset for gVisor** – Generates OCI bundle/config data for `runsc`, including process identity, mounts, namespaces, seccomp, hooks, and cgroup path wiring
+- **OCI runtime-spec subset for gVisor** – Generates OCI bundle/config data for `runsc`, including process identity, mounts, namespaces, seccomp, and cgroup path wiring
 - **Detached mode** – Run containers in the background as systemd transient services with `--detach`, managed via `nucleus stop`/`logs`/`attach`
 - **Production service support** – Declarative NixOS module, egress policies, credential-broker egress, health checks, secrets mounting, sd_notify, and journald integration
 - **Explicit workload identity** – Native and gVisor runtimes can drop to a configured `uid`/`gid` plus supplementary groups after privileged setup
@@ -136,7 +136,7 @@ Nucleus leverages Linux kernel isolation primitives:
 - **seccomp** – Syscall whitelist filtering with per-service JSON profiles and trace-based generation (irreversible)
 - **Landlock** – Native filesystem and TCP access rules, with abstract Unix socket and signal scoping on Landlock ABI 6 (Linux 6.12+)
 - **gVisor** – Optional application kernel (runsc) with none, bridge handoff, and explicit gvisor-host network modes
-- **OCI bundle generation** – Emits OCI `config.json` plus bundle layout for gVisor, including `process.user`, lifecycle hooks, seccomp, resource limits, and namespace mappings
+- **OCI bundle generation** – Emits OCI `config.json` plus bundle layout for gVisor, including `process.user`, seccomp, resource limits, and namespace mappings
 - **Image snapshots** – Local signed manifests with optional overlay diffs rooted in attested Nix rootfs closures
 - **PID 1 init** – Mini-init supervisor in production mode for zombie reaping and signal forwarding
 - **In-memory secrets** – Dedicated tmpfs at `/run/secrets` with volatile zeroing of source buffers
@@ -170,7 +170,7 @@ The Cargo package name is `nucleus-container`; it installs the `nucleus` binary.
 - **Local signed image snapshots** – Native overlay-backed containers can be committed, verified, inspected, loaded, and run as thin image directories over a Nix rootfs base.
 - **Privilege drop for services** – `--user`, `--group`, and `--additional-group` now apply a real post-setup workload identity in both the native runtime and gVisor.
 - **Ownership-aware secrets and writable paths** – Production secret staging and NixOS `createHostPath = true` defaults now align file ownership with the configured workload user/group.
-- **OCI bundle identity support** – Generated gVisor OCI configs now carry `process.user` including supplementary groups, alongside namespaces, mounts, resource limits, seccomp, hooks, and `cgroupsPath`.
+- **OCI bundle identity support** – Generated gVisor OCI configs now carry `process.user` including supplementary groups, alongside namespaces, mounts, resource limits, seccomp, and `cgroupsPath`.
 - **Probe execution under workload identity** – Exec-based health and readiness probes now run as the configured service account instead of implicitly as root.
 - **Systemd/NixOS service integration improvements** – The module exposes `user`, `group`, and `supplementaryGroups`, and packaged Nix usage includes `gvisor` in the flake/dev shell path.
 
@@ -460,11 +460,27 @@ nucleus image run ./worker.nucleus-image -- /bin/cat /tmp/result
 
 `nucleus image commit` requires a container launched with `--rootfs-mode
 overlay`; overlay rootfs mode is currently native-runtime only and production
-mode rejects it. Runtime-committed images require a host-local HMAC signature even in the Nix store. Unsigned Nix-built manifests may reference only a base image. Overlay data comes from the image-local `diff/` directory.
-Use `--image-key-file PATH` or set `NUCLEUS_IMAGE_HMAC_KEY_FILE` to pin that key
-path; otherwise Nucleus creates an owner-only key under `/var/lib/nucleus` for
-root or the user's data directory for non-root runs. Use the same key path when
-one uid commits an image and another uid, such as root, runs or inspects it.
+mode rejects it.
+Each runtime commit signs the image with Ed25519. The first commit creates a
+32-byte private seed and its 32-byte public key. The default seed is
+`/var/lib/nucleus/image-ed25519.key` for root and
+`$XDG_DATA_HOME/nucleus/image-ed25519.key` for other users
+(`XDG_DATA_HOME` defaults to `~/.local/share`).
+
+To verify on another host, provision the companion `.pub` file through a
+trusted channel and transfer the image preserving numeric ownership, modes,
+nanosecond mtimes and xattrs. For example, these commands use an explicit
+signing seed on the producer and a provisioned public key on the verifier.
+
+```sh
+nucleus image commit worker -o ./worker.nucleus-image --image-key-file /var/lib/nucleus/release.key
+nucleus image load ./worker.nucleus-image --image-key-file /etc/nucleus/release.key.pub
+```
+
+`NUCLEUS_IMAGE_SIGNING_KEY_FILE` selects the commit key.
+`NUCLEUS_IMAGE_VERIFY_KEY_FILE` selects the public key for load, inspect and run.
+By default verification reads the companion `.pub` file beside the selected
+signing-key path. Recommit legacy HMAC images from their trusted source before upgrading consumers.
 Nix-built images from `nucleus.lib.mkImage` live in `/nix/store` and omit
 `image.sig` because Nix store/substituter trust is the integrity root.
 
@@ -1049,7 +1065,7 @@ the CLI `nucleus image commit` workflow.
 
 **Prefer credential brokers for bearer-token APIs.** If untrusted code can drive a provider CLI, do not place the bearer token in the sandbox environment. Run a host-side broker that holds the credential, injects it into approved upstream requests, rate-limits and audits usage, and start Nucleus with `--credential-broker IP:PORT` so the sandbox can only reach that broker endpoint. Proxy environment variables are client hints, not the security boundary: Nucleus enforces the boundary with namespace-local egress rules, and non-HTTP clients that ignore proxy variables are denied unless they speak to the broker endpoint.
 
-**Protect the local image signing key.** Runtime-committed image directories are verified with the host-local HMAC key selected by `NUCLEUS_IMAGE_HMAC_KEY_FILE` or the default owner-only key path. Treat that file like deployment signing material: do not share it across trust domains unless those hosts should be able to trust and produce each other's local image snapshots.
+**Protect the image signing key.** Keep the private seed on the signing host. Distribute only its public key to hosts that load, inspect, or run the images.
 
 **Workload identity.** When host root launches a default agent, Nucleus maps container UID/GID 0 to host UID/GID 100000. Host bind mounts use the mapped identity for permission checks. To run an agent with an existing unprivileged host identity, pass its nonzero `--user` and `--group`. With `--workspace-mode copy-in-out`, the workload edits a private copy owned by its mapped identity.
 
@@ -1195,12 +1211,22 @@ Nucleus is not a generic external OCI runtime. For gVisor execution it generates
 - `process`: args, env, cwd, `noNewPrivileges`, terminal settings, rlimits, and `process.user` (`uid`, `gid`, `additionalGids`)
 - `root` and `mounts`: read-only rootfs plus bind, tmpfs, and secret mounts
 - `linux`: namespaces, cgroup path, resource limits, uid/gid mappings, masked paths, readonly paths, devices, seccomp, and sysctls
-- `hooks`: OCI lifecycle hooks with OCI state JSON on stdin
 - `annotations`: runtime metadata passed through to the bundle
 
 That OCI path is the contract used with `runsc`. The native runtime uses Nucleus's direct Linux setup path rather than exposing a separate OCI CLI surface.
 
-Lifecycle hooks execute host-side commands with supervisor privileges. They are not accepted in topology service definitions; use only explicit administrative `nucleus create --hooks` configuration for hooks.
+Configure lifecycle hooks explicitly with `nucleus create --hooks`. Hooks receive
+OCI state JSON on stdin and only the environment supplied in their hook entry.
+Nucleus runs hooks with empty effective, permitted, inheritable and ambient
+capability sets and `no_new_privs`. Root supervisors switch hooks to UID/GID
+65534 with empty supplementary groups. Native launches support all five phases.
+gVisor supports supervisor-run `poststart` and `poststop`. Its three creation
+and start phases require execution inside runsc and are rejected during configuration.
+
+An explicit `--bundle` must name a new or empty directory under trusted parents.
+An existing bundle directory must belong to the launching identity and its
+permissions must exclude group and other writes. Host root uses
+`/run/nucleus-gvisor` by default even when sudo preserves `XDG_RUNTIME_DIR`.
 
 ## Machine-Readable Events
 

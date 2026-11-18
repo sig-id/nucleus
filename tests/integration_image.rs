@@ -5,7 +5,7 @@
 /// way the CLI does, with a synthetic Nix-style rootfs and an upperdir that
 /// stands in for a live overlay. They focus on cross-cutting behavior:
 ///
-/// - HMAC verification must reject any post-commit mutation of the image dir.
+/// - signature verification must reject any post-commit mutation of the image dir.
 /// - Diff export must skip `/dev`, `/proc`, `/sys`, `/run/secrets`, and the
 ///   pivot-time `.old_root`, so runtime artifacts never leak into snapshots.
 /// - User-supplied env / workdir must round-trip through commit and load.
@@ -48,9 +48,9 @@ mod tests {
             let lock = LOCK.lock().unwrap();
             let key_dir = TempDir::new().unwrap();
             fs::set_permissions(key_dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
-            let previous = std::env::var_os("NUCLEUS_IMAGE_HMAC_KEY_FILE");
+            let previous = std::env::var_os("NUCLEUS_IMAGE_SIGNING_KEY_FILE");
             std::env::set_var(
-                "NUCLEUS_IMAGE_HMAC_KEY_FILE",
+                "NUCLEUS_IMAGE_SIGNING_KEY_FILE",
                 key_dir.path().join("image.key"),
             );
             Self {
@@ -64,8 +64,8 @@ mod tests {
     impl Drop for ImageKeyGuard {
         fn drop(&mut self) {
             match &self.previous {
-                Some(value) => std::env::set_var("NUCLEUS_IMAGE_HMAC_KEY_FILE", value),
-                None => std::env::remove_var("NUCLEUS_IMAGE_HMAC_KEY_FILE"),
+                Some(value) => std::env::set_var("NUCLEUS_IMAGE_SIGNING_KEY_FILE", value),
+                None => std::env::remove_var("NUCLEUS_IMAGE_SIGNING_KEY_FILE"),
             }
         }
     }
@@ -279,7 +279,7 @@ mod tests {
         assert!(!image_dir.join(IMAGE_DIFF_DIR).join(".old_root").exists());
 
         // Diff digest is recorded so tampering with diff contents is detectable
-        // via HMAC mismatch on load.
+        // via signature mismatch on load.
         let diff = manifest.diff.expect("committed image must carry a diff");
         assert!(!diff.digest.is_empty());
         assert!(diff.manifest.contains_key("etc/config"));
@@ -288,7 +288,7 @@ mod tests {
     }
 
     #[test]
-    fn test_image_load_verifies_hmac_and_rejects_tampering() {
+    fn test_image_load_verifies_signature_and_rejects_tampering() {
         let _key = ImageKeyGuard::new();
         let temp = TempDir::new().unwrap();
         let rootfs = synthetic_rootfs(temp.path());
@@ -314,7 +314,7 @@ mod tests {
             Some("8080")
         );
 
-        // Tampering with the diff must break HMAC verification.
+        // Tampering with the diff must break signature verification.
         fs::write(
             image_dir.join(IMAGE_DIFF_DIR).join("etc/config"),
             b"tampered",
@@ -322,8 +322,8 @@ mod tests {
         .unwrap();
         let err = load_image(&image_dir).unwrap_err();
         assert!(
-            err.to_string().contains("HMAC mismatch"),
-            "expected HMAC mismatch, got: {err}"
+            err.to_string().contains("signature mismatch"),
+            "expected signature mismatch, got: {err}"
         );
     }
 

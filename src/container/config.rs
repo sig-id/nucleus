@@ -1597,6 +1597,17 @@ impl ContainerConfig {
     /// Validate runtime-specific feature support.
     pub fn validate_runtime_support(&self) -> crate::error::Result<()> {
         self.limits.validate_runtime_sanity()?;
+        if self.use_gvisor
+            && self.hooks.as_ref().is_some_and(|h| {
+                !h.create_runtime.is_empty()
+                    || !h.create_container.is_empty()
+                    || !h.start_container.is_empty()
+            })
+        {
+            return Err(crate::error::NucleusError::ConfigError(
+                "gVisor cannot enforce the hook privilege drop for createRuntime, createContainer or startContainer hooks".into(),
+            ));
+        }
 
         if let Some(user_ns_config) = &self.user_ns_config {
             if !self.process_identity.additional_gids.is_empty() {

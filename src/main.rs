@@ -36,7 +36,6 @@ use tracing::info;
 
 const SAFE_PRIVILEGED_HELPER_PATH: &str =
     "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
-const IMAGE_HMAC_KEY_ENV: &str = "NUCLEUS_IMAGE_HMAC_KEY_FILE";
 
 const DANGEROUS_ENV_VARS: &[&str] = &[
     "LD_PRELOAD",
@@ -1402,7 +1401,7 @@ enum ImageCommands {
         #[arg(long)]
         freeze: bool,
 
-        /// HMAC key file used to sign or verify local runtime images
+        /// Ed25519 signing seed file (publishes the companion PATH.pub verification key)
         #[arg(long = "image-key-file", value_name = "PATH")]
         image_key_file: Option<PathBuf>,
     },
@@ -1412,7 +1411,7 @@ enum ImageCommands {
         /// Image directory
         image: String,
 
-        /// HMAC key file used to verify local runtime images
+        /// Trusted Ed25519 public verification key file (32 raw bytes)
         #[arg(long = "image-key-file", value_name = "PATH")]
         image_key_file: Option<PathBuf>,
 
@@ -1426,7 +1425,7 @@ enum ImageCommands {
         /// Image directory
         image: String,
 
-        /// HMAC key file used to verify local runtime images
+        /// Trusted Ed25519 public verification key file (32 raw bytes)
         #[arg(long = "image-key-file", value_name = "PATH")]
         image_key_file: Option<PathBuf>,
     },
@@ -1436,7 +1435,7 @@ enum ImageCommands {
         /// Image directory
         image: String,
 
-        /// HMAC key file used to verify local runtime images
+        /// Trusted Ed25519 public verification key file (32 raw bytes)
         #[arg(long = "image-key-file", value_name = "PATH")]
         image_key_file: Option<PathBuf>,
     },
@@ -2024,7 +2023,7 @@ fn try_main() -> Result<i32> {
                 image_key_file,
             } => {
                 let _image_key_env =
-                    ScopedEnvVar::set_path(IMAGE_HMAC_KEY_ENV, image_key_file.as_deref());
+                    ScopedEnvVar::set_path(image::IMAGE_SIGNING_KEY_ENV, image_key_file.as_deref());
                 let state_mgr = ContainerStateManager::new_with_root(state_root.clone())?;
                 let state = state_mgr.resolve_container(&container)?;
                 let manifest = image::commit_container_image(
@@ -2041,7 +2040,7 @@ fn try_main() -> Result<i32> {
                 args,
             } => {
                 let _image_key_env =
-                    ScopedEnvVar::set_path(IMAGE_HMAC_KEY_ENV, image_key_file.as_deref());
+                    ScopedEnvVar::set_path(image::IMAGE_VERIFY_KEY_ENV, image_key_file.as_deref());
                 let image_dir = PathBuf::from(&image);
                 let verified = image::VerifiedImage::open(&image_dir)?;
                 let manifest = &verified.manifest;
@@ -2152,7 +2151,7 @@ fn try_main() -> Result<i32> {
                 image_key_file,
             } => {
                 let _image_key_env =
-                    ScopedEnvVar::set_path(IMAGE_HMAC_KEY_ENV, image_key_file.as_deref());
+                    ScopedEnvVar::set_path(image::IMAGE_VERIFY_KEY_ENV, image_key_file.as_deref());
                 let manifest = image::load_image(&PathBuf::from(&image))?;
                 println!("{}", serde_json::to_string_pretty(&manifest)?);
                 Ok(0)
@@ -2162,7 +2161,7 @@ fn try_main() -> Result<i32> {
                 image_key_file,
             } => {
                 let _image_key_env =
-                    ScopedEnvVar::set_path(IMAGE_HMAC_KEY_ENV, image_key_file.as_deref());
+                    ScopedEnvVar::set_path(image::IMAGE_VERIFY_KEY_ENV, image_key_file.as_deref());
                 let manifest = image::load_image(&PathBuf::from(&image))?;
                 println!("Image {} verified", manifest.image_id);
                 Ok(0)

@@ -1,13 +1,13 @@
 use super::landlock::LandlockManager;
 use crate::error::{NucleusError, Result};
 use crate::oci::OciBundle;
-use nix::unistd::{Gid, Uid};
+use nix::unistd::Uid;
 use sha2::{Digest, Sha256};
 use std::ffi::CString;
 use std::fs::{self, DirBuilder, OpenOptions};
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use tracing::{debug, info, warn};
 
@@ -138,6 +138,7 @@ impl GVisorOciRunOptions {
 /// NucleusSecurity_GVisor_GVisorRuntime.tla
 pub struct GVisorRuntime {
     runsc_path: String,
+    prepared_base: Option<PathBuf>,
 }
 
 impl GVisorRuntime {
@@ -147,7 +148,10 @@ impl GVisorRuntime {
     pub fn new() -> Result<Self> {
         let runsc_path = Self::resolve_path()?;
         info!("Found runsc at: {}", runsc_path);
-        Ok(Self { runsc_path })
+        Ok(Self {
+            runsc_path,
+            prepared_base: None,
+        })
     }
 
     /// Create a GVisor runtime with a pre-resolved runsc path.
@@ -156,7 +160,17 @@ impl GVisorRuntime {
     /// (e.g. before entering a user namespace where UID 0 would block
     /// PATH-based lookup).
     pub fn with_path(runsc_path: String) -> Self {
-        Self { runsc_path }
+        Self {
+            runsc_path,
+            prepared_base: None,
+        }
+    }
+
+    /// The launcher validated this path under the host credentials, before
+    /// entering the user namespace where host ownership is no longer visible.
+    pub(crate) fn with_prepared_base(mut self, base: PathBuf) -> Self {
+        self.prepared_base = Some(base);
+        self
     }
 
     /// Resolve the runsc path without constructing a full runtime.
@@ -366,7 +380,8 @@ impl GVisorRuntime {
         // this from the OCI bundle parent: --bundle may be operator-provided,
         // shared, or attacker-writable, while runsc state includes a staged
         // executable used by the supervisor process.
-        let runsc_root = Self::secure_runsc_root(container_id)?;
+        bundle.validate_runsc_handoff()?;
+        let runsc_root = self.secure_runsc_root(container_id)?;
 
         let runsc_runtime_dir = runsc_root.join("runtime");
         Self::ensure_secure_runsc_dir(&runsc_runtime_dir, "runsc runtime directory")?;
@@ -560,6 +575,10 @@ impl GVisorRuntime {
         };
 
         let path = Self::absolute_path(Path::new(&raw), "runsc debug directory")?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| NucleusError::GVisorError("Invalid debug directory".into()))?;
+        crate::filesystem::trusted_directory(parent, true)?;
         Self::ensure_secure_runsc_dir(&path, "runsc debug directory")?;
         Ok(Some(path))
     }
@@ -671,26 +690,47 @@ impl GVisorRuntime {
         program.parent().map(Path::to_path_buf)
     }
 
-    fn secure_runsc_root(container_id: &str) -> Result<PathBuf> {
-        let artifact_base = Self::gvisor_artifact_base()?;
-        let artifact_dir = artifact_base.join(Self::runsc_state_component(container_id));
-
-        if Self::host_root_requires_trusted_runsc_ancestry() {
-            Self::ensure_trusted_host_root_runsc_ancestry(
-                &artifact_base,
-                "gVisor runsc artifact base",
-            )?;
-        }
-
-        Self::ensure_secure_runsc_dir(&artifact_base, "gVisor runsc artifact base")?;
-        Self::ensure_secure_runsc_dir(&artifact_dir, "gVisor runsc artifact directory")?;
-
+    fn secure_runsc_root(&self, container_id: &str) -> Result<PathBuf> {
+        let artifact_dir = self.prepare_artifact_dir(container_id)?;
         let runsc_root = artifact_dir.join("runsc-root");
         Self::ensure_secure_runsc_dir(&runsc_root, "runsc root directory")?;
         Ok(runsc_root)
     }
 
-    fn gvisor_artifact_base() -> Result<PathBuf> {
+    pub(crate) fn artifact_dir(container_id: &str) -> Result<PathBuf> {
+        Ok(Self::gvisor_artifact_base()?.join(Self::runsc_state_component(container_id)))
+    }
+
+    pub(crate) fn prepare_artifact_base() -> Result<PathBuf> {
+        let base = Self::gvisor_artifact_base()?;
+        if base.file_name().is_none()
+            || base
+                .components()
+                .any(|c| c == std::path::Component::ParentDir)
+        {
+            return Err(NucleusError::GVisorError(format!(
+                "Invalid gVisor artifact base {base:?}"
+            )));
+        }
+        let parent = base
+            .parent()
+            .ok_or_else(|| NucleusError::GVisorError("Invalid artifact base".into()))?;
+        crate::filesystem::trusted_directory(parent, true)?;
+        Self::ensure_secure_runsc_dir(&base, "gVisor artifact base")?;
+        Ok(base)
+    }
+
+    pub(crate) fn prepare_artifact_dir(&self, container_id: &str) -> Result<PathBuf> {
+        let base = match &self.prepared_base {
+            Some(path) => path.clone(),
+            None => Self::prepare_artifact_base()?,
+        };
+        let dir = base.join(Self::runsc_state_component(container_id));
+        Self::ensure_secure_runsc_dir(&dir, "gVisor artifact directory")?;
+        Ok(dir)
+    }
+
+    pub(crate) fn gvisor_artifact_base() -> Result<PathBuf> {
         if let Some(path) =
             std::env::var_os("NUCLEUS_GVISOR_ARTIFACT_BASE").filter(|path| !path.is_empty())
         {
@@ -774,94 +814,7 @@ impl GVisorRuntime {
         false
     }
 
-    fn host_root_requires_trusted_runsc_ancestry() -> bool {
-        Uid::effective().is_root() && !Self::root_uid_maps_to_unprivileged_host_uid_from_proc()
-    }
-
-    fn ensure_trusted_host_root_runsc_ancestry(path: &Path, label: &str) -> Result<()> {
-        let path = Self::absolute_path(path, label)?;
-
-        let mut current = PathBuf::new();
-        for component in path.components() {
-            match component {
-                Component::Prefix(prefix) => current.push(prefix.as_os_str()),
-                Component::RootDir => current.push(component.as_os_str()),
-                Component::CurDir => {}
-                Component::ParentDir => {
-                    return Err(NucleusError::GVisorError(format!(
-                        "{} {:?} contains a parent-directory component",
-                        label, path
-                    )));
-                }
-                Component::Normal(name) => {
-                    current.push(name);
-                    match fs::symlink_metadata(&current) {
-                        Ok(metadata) => Self::ensure_trusted_host_root_runsc_ancestor_component(
-                            &current, metadata, label,
-                        )?,
-                        Err(e) if e.kind() == io::ErrorKind::NotFound => break,
-                        Err(e) => {
-                            return Err(NucleusError::GVisorError(format!(
-                                "Failed to stat {} ancestor {:?}: {}",
-                                label, current, e
-                            )));
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    fn ensure_trusted_host_root_runsc_ancestor_component(
-        path: &Path,
-        metadata: fs::Metadata,
-        label: &str,
-    ) -> Result<()> {
-        if metadata.file_type().is_symlink() {
-            return Err(NucleusError::GVisorError(format!(
-                "Refusing symlink {} ancestor {:?}",
-                label, path
-            )));
-        }
-        if !metadata.file_type().is_dir() {
-            return Err(NucleusError::GVisorError(format!(
-                "{} ancestor {:?} is not a directory",
-                label, path
-            )));
-        }
-
-        let owner = metadata.uid();
-        if owner != 0 {
-            return Err(NucleusError::GVisorError(format!(
-                "{} ancestor {:?} is owned by uid {} (expected root)",
-                label, path, owner
-            )));
-        }
-
-        let mode = metadata.permissions().mode();
-        if mode & 0o022 != 0 && mode & 0o1000 == 0 {
-            return Err(NucleusError::GVisorError(format!(
-                "{} ancestor {:?} has unsafe permissions {:o}",
-                label,
-                path,
-                mode & 0o7777
-            )));
-        }
-
-        Ok(())
-    }
-
     fn ensure_secure_runsc_dir(path: &Path, label: &str) -> Result<()> {
-        if let Some(parent) = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            Self::ensure_trusted_runsc_parent(parent, label)?;
-        }
-
-        let mut created = false;
         match fs::symlink_metadata(path) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 return Err(NucleusError::GVisorError(format!(
@@ -878,9 +831,7 @@ impl GVisorRuntime {
             Ok(_) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 match DirBuilder::new().mode(0o700).create(path) {
-                    Ok(()) => {
-                        created = true;
-                    }
+                    Ok(()) => (),
                     Err(create_err) if create_err.kind() == io::ErrorKind::AlreadyExists => {}
                     Err(create_err) => {
                         return Err(NucleusError::GVisorError(format!(
@@ -896,15 +847,6 @@ impl GVisorRuntime {
                     label, path, e
                 )));
             }
-        }
-
-        if created {
-            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|e| {
-                NucleusError::GVisorError(format!(
-                    "Failed to secure newly-created {} permissions {:?}: {}",
-                    label, path, e
-                ))
-            })?;
         }
 
         let dir = OpenOptions::new()
@@ -931,34 +873,15 @@ impl GVisorRuntime {
         let owner = metadata.uid();
         let expected = Uid::effective().as_raw();
         if owner != expected {
-            // Under a non-trivial user namespace (keep-id / auto), files we
-            // legitimately own can appear under a non-root container uid
-            // (e.g. host uid 1000 -> container uid 1000). If the owner is still
-            // a uid mapped into our namespace, reclaim the directory by
-            // chowning it to container root (the trusted owner) rather than
-            // failing. This handles stale dirs left by a prior rootless mode.
-            if crate::isolation::uid_is_mapped_in_current_userns(owner)
-                && Uid::effective().is_root()
-            {
-                debug!(
-                    "Reclaiming {} {:?} from mapped uid {} to container root",
-                    label, path, owner
-                );
-                nix::unistd::chown(path, Some(Uid::from_raw(0)), Some(Gid::from_raw(0)))
-                    .map_err(|e| {
-                        NucleusError::GVisorError(format!(
-                            "Failed to reclaim {} {:?}: {}",
-                            label, path, e
-                        ))
-                    })?;
-            } else {
-                return Err(NucleusError::GVisorError(format!(
-                    "{} {:?} is owned by uid {} (expected {})",
-                    label, path, owner, expected
-                )));
-            }
+            return Err(NucleusError::GVisorError(format!(
+                "{label} {path:?} is owned by uid {owner} (expected {expected})"
+            )));
         }
-
+        if metadata.mode() & 0o022 != 0 {
+            return Err(NucleusError::GVisorError(format!(
+                "Untrusted writable {label} {path:?}"
+            )));
+        }
         let mode = metadata.permissions().mode() & 0o777;
         if mode != 0o700 {
             dir.set_permissions(fs::Permissions::from_mode(0o700))
@@ -968,50 +891,6 @@ impl GVisorRuntime {
                         label, path, e
                     ))
                 })?;
-        }
-
-        Ok(())
-    }
-
-    fn ensure_trusted_runsc_parent(parent: &Path, label: &str) -> Result<()> {
-        let metadata = fs::symlink_metadata(parent).map_err(|e| {
-            NucleusError::GVisorError(format!(
-                "Failed to stat parent for {} {:?}: {}",
-                label, parent, e
-            ))
-        })?;
-        if metadata.file_type().is_symlink() {
-            return Err(NucleusError::GVisorError(format!(
-                "Refusing symlink parent for {} {:?}",
-                label, parent
-            )));
-        }
-        if !metadata.file_type().is_dir() {
-            return Err(NucleusError::GVisorError(format!(
-                "Parent for {} {:?} is not a directory",
-                label, parent
-            )));
-        }
-
-        let owner = metadata.uid();
-        let current = Uid::effective().as_raw();
-        // A parent is trusted if it is owned by us, by container root, or by any
-        // uid mapped into our (non-trivial) user namespace. The last clause is
-        // required for keep-id / auto rootless, where our own runtime dir
-        // (e.g. $XDG_RUNTIME_DIR) appears under a non-root container uid.
-        let owner_trusted = owner == current
-            || owner == 0
-            || crate::isolation::uid_is_mapped_in_current_userns(owner);
-        let mode = metadata.permissions().mode();
-        let unsafe_writable = mode & 0o022 != 0 && mode & 0o1000 == 0;
-        if !owner_trusted || unsafe_writable {
-            return Err(NucleusError::GVisorError(format!(
-                "Parent for {} {:?} is not trusted (owner uid {}, mode {:o})",
-                label,
-                parent,
-                owner,
-                mode & 0o7777
-            )));
         }
 
         Ok(())
@@ -1714,7 +1593,9 @@ mod tests {
             OciConfig::new(vec!["/bin/true".to_string()], None),
         );
 
-        let runsc_root = GVisorRuntime::secure_runsc_root("container-id").unwrap();
+        let runsc_root = GVisorRuntime::with_path("runsc".into())
+            .secure_runsc_root("container-id")
+            .unwrap();
 
         assert!(runsc_root
             .starts_with(artifact_base.join(GVisorRuntime::runsc_state_component("container-id"))));

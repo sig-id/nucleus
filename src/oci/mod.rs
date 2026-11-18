@@ -13,7 +13,7 @@ use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 
@@ -436,10 +436,6 @@ impl OciHooks {
     }
 
     fn execute_hook(hook: &OciHook, state_json: &str, phase: &str) -> Result<()> {
-        #[cfg(not(test))]
-        use std::os::unix::process::CommandExt;
-        use std::process::{Command, Stdio};
-
         let hook_path = Path::new(&hook.path);
         if !hook_path.is_absolute() {
             return Err(NucleusError::HookError(format!(
@@ -448,68 +444,61 @@ impl OciHooks {
             )));
         }
 
-        // Restrict hooks to trusted system directories. Hooks execute in
-        // the parent process before security hardening (by OCI spec), so
-        // they must come from locations that unprivileged users cannot write to.
-        #[cfg(not(test))]
+        const TRUSTED_ROOTS: &[&str] = &[
+            "/usr/bin",
+            "/usr/sbin",
+            "/usr/lib",
+            "/usr/libexec",
+            "/usr/local/bin",
+            "/usr/local/sbin",
+            "/usr/local/libexec",
+            "/bin",
+            "/sbin",
+            "/nix/store",
+            "/opt",
+        ];
+        let trusted = |p: &Path| TRUSTED_ROOTS.iter().any(|root| p.starts_with(root));
+        if hook_path
+            .components()
+            .any(|c| c == std::path::Component::ParentDir)
+            || !trusted(hook_path)
         {
-            const TRUSTED_HOOK_PREFIXES: &[&str] = &[
-                "/usr/bin/",
-                "/usr/sbin/",
-                "/usr/lib/",
-                "/usr/libexec/",
-                "/usr/local/bin/",
-                "/usr/local/sbin/",
-                "/usr/local/libexec/",
-                "/bin/",
-                "/sbin/",
-                "/nix/store/",
-                "/opt/",
-            ];
-            if !TRUSTED_HOOK_PREFIXES
-                .iter()
-                .any(|prefix| hook.path.starts_with(prefix))
-            {
-                return Err(NucleusError::HookError(format!(
-                    "{} hook path '{}' is not under a trusted directory ({:?})",
-                    phase, hook.path, TRUSTED_HOOK_PREFIXES
-                )));
-            }
+            return Err(NucleusError::HookError(format!(
+                "Untrusted {phase} hook path {hook_path:?}"
+            )));
         }
-
-        // Use symlink_metadata (lstat) instead of .exists() to avoid
-        // following symlinks in the existence check. Reject symlinked hooks
-        // to prevent a TOCTOU swap between the check and exec.
-        match std::fs::symlink_metadata(hook_path) {
-            Ok(meta) if meta.file_type().is_symlink() => {
-                return Err(NucleusError::HookError(format!(
-                    "{} hook path is a symlink (refusing to follow): {}",
-                    phase, hook.path
-                )));
-            }
-            Err(_) => {
-                return Err(NucleusError::HookError(format!(
-                    "{} hook binary not found: {}",
-                    phase, hook.path
-                )));
-            }
-            Ok(_) => {}
+        if fs::symlink_metadata(hook_path)?.file_type().is_symlink() {
+            return Err(NucleusError::HookError(format!(
+                "Refusing symlink {phase} hook {hook_path:?}"
+            )));
         }
+        let executable = hook_path.canonicalize()?;
+        if !trusted(&executable) {
+            return Err(NucleusError::HookError(format!(
+                "Untrusted resolved {phase} hook {executable:?}"
+            )));
+        }
+        crate::filesystem::trusted_directory(
+            executable
+                .parent()
+                .expect("trusted executable has a parent"),
+            false,
+        )?;
+        Self::validate_hook_binary(&executable, phase)?;
+        Self::spawn_hook(&executable, hook, state_json, phase)
+    }
 
-        // C-1: Validate hook binary ownership and permissions to prevent
-        // execution of world-writable or unexpectedly-owned binaries.
-        // Similar to runsc's hook validation – reject hooks that could be
-        // tampered with by unprivileged users.
-        Self::validate_hook_binary(hook_path, phase)?;
-
-        let mut cmd = Command::new(&hook.path);
+    fn spawn_hook(executable: &Path, hook: &OciHook, state_json: &str, phase: &str) -> Result<()> {
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+        let mut cmd = Command::new(executable);
+        cmd.current_dir("/").env_clear();
         if !hook.args.is_empty() {
             // OCI spec: args[0] is the binary name (like execve argv); pass rest as arguments
             cmd.args(&hook.args[1..]);
         }
 
         if !hook.env.is_empty() {
-            cmd.env_clear();
             for entry in &hook.env {
                 if let Some((key, value)) = entry.split_once('=') {
                     cmd.env(key, value);
@@ -517,39 +506,76 @@ impl OciHooks {
             }
         }
 
-        // C-1: Drop all capabilities and set restrictive resource limits
-        // for hook execution. Hooks run in the parent process before security
-        // hardening, so we sandbox them defensively.
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
 
-        // C-1: Apply RLIMIT backstops only in the spawned child process
-        // via pre_exec, so the parent process is not affected.
-        // Note: pre_exec runs after fork but before exec, in the child process.
-        #[cfg(not(test))]
+        // Query the current thread before fork. The child only performs syscalls.
+        let drop_bounding =
+            caps::has_cap(None, caps::CapSet::Effective, caps::Capability::CAP_SETPCAP).map_err(
+                |e| NucleusError::HookError(format!("Cannot inspect hook capabilities: {e}")),
+            )?;
         unsafe {
-            cmd.pre_exec(|| {
+            cmd.pre_exec(move || {
                 // Prevent the hook from gaining privileges via setuid/setgid
                 // binaries or file capabilities. This must be set before exec.
                 if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
 
-                let rlim_nproc = libc::rlimit {
-                    rlim_cur: 1024,
-                    rlim_max: 1024,
-                };
-                if libc::setrlimit(libc::RLIMIT_NPROC, &rlim_nproc) != 0 {
+                if libc::syscall(
+                    libc::SYS_close_range,
+                    3u32,
+                    u32::MAX,
+                    libc::CLOSE_RANGE_CLOEXEC,
+                ) < 0
+                {
                     return Err(std::io::Error::last_os_error());
                 }
-
-                let rlim_nofile = libc::rlimit {
-                    rlim_cur: 1024,
-                    rlim_max: 1024,
-                };
-                if libc::setrlimit(libc::RLIMIT_NOFILE, &rlim_nofile) != 0 {
+                if drop_bounding {
+                    for cap in 0u32.. {
+                        if libc::prctl(libc::PR_CAPBSET_DROP, cap as libc::c_ulong, 0, 0, 0) < 0 {
+                            let e = std::io::Error::last_os_error();
+                            if e.raw_os_error() == Some(libc::EINVAL) {
+                                break;
+                            }
+                            return Err(e);
+                        }
+                    }
+                }
+                if libc::geteuid() == 0 || libc::getuid() == 0 {
+                    if libc::getgroups(0, std::ptr::null_mut()) != 0
+                        && libc::setgroups(0, std::ptr::null()) < 0
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::setresgid(65534, 65534, 65534) < 0
+                        || libc::setresuid(65534, 65534, 65534) < 0
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                // Linux capset v3 ABI: version and pid, then two triples of
+                // effective/permitted/inheritable u32s. Clearing these also
+                // lowers every ambient capability. Only syscalls after fork.
+                let header = [0x2008_0522u32, 0];
+                let data = [0u32; 6];
+                if libc::syscall(libc::SYS_capset, header.as_ptr(), data.as_ptr()) < 0 {
                     return Err(std::io::Error::last_os_error());
+                }
+                for resource in [libc::RLIMIT_NPROC, libc::RLIMIT_NOFILE] {
+                    let mut limit = libc::rlimit {
+                        rlim_cur: 0,
+                        rlim_max: 0,
+                    };
+                    if libc::getrlimit(resource, &mut limit) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    limit.rlim_cur = limit.rlim_cur.min(1024);
+                    limit.rlim_max = limit.rlim_max.min(1024);
+                    if libc::setrlimit(resource, &limit) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
                 }
 
                 Ok(())
@@ -668,24 +694,9 @@ impl OciHooks {
         let gid = metadata.gid();
         let effective_uid = nix::unistd::Uid::effective().as_raw();
 
-        // Reject world-writable hooks
-        if mode & 0o002 != 0 {
+        if !metadata.is_file() || mode & 0o022 != 0 {
             return Err(NucleusError::HookError(format!(
-                "{} hook {} is world-writable (mode {:04o}) – refusing to execute",
-                phase,
-                hook_path.display(),
-                mode & 0o7777
-            )));
-        }
-
-        // Reject group-writable hooks unless owned by root
-        if mode & 0o020 != 0 && uid != 0 {
-            return Err(NucleusError::HookError(format!(
-                "{} hook {} is group-writable and not owned by root (mode {:04o}, uid {}) – refusing to execute",
-                phase,
-                hook_path.display(),
-                mode & 0o7777,
-                uid
+                "Untrusted {phase} hook {hook_path:?} (mode {mode:o})"
             )));
         }
 
@@ -1620,6 +1631,7 @@ impl From<&IdMapping> for OciIdMapping {
 pub struct OciBundle {
     bundle_path: PathBuf,
     config: OciConfig,
+    created: std::sync::Mutex<Option<(fs::File, bool)>>,
 }
 
 fn safe_child_name(name: &str) -> std::io::Result<CString> {
@@ -1650,14 +1662,9 @@ fn mkdirat_dir(parent: &fs::File, name: &str, mode: libc::mode_t) -> std::io::Re
     let result = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), mode) };
 
     if result == 0 {
-        return Ok(());
-    }
-
-    let err = std::io::Error::last_os_error();
-    if err.raw_os_error() == Some(libc::EEXIST) {
         Ok(())
     } else {
-        Err(err)
+        Err(std::io::Error::last_os_error())
     }
 }
 
@@ -1688,7 +1695,7 @@ fn openat_file_nofollow(
         libc::openat(
             parent.as_raw_fd(),
             name.as_ptr(),
-            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             mode,
         )
     };
@@ -1700,41 +1707,61 @@ fn openat_file_nofollow(
     }
 }
 
+/// Accept only a new directory or an empty directory under the caller's control.
+pub(crate) fn open_empty_bundle(path: &Path) -> Result<(fs::File, bool)> {
+    let created = match fs::DirBuilder::new().mode(0o700).create(path) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(e) => return Err(e.into()),
+    };
+    let dir = open_dir_nofollow(path).map_err(|e| {
+        NucleusError::GVisorError(format!(
+            "Failed to open bundle directory safely {path:?}: {e}"
+        ))
+    })?;
+    let meta = dir.metadata()?;
+    if meta.uid() != nix::unistd::Uid::effective().as_raw() || meta.mode() & 0o022 != 0 {
+        return Err(NucleusError::GVisorError(format!(
+            "Untrusted bundle directory {path:?}"
+        )));
+    }
+    if fs::read_dir(path)?.next().transpose()?.is_some() {
+        return Err(NucleusError::GVisorError(format!(
+            "Bundle directory must be empty: {path:?}"
+        )));
+    }
+    dir.set_permissions(fs::Permissions::from_mode(0o700))?;
+    Ok((dir, created))
+}
+
 impl OciBundle {
     /// Create a new OCI bundle
     pub fn new(bundle_path: PathBuf, config: OciConfig) -> Self {
         Self {
             bundle_path,
             config,
+            created: Default::default(),
         }
     }
 
     /// Create the bundle directory structure and write config.json
     pub fn create(&self) -> Result<()> {
-        info!("Creating OCI bundle at {:?}", self.bundle_path);
+        let path = std::env::current_dir()?.join(&self.bundle_path);
+        let parent = path
+            .parent()
+            .ok_or_else(|| NucleusError::GVisorError("Invalid bundle path".into()))?;
+        crate::filesystem::trusted_directory(parent, true)?;
+        self.create_in_trusted_parent()
+    }
 
-        // Create the bundle directory, then reopen it without following a final
-        // symlink before applying permissions or creating children beneath it.
-        fs::create_dir_all(&self.bundle_path).map_err(|e| {
-            NucleusError::GVisorError(format!(
-                "Failed to create bundle directory {:?}: {}",
-                self.bundle_path, e
-            ))
-        })?;
-        let bundle_dir = open_dir_nofollow(&self.bundle_path).map_err(|e| {
-            NucleusError::GVisorError(format!(
-                "Failed to open bundle directory safely {:?}: {}",
-                self.bundle_path, e
-            ))
-        })?;
-        bundle_dir
-            .set_permissions(fs::Permissions::from_mode(0o700))
-            .map_err(|e| {
-                NucleusError::GVisorError(format!(
-                    "Failed to secure bundle directory permissions {:?}: {}",
-                    self.bundle_path, e
-                ))
-            })?;
+    /// The launcher validates the parent in the host namespace before a mapped handoff.
+    pub(crate) fn create_in_trusted_parent(&self) -> Result<()> {
+        info!("Creating OCI bundle at {:?}", self.bundle_path);
+        let mut claim = self.created.lock().expect("bundle lock poisoned");
+        if claim.is_some() {
+            return Err(NucleusError::GVisorError("Bundle already created".into()));
+        }
+        let (bundle_dir, created) = open_empty_bundle(&self.bundle_path)?;
 
         // Create rootfs relative to the trusted bundle directory. mkdirat plus
         // openat(O_NOFOLLOW) prevents a pre-existing rootfs symlink from being
@@ -1743,6 +1770,7 @@ impl OciBundle {
         mkdirat_dir(&bundle_dir, "rootfs", 0o755).map_err(|e| {
             NucleusError::GVisorError(format!("Failed to create rootfs directory: {}", e))
         })?;
+        *claim = Some((bundle_dir.try_clone()?, created));
         let rootfs_dir = openat_dir_nofollow(&bundle_dir, "rootfs").map_err(|e| {
             NucleusError::GVisorError(format!(
                 "Failed to open rootfs directory safely {:?}: {}",
@@ -1802,14 +1830,83 @@ impl OciBundle {
         &self.bundle_path
     }
 
+    /// runsc executes hooks itself. Check the actual bundle file, including
+    /// when a library caller supplies an existing bundle without calling create.
+    pub(crate) fn validate_runsc_handoff(&self) -> Result<()> {
+        let path = std::env::current_dir()?.join(&self.bundle_path);
+        let claim = self.created.lock().expect("bundle lock poisoned");
+        if claim.is_none() {
+            crate::filesystem::trusted_directory(&path, false)?;
+        }
+        let dir = open_dir_nofollow(&path)?;
+        let meta = dir.metadata()?;
+        if meta.uid() != nix::unistd::Uid::effective().as_raw() || meta.mode() & 0o022 != 0 {
+            return Err(NucleusError::GVisorError("Untrusted OCI bundle".into()));
+        }
+        if let Some((original, _)) = claim.as_ref() {
+            let original = original.metadata()?;
+            if (original.dev(), original.ino()) != (meta.dev(), meta.ino()) {
+                return Err(NucleusError::GVisorError(
+                    "Bundle directory was replaced".into(),
+                ));
+            }
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path.join("config.json"))?;
+        let config_meta = file.metadata()?;
+        if !config_meta.is_file()
+            || config_meta.uid() != meta.uid()
+            || config_meta.mode() & 0o022 != 0
+        {
+            return Err(NucleusError::GVisorError(
+                "Untrusted OCI config.json".into(),
+            ));
+        }
+        let config: serde_json::Value = serde_json::from_reader(file)?;
+        if config
+            .as_object()
+            .is_none_or(|fields| fields.keys().any(|k| k.eq_ignore_ascii_case("hooks")))
+        {
+            return Err(NucleusError::GVisorError(
+                "runsc bundle must omit delegated OCI hooks".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Clean up the bundle
     pub fn cleanup(&self) -> Result<()> {
-        if self.bundle_path.exists() {
-            fs::remove_dir_all(&self.bundle_path).map_err(|e| {
-                NucleusError::GVisorError(format!("Failed to cleanup bundle: {}", e))
-            })?;
-            debug!("Cleaned up OCI bundle at {:?}", self.bundle_path);
+        let mut claim = self.created.lock().expect("bundle lock poisoned");
+        let Some((dir, created)) = claim.as_ref() else {
+            return Ok(());
+        };
+        let current = match fs::symlink_metadata(&self.bundle_path) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        let original = dir.metadata()?;
+        if (current.dev(), current.ino()) != (original.dev(), original.ino()) {
+            return Err(NucleusError::GVisorError(
+                "Bundle directory was replaced".into(),
+            ));
         }
+        let pinned = PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()));
+        for result in [
+            fs::remove_dir_all(pinned.join("rootfs")),
+            fs::remove_file(pinned.join("config.json")),
+        ] {
+            match result {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+                other => other?,
+            }
+        }
+        if *created {
+            fs::remove_dir(&self.bundle_path)?;
+        }
+        *claim = None;
         Ok(())
     }
 }
@@ -2009,6 +2106,27 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_preserves_existing_bundle_directory_and_rejects_replacement() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("bundle");
+        fs::create_dir(&path).unwrap();
+        let bundle = OciBundle::new(path.clone(), OciConfig::new(vec!["/bin/true".into()], None));
+        bundle.create().unwrap();
+        bundle.validate_runsc_handoff().unwrap();
+        fs::write(path.join("config.json"), r#"{"hooks":{"poststop":[]}}"#).unwrap();
+        assert!(bundle.validate_runsc_handoff().is_err());
+        fs::rename(&path, tmp.path().join("moved")).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(bundle.cleanup().is_err());
+        fs::remove_dir(&path).unwrap();
+        fs::rename(tmp.path().join("moved"), &path).unwrap();
+        fs::write(path.join("operator-file"), "keep").unwrap();
+        bundle.cleanup().unwrap();
+        assert_eq!(fs::read(path.join("operator-file")).unwrap(), b"keep");
+        assert!(!path.join("rootfs").exists());
+    }
+
+    #[test]
     fn test_oci_bundle_rejects_bundle_symlink() {
         let temp_dir = TempDir::new().unwrap();
         let bundle_path = temp_dir.path().join("test-bundle");
@@ -2054,7 +2172,7 @@ mod tests {
 
         let err = bundle.create().unwrap_err();
 
-        assert!(format!("{err}").contains("Failed to open rootfs directory safely"));
+        assert!(format!("{err}").contains("Bundle directory must be empty"));
         assert_eq!(
             fs::metadata(&protected_host_dir)
                 .unwrap()
@@ -2544,39 +2662,39 @@ mod tests {
         drop(f);
     }
 
-    #[test]
-    fn test_oci_hook_executes_successfully() {
-        let temp_dir = TempDir::new().unwrap();
-        let hook_script = temp_dir.path().join("hook.sh");
-        let output_file = temp_dir.path().join("output.json");
-
-        write_script(
-            &hook_script,
-            &format!("cat > {}\n", output_file.to_string_lossy()),
-        );
-
-        let hook = OciHook {
-            path: hook_script.to_string_lossy().to_string(),
-            args: vec![],
+    fn bash_hook(body: &str) -> OciHook {
+        let bash = Path::new(&find_bash()).canonicalize().unwrap();
+        OciHook {
+            path: bash.display().to_string(),
+            args: vec!["bash".into(), "-c".into(), body.into()],
             env: vec![],
             timeout: Some(5),
-        };
-        let state = OciContainerState {
-            oci_version: "1.0.2".to_string(),
-            id: "test-container".to_string(),
-            status: OciStatus::Creating,
-            pid: 12345,
-            bundle: "/tmp/test-bundle".to_string(),
-        };
+        }
+    }
 
-        OciHooks::run_hooks(&[hook], &state, "createRuntime").unwrap();
+    #[test]
+    fn hook_receives_state_with_unprivileged_credentials() {
+        let hook = bash_hook(
+            r#"IFS= read -r state || [[ -n $state ]]
+            [[ "$state" == '{"id":"test"}' && $EUID != 0 ]] || exit 1
+            while read -r key value _; do
+                case "$key" in
+                    CapEff:|CapPrm:|CapInh:|CapAmb:) [[ $value == 0000000000000000 ]] || exit 2 ;;
+                    NoNewPrivs:) [[ $value == 1 ]] || exit 3 ;;
+                esac
+            done </proc/self/status"#,
+        );
+        OciHooks::execute_hook(&hook, r#"{"id":"test"}"#, "createRuntime").unwrap();
+    }
 
-        // Verify the hook received the container state JSON on stdin
-        let written = std::fs::read_to_string(&output_file).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&written).unwrap();
-        assert_eq!(parsed["id"], "test-container");
-        assert_eq!(parsed["pid"], 12345);
-        assert_eq!(parsed["status"], "creating");
+    #[test]
+    fn hook_rejects_parent_components() {
+        let mut hook = bash_hook("exit 0");
+        hook.path = "/usr/bin/../../bin/true".into();
+        assert!(OciHooks::execute_hook(&hook, "{}", "poststart")
+            .unwrap_err()
+            .to_string()
+            .contains("Untrusted"));
     }
 
     #[test]
@@ -2585,9 +2703,15 @@ mod tests {
         let hook_script = temp_dir.path().join("hook.sh");
         let output_file = temp_dir.path().join("output.json");
 
+        fs::set_permissions(temp_dir.path(), fs::Permissions::from_mode(0o711)).unwrap();
+        fs::write(&output_file, "").unwrap();
+        fs::set_permissions(&output_file, fs::Permissions::from_mode(0o666)).unwrap();
         write_script(
             &hook_script,
-            &format!("cat > {}\n", output_file.to_string_lossy()),
+            &format!(
+                r#"IFS= read -r state || [[ -n $state ]]; echo "$state" > {}"#,
+                output_file.display()
+            ),
         );
 
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
@@ -2613,7 +2737,12 @@ mod tests {
             bundle: "/tmp/test-bundle".to_string(),
         };
 
-        let result = OciHooks::run_hooks(&[hook], &state, "createRuntime");
+        let result = OciHooks::spawn_hook(
+            &hook_script,
+            &hook,
+            &serde_json::to_string(&state).unwrap(),
+            "createRuntime",
+        );
         busy_handle.join().unwrap();
         result.unwrap();
 
@@ -2624,16 +2753,7 @@ mod tests {
 
     #[test]
     fn test_oci_hook_nonzero_exit_is_error() {
-        let temp_dir = TempDir::new().unwrap();
-        let hook_script = temp_dir.path().join("fail.sh");
-        write_script(&hook_script, "exit 1\n");
-
-        let hook = OciHook {
-            path: hook_script.to_string_lossy().to_string(),
-            args: vec![],
-            env: vec![],
-            timeout: Some(5),
-        };
+        let hook = bash_hook("exit 1");
         let state = OciContainerState {
             oci_version: "1.0.2".to_string(),
             id: "test".to_string(),
@@ -2653,26 +2773,13 @@ mod tests {
     #[test]
     fn test_oci_hooks_best_effort_continues_on_failure() {
         let temp_dir = TempDir::new().unwrap();
-        let fail_script = temp_dir.path().join("fail.sh");
-        write_script(&fail_script, "exit 1\n");
-
         let marker = temp_dir.path().join("ran");
-        let ok_script = temp_dir.path().join("ok.sh");
-        write_script(&ok_script, &format!("touch {}\n", marker.to_string_lossy()));
-
+        fs::set_permissions(temp_dir.path(), fs::Permissions::from_mode(0o711)).unwrap();
+        fs::write(&marker, "").unwrap();
+        fs::set_permissions(&marker, fs::Permissions::from_mode(0o666)).unwrap();
         let hooks = vec![
-            OciHook {
-                path: fail_script.to_string_lossy().to_string(),
-                args: vec![],
-                env: vec![],
-                timeout: Some(5),
-            },
-            OciHook {
-                path: ok_script.to_string_lossy().to_string(),
-                args: vec![],
-                env: vec![],
-                timeout: Some(5),
-            },
+            bash_hook("exit 1"),
+            bash_hook(&format!("echo ran > {}", marker.display())),
         ];
         let state = OciContainerState {
             oci_version: "1.0.2".to_string(),
@@ -2685,6 +2792,6 @@ mod tests {
         // best_effort should not panic or return error
         OciHooks::run_hooks_best_effort(&hooks, &state, "poststop");
         // Second hook should have run despite first failing
-        assert!(marker.exists(), "second hook should run after first fails");
+        assert_eq!(fs::read_to_string(marker).unwrap(), "ran\n");
     }
 }

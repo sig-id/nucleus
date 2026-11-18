@@ -306,35 +306,16 @@ impl Container {
         Self::ensure_runtime_parent_dir(&runtime_root)?;
 
         let base = runtime_root.join(&config.id);
-        std::fs::create_dir_all(&base).map_err(|e| {
-            NucleusError::FilesystemError(format!(
-                "Failed to create user namespace runtime base {:?}: {}",
-                base, e
-            ))
-        })?;
-        chown(
-            &base,
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().mode(0o700).create(&base)?;
+        let directory = std::fs::File::open(&base)?;
+        nix::unistd::fchown(
+            &directory,
             Some(Uid::from_raw(host_uid)),
             Some(Gid::from_raw(host_gid)),
-        )
-        .map_err(|e| {
-            NucleusError::FilesystemError(format!(
-                "Failed to chown user namespace runtime base {:?} to {}:{}: {}",
-                base, host_uid, host_gid, e
-            ))
-        })?;
-        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
-            NucleusError::FilesystemError(format!(
-                "Failed to secure user namespace runtime base {:?}: {}",
-                base, e
-            ))
-        })?;
+        )?;
 
-        // Setting NUCLEUS_GVISOR_ARTIFACT_BASE only relocates the default
-        // bundle: an explicit --bundle path is used unchanged by
-        // setup_and_exec_gvisor_oci after the child has become the mapped
-        // supervisor. Prepare that directory here, while still host root, so
-        // the demoted child can create and secure the bundle in place.
+        // Prepare explicit bundles before handing off to the mapped identity.
         if config.use_gvisor {
             if let Some(bundle_dir) = config.bundle_dir.as_deref() {
                 Self::prepare_mapped_bundle_dir(bundle_dir, host_uid, host_gid)?;
@@ -353,43 +334,49 @@ impl Container {
     /// directory while still host root and transfer it to the supervisor so
     /// previously working explicit bundles keep working.
     fn prepare_mapped_bundle_dir(path: &Path, host_uid: u32, host_gid: u32) -> Result<()> {
-        match std::fs::symlink_metadata(path) {
-            Ok(meta) if meta.file_type().is_symlink() => {
-                return Err(NucleusError::FilesystemError(format!(
-                    "Refusing symlink explicit gVisor bundle directory {:?}",
-                    path
-                )));
-            }
-            Ok(_) | Err(_) => {}
+        let path = std::env::current_dir()?.join(path);
+        let parent = path
+            .parent()
+            .ok_or_else(|| NucleusError::FilesystemError("Invalid bundle path".into()))?;
+        // trusted_directory creates missing ancestors as 0700 root-owned,
+        // which the mapped supervisor could never traverse. Widen exactly the
+        // components created here to search-only; pre-existing directories
+        // keep their ownership and mode untouched.
+        let created_ancestors = Self::missing_ancestors(parent);
+        crate::filesystem::trusted_directory(parent, true)?;
+        for created in &created_ancestors {
+            std::fs::set_permissions(created, std::fs::Permissions::from_mode(0o711)).map_err(
+                |e| {
+                    NucleusError::FilesystemError(format!(
+                        "Failed to grant traversal on created bundle parent {:?}: {}",
+                        created, e
+                    ))
+                },
+            )?;
         }
-
-        std::fs::create_dir_all(path).map_err(|e| {
-            NucleusError::FilesystemError(format!(
-                "Failed to create explicit gVisor bundle directory {:?}: {}",
-                path, e
-            ))
-        })?;
-        chown(
-            path,
+        let (dir, _) = crate::oci::open_empty_bundle(&path)?;
+        nix::unistd::fchown(
+            &dir,
             Some(Uid::from_raw(host_uid)),
             Some(Gid::from_raw(host_gid)),
-        )
-        .map_err(|e| {
-            NucleusError::FilesystemError(format!(
-                "Failed to chown explicit gVisor bundle directory {:?} to {}:{}: {}",
-                path, host_uid, host_gid, e
-            ))
-        })?;
+        )?;
         Ok(())
     }
 
+    /// Ancestor directories of `path` that do not exist yet.
+    ///
+    /// Used to widen exactly the components a trusted-directory creation
+    /// adds, so the mapped supervisor can traverse them without changing the
+    /// mode of pre-existing user directories.
+    fn missing_ancestors(path: &Path) -> Vec<PathBuf> {
+        path.ancestors()
+            .filter(|p| !p.as_os_str().is_empty() && !p.exists())
+            .map(Path::to_path_buf)
+            .collect()
+    }
+
     fn ensure_runtime_parent_dir(path: &std::path::Path) -> Result<()> {
-        std::fs::create_dir_all(path).map_err(|e| {
-            NucleusError::FilesystemError(format!(
-                "Failed to create runtime parent dir {:?}: {}",
-                path, e
-            ))
-        })?;
+        crate::filesystem::trusted_directory(path, true)?;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o711)).map_err(|e| {
             NucleusError::FilesystemError(format!(
                 "Failed to secure runtime parent dir {:?}: {}",
@@ -1367,16 +1354,44 @@ impl Container {
             let mapped_base = runtime_base_override
                 .as_deref()
                 .filter(|_| Uid::effective().is_root());
+            let artifact_base = match mapped_base {
+                Some(base) => base.to_owned(),
+                None => GVisorRuntime::prepare_artifact_base()?,
+            };
+            let mut handoff_bundle: Option<std::fs::File> = None;
+            if mapped_base.is_none() {
+                if let Some(bundle) = &self.config.bundle_dir {
+                    let path = std::env::current_dir()?.join(bundle);
+                    let parent = path.parent().ok_or_else(|| {
+                        NucleusError::FilesystemError("Invalid bundle path".into())
+                    })?;
+                    crate::filesystem::trusted_directory(parent, true)?;
+                    // keep-id handoffs demote the setup process to container
+                    // ID 0 while the caller's files keep their original host
+                    // identity, so the bundle ownership check inside
+                    // OciBundle::create would reject the launching user's own
+                    // directory. Validate the empty bundle now, while the
+                    // effective UID still matches its owner, and transfer it
+                    // to the mapped supervisor right after the handoff.
+                    if Self::gvisor_needs_precreated_userns(
+                        &self.config,
+                        Uid::effective().is_root(),
+                    ) {
+                        let (dir, _) = crate::oci::open_empty_bundle(&path)?;
+                        handoff_bundle = Some(dir);
+                    }
+                }
+            }
             let gvisor_precreated_userns = self.prepare_gvisor_handoff_namespace(
                 userns_request_pipe.as_ref(),
                 userns_ack_pipe.as_ref(),
             )?;
+            if let (Some(dir), true) = (handoff_bundle, gvisor_precreated_userns) {
+                // Namespace-relative chown to container ID 0: the mapped
+                // supervisor owns the bundle for the upcoming create.
+                nix::unistd::fchown(&dir, Some(Uid::from_raw(0)), Some(Gid::from_raw(0)))?;
+            };
 
-            if let Some(base) = mapped_base {
-                // Both the OCI bundle and runsc state must be owned by the mapped supervisor.
-                // This is the single-threaded fork child, before runsc receives its sanitized env.
-                std::env::set_var("NUCLEUS_GVISOR_ARTIFACT_BASE", base);
-            }
             if mapped_base.is_some() || Self::gvisor_needs_mount_staging(&self.config) {
                 // Staged bind mounts must be private to this launch.
                 nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNS)?;
@@ -1398,7 +1413,11 @@ impl Container {
                     "Failed waiting for parent setup acknowledgement",
                 )?;
             }
-            return self.setup_and_exec_gvisor(gvisor_precreated_userns, gpu_device_set);
+            return self.setup_and_exec_gvisor(
+                artifact_base,
+                gvisor_precreated_userns,
+                gpu_device_set,
+            );
         }
 
         let workload_caps = self
@@ -3545,7 +3564,7 @@ mod tests {
             "NUCLEUS_GVISOR_ARTIFACT_BASE",
             temp.path().join("gvisor-artifacts"),
         );
-        let artifact_dir = Container::gvisor_artifact_dir("cleanup-test");
+        let artifact_dir = GVisorRuntime::artifact_dir("cleanup-test").unwrap();
         std::fs::create_dir_all(&artifact_dir).unwrap();
         std::fs::write(artifact_dir.join("config.json"), "{}").unwrap();
 
@@ -3554,15 +3573,47 @@ mod tests {
     }
 
     #[test]
-    fn test_gvisor_artifact_base_prefers_xdg_runtime_dir() {
+    #[ignore = "requires host root to exercise uid ownership checks"]
+    fn host_root_rejects_foreign_bundle_and_artifact_paths() {
+        assert!(Uid::effective().is_root());
+        let _lock = EnvLock::acquire();
+        let temp = tempfile::tempdir().unwrap();
+        let foreign = temp.path().join("foreign");
+        std::fs::create_dir(&foreign).unwrap();
+        let uid = Uid::from_raw(65534);
+        chown(&foreign, Some(uid), None).unwrap();
+        let _xdg = EnvVarGuard::set("XDG_RUNTIME_DIR", &foreign);
+        let _override = EnvVarGuard::remove("NUCLEUS_GVISOR_ARTIFACT_BASE");
+        assert_eq!(
+            GVisorRuntime::gvisor_artifact_base().unwrap(),
+            Path::new("/run/nucleus-gvisor")
+        );
+        let base = foreign.join("artifacts");
+        let _override = EnvVarGuard::set("NUCLEUS_GVISOR_ARTIFACT_BASE", &base);
+        assert!(GVisorRuntime::prepare_artifact_base().is_err());
+        assert!(!base.exists());
+        assert!(Container::prepare_mapped_bundle_dir(&foreign, 100000, 100000).is_err());
+        assert!(
+            Container::prepare_mapped_bundle_dir(&foreign.join("bundle"), 100000, 100000).is_err()
+        );
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(std::fs::metadata(&foreign).unwrap().uid(), uid.as_raw());
+    }
+
+    #[test]
+    fn test_gvisor_artifact_base_uses_xdg_only_for_unprivileged_hosts() {
         let _env_lock = EnvLock::acquire();
         let temp = tempfile::TempDir::new().unwrap();
         let _artifact_override = EnvVarGuard::remove("NUCLEUS_GVISOR_ARTIFACT_BASE");
         let _runtime = EnvVarGuard::set("XDG_RUNTIME_DIR", temp.path());
 
         assert_eq!(
-            Container::gvisor_artifact_dir("xdg-test"),
-            temp.path().join("nucleus-gvisor").join("xdg-test")
+            GVisorRuntime::gvisor_artifact_base().unwrap(),
+            if Uid::effective().is_root() && !crate::isolation::in_nontrivial_userns() {
+                PathBuf::from("/run/nucleus-gvisor")
+            } else {
+                temp.path().join("nucleus-gvisor")
+            }
         );
     }
 
@@ -3665,11 +3716,6 @@ mod tests {
             fn_body.contains("prepare_mapped_bundle_dir"),
             "root remap handoff must prepare explicit --bundle directories for the mapped supervisor"
         );
-        let helper = extract_fn_body(source, "fn prepare_mapped_bundle_dir");
-        assert!(
-            helper.contains("symlink_metadata") && helper.contains("Refusing symlink"),
-            "explicit bundle preparation must refuse symlinked paths before chowning"
-        );
     }
 
     #[test]
@@ -3694,7 +3740,7 @@ mod tests {
         let err = Container::prepare_mapped_bundle_dir(&link, uid.as_raw(), gid.as_raw())
             .unwrap_err()
             .to_string();
-        assert!(err.contains("Refusing symlink"));
+        assert!(err.contains("Failed to open bundle directory safely"));
     }
     #[test]
     fn test_gvisor_mount_staging_precreates_userns_in_all_service_modes() {
@@ -3732,5 +3778,76 @@ mod tests {
             .with_user_namespace(crate::isolation::UserNamespaceConfig::rootless())
             .with_service_mode(ServiceMode::StrictAgent);
         assert!(!Container::gvisor_needs_precreated_userns(&plain, false));
+    }
+    #[test]
+    fn test_prepare_mapped_bundle_dir_grants_traversal_on_created_parents() {
+        let temp = tempfile::tempdir().unwrap();
+        let bundle = temp.path().join("deep/nested/parents/explicit-bundle");
+        let uid = Uid::effective();
+        let gid = Gid::effective();
+        use std::os::unix::fs::PermissionsExt;
+
+        Container::prepare_mapped_bundle_dir(&bundle, uid.as_raw(), gid.as_raw()).unwrap();
+
+        // Every ancestor created by the preparation must be traversable by
+        // the mapped supervisor (search-only), not just root.
+        for created in [temp.path().join("deep"), temp.path().join("deep/nested")] {
+            let mode = std::fs::metadata(created).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o711, "created ancestor must grant traversal");
+        }
+        // The bundle itself stays owner-only.
+        let mode = std::fs::metadata(&bundle).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    #[test]
+    fn test_prepare_mapped_bundle_dir_preserves_existing_parent_modes() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("pre-existing");
+        std::fs::create_dir(&parent).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o750)).unwrap();
+        let bundle = parent.join("explicit-bundle");
+        let uid = Uid::effective();
+        let gid = Gid::effective();
+
+        Container::prepare_mapped_bundle_dir(&bundle, uid.as_raw(), gid.as_raw()).unwrap();
+
+        let mode = std::fs::metadata(&parent).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o750, "pre-existing parent mode must be untouched");
+    }
+
+    #[test]
+    fn test_missing_ancestors_lists_only_absent_prefixes() {
+        let temp = tempfile::tempdir().unwrap();
+        let existing = temp.path().join("existing");
+        std::fs::create_dir(&existing).unwrap();
+        let missing = Container::missing_ancestors(&existing.join("a/b"));
+        assert_eq!(
+            missing,
+            vec![existing.join("a/b"), existing.join("a")],
+            "ancestors are reported deepest-first, excluding existing prefixes"
+        );
+    }
+
+    #[test]
+    fn test_keepid_handoff_transfers_caller_owned_bundle() {
+        // Structural regression: the child must validate the explicit bundle
+        // while still the launching user and transfer it to container ID 0
+        // right after the user namespace handoff.
+        let source = include_str!("runtime.rs");
+        let fn_body = extract_fn_body(source, "fn setup_and_exec");
+        let validate = fn_body.find("open_empty_bundle").unwrap();
+        let handoff = fn_body.find("prepare_gvisor_handoff_namespace").unwrap();
+        let transfer = fn_body.find("nix::unistd::fchown").unwrap();
+        assert!(
+            validate < handoff && handoff < transfer,
+            "keep-id launches must validate the caller-owned bundle before the handoff and transfer it after"
+        );
+        let segment = &fn_body[handoff..transfer];
+        assert!(
+            segment.contains("gvisor_precreated_userns"),
+            "the bundle transfer must be gated on the completed user namespace handoff"
+        );
     }
 }

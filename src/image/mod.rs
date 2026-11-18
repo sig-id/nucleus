@@ -5,6 +5,7 @@ use crate::filesystem::{
     ROOTFS_ATTESTATION_FILE, ROOTFS_STORE_PATHS_FILE,
 };
 use crate::resources::Cgroup;
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use nix::fcntl::{open, openat, readlinkat, OFlag};
 use nix::sys::stat::{makedev, mknod, Mode, SFlag};
 use nix::unistd::Uid;
@@ -26,7 +27,8 @@ pub const IMAGE_SIGNATURE_FILE: &str = "image.sig";
 pub const IMAGE_ROOTFS_ATTESTATION_FILE: &str = "rootfs.sha256";
 pub const IMAGE_STORE_PATHS_FILE: &str = "store-paths";
 pub const IMAGE_DIFF_DIR: &str = "diff";
-const IMAGE_HMAC_KEY_SIZE: usize = 32;
+pub const IMAGE_SIGNING_KEY_ENV: &str = "NUCLEUS_IMAGE_SIGNING_KEY_FILE";
+pub const IMAGE_VERIFY_KEY_ENV: &str = "NUCLEUS_IMAGE_VERIFY_KEY_FILE";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NucleusImageManifest {
@@ -191,7 +193,16 @@ pub fn commit_container_image(
         ))
     })?;
     let upperdir = PathBuf::from(upperdir);
-    ensure_real_directory(&upperdir, "overlay upperdir")?;
+    // Pin the entire source path before touching the output. A symlink in any
+    // component of a recorded upperdir is invalid, including its ancestors.
+    let cwd = open(".", OFlag::O_PATH | OFlag::O_CLOEXEC, Mode::empty())?;
+    let upperdir = nix::fcntl::openat2(
+        &cwd,
+        &upperdir,
+        nix::fcntl::OpenHow::new()
+            .flags(OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC)
+            .resolve(nix::fcntl::ResolveFlag::RESOLVE_NO_SYMLINKS),
+    )?;
 
     let _freeze_guard = if options.freeze {
         let cgroup_path = state.cgroup_path.as_deref().ok_or_else(|| {
@@ -205,9 +216,37 @@ pub fn commit_container_image(
         None
     };
 
-    prepare_image_dir(output_dir)?;
+    let output = std::env::current_dir()?.join(output_dir);
+    let parent = output
+        .parent()
+        .ok_or_else(|| image_error("Invalid image output path".into()))?;
+    let parent = crate::filesystem::trusted_directory(parent, true)?;
+    let source = fs::read_link(crate::filesystem::fd_path(&upperdir))?;
+    if parent.starts_with(&source) || source.starts_with(&output) {
+        return Err(image_error(
+            "Image output and overlay upperdir must be disjoint".into(),
+        ));
+    }
+    match fs::symlink_metadata(&output) {
+        Ok(meta)
+            if !meta.is_dir()
+                || meta.uid() != Uid::effective().as_raw()
+                || meta.mode() & 0o022 != 0 =>
+        {
+            return Err(image_error(format!("Untrusted image output {output:?}")));
+        }
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+        _ => (),
+    }
+    // Keep partially copied workload-owned files inaccessible and publish the
+    // completed signature and tree together.
+    let staging = tempfile::Builder::new()
+        .prefix(".nucleus-commit-")
+        .permissions(fs::Permissions::from_mode(0o700))
+        .tempdir_in(parent)?;
+    let output_dir = staging.path();
     let diff_dir = output_dir.join(IMAGE_DIFF_DIR);
-    prepare_empty_dir(&diff_dir, "image diff directory")?;
+    fs::create_dir(&diff_dir)?;
 
     let base = ImageBase::from_rootfs(Path::new(rootfs_path))?;
     copy_base_sidecars(Path::new(rootfs_path), output_dir)?;
@@ -215,7 +254,52 @@ pub fn commit_container_image(
     let config = ImageConfig::from_state(state);
     let manifest = NucleusImageManifest::new(base, Some(diff), config)?;
     manifest.save(output_dir)?;
-    write_image_hmac(output_dir)?;
+    sign_image(output_dir)?;
+    match fs::rename(output_dir, &output) {
+        Ok(()) => {
+            let _ = staging.keep();
+        }
+        Err(e)
+            if e.raw_os_error() == Some(libc::ENOTEMPTY)
+                || e.raw_os_error() == Some(libc::EEXIST) =>
+        {
+            // Updating an existing package must not discard unrelated files.
+            let meta = fs::symlink_metadata(&output)?;
+            if !meta.is_dir() || meta.uid() != Uid::effective().as_raw() || meta.mode() & 0o077 != 0
+            {
+                return Err(image_error(format!(
+                    "Untrusted existing image output {output:?}"
+                )));
+            }
+            NucleusImageManifest::load(&output)?;
+            for entry in fs::read_dir(&output)? {
+                let name = entry?.file_name();
+                if !matches!(
+                    name.to_str(),
+                    Some(
+                        IMAGE_MANIFEST_FILE
+                            | IMAGE_SIGNATURE_FILE
+                            | IMAGE_DIFF_DIR
+                            | IMAGE_STORE_PATHS_FILE
+                            | IMAGE_ROOTFS_ATTESTATION_FILE
+                    )
+                ) {
+                    return Err(image_error(format!(
+                        "Unexpected entry {name:?} in existing image output"
+                    )));
+                }
+            }
+            nix::fcntl::renameat2(
+                &cwd,
+                output_dir,
+                &cwd,
+                &output,
+                nix::fcntl::RenameFlags::RENAME_EXCHANGE,
+            )?;
+            // The temporary directory now owns the previous package.
+        }
+        Err(e) => return Err(e.into()),
+    }
     Ok(manifest)
 }
 
@@ -238,7 +322,10 @@ impl VerifiedImage {
             let snapshot = tempfile::Builder::new()
                 .prefix("nucleus-image-")
                 .permissions(fs::Permissions::from_mode(0o700))
-                .tempdir()?;
+                .tempdir_in(crate::filesystem::trusted_directory(
+                    &std::env::temp_dir(),
+                    false,
+                )?)?;
             if snapshot
                 .path()
                 .canonicalize()?
@@ -249,7 +336,7 @@ impl VerifiedImage {
                 ));
             }
             copy_image_tree(image_dir, snapshot.path(), None)?;
-            verify_image_hmac(snapshot.path())?;
+            verify_image_signature(snapshot.path())?;
             let manifest = NucleusImageManifest::load(snapshot.path())?;
             return Ok(Self {
                 manifest,
@@ -396,9 +483,9 @@ fn replay_deleted_paths(upperdir: &Path, deleted_paths: &[String]) -> Result<()>
     Ok(())
 }
 
-fn export_diff(upperdir: &Path, diff_dir: &Path) -> Result<ImageDiff> {
+fn export_diff(upperdir: &std::os::fd::OwnedFd, diff_dir: &Path) -> Result<ImageDiff> {
     let mut entries = LayerEntries::default();
-    copy_image_tree(upperdir, diff_dir, Some(&mut entries))?;
+    copy_image_dir(upperdir, Path::new(""), diff_dir, Some(&mut entries))?;
     let digest = digest_diff_manifest(&entries.manifest, &entries.deleted_paths)?;
     Ok(ImageDiff {
         path: IMAGE_DIFF_DIR.to_string(),
@@ -869,69 +956,6 @@ fn hash_file(path: &Path) -> Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
-fn prepare_image_dir(path: &Path) -> Result<()> {
-    reject_symlink_path(path, "image directory")?;
-    if path.exists() {
-        if !path.is_dir() {
-            return Err(image_error(format!(
-                "Image output {:?} is not a directory",
-                path
-            )));
-        }
-    } else {
-        fs::create_dir_all(path)
-            .map_err(|e| image_error(format!("Failed to create image dir {:?}: {}", path, e)))?;
-    }
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-        .map_err(|e| image_error(format!("Failed to secure image dir {:?}: {}", path, e)))
-}
-
-fn prepare_empty_dir(path: &Path, label: &str) -> Result<()> {
-    reject_symlink_path(path, label)?;
-    if path.exists() {
-        if !path.is_dir() {
-            return Err(image_error(format!(
-                "{} {:?} is not a directory",
-                label, path
-            )));
-        }
-        for entry in fs::read_dir(path)
-            .map_err(|e| image_error(format!("Failed to read {} {:?}: {}", label, path, e)))?
-        {
-            let entry = entry.map_err(|e| {
-                image_error(format!("Failed to enumerate {} {:?}: {}", label, path, e))
-            })?;
-            let entry_path = entry.path();
-            let metadata = fs::symlink_metadata(&entry_path).map_err(|e| {
-                image_error(format!(
-                    "Failed to stat {} entry {:?}: {}",
-                    label, entry_path, e
-                ))
-            })?;
-            if metadata.is_dir() && !metadata.file_type().is_symlink() {
-                fs::remove_dir_all(&entry_path).map_err(|e| {
-                    image_error(format!(
-                        "Failed to remove stale dir {:?}: {}",
-                        entry_path, e
-                    ))
-                })?;
-            } else {
-                fs::remove_file(&entry_path).map_err(|e| {
-                    image_error(format!(
-                        "Failed to remove stale file {:?}: {}",
-                        entry_path, e
-                    ))
-                })?;
-            }
-        }
-    } else {
-        fs::create_dir(path)
-            .map_err(|e| image_error(format!("Failed to create {} {:?}: {}", label, path, e)))?;
-    }
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-        .map_err(|e| image_error(format!("Failed to secure {} {:?}: {}", label, path, e)))
-}
-
 fn ensure_real_directory(path: &Path, label: &str) -> Result<()> {
     reject_symlink_path(path, label)?;
     let metadata = fs::metadata(path)
@@ -990,67 +1014,69 @@ fn atomic_write_bytes(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
     })
 }
 
-fn write_image_hmac(dir: &Path) -> Result<()> {
-    let key = load_or_create_image_hmac_key()?;
-    let digest = compute_image_hmac(dir, &key)?;
-    atomic_write_bytes(&dir.join(IMAGE_SIGNATURE_FILE), digest.as_bytes(), 0o600)
-}
-
-fn verify_image_hmac(dir: &Path) -> Result<()> {
-    let sig_path = dir.join(IMAGE_SIGNATURE_FILE);
-    let expected = read_file_nofollow_bytes(&sig_path).map_err(|e| {
-        image_error(format!(
-            "Failed to read image signature {:?}: {}",
-            sig_path, e
-        ))
-    })?;
-    let expected = std::str::from_utf8(&expected)
-        .map_err(|e| image_error(format!("Image signature is not UTF-8: {}", e)))?
-        .trim()
-        .to_string();
-    if expected.is_empty() {
-        return Err(image_error("Image signature is empty".to_string()));
-    }
-    let key = load_or_create_image_hmac_key()?;
-    let actual = compute_image_hmac(dir, &key)?;
-    if expected != actual {
+fn sign_image(dir: &Path) -> Result<()> {
+    let path = signing_key_path()?;
+    let parent = crate::filesystem::trusted_directory(
+        path.parent()
+            .expect("validated signing key path has a filename"),
+        true,
+    )?;
+    if parent.starts_with(dir.canonicalize()?) {
         return Err(image_error(
-            "Image integrity verification failed: HMAC mismatch".into(),
+            "Signing key must be stored outside the image".into(),
         ));
     }
-    Ok(())
+    if !path.try_exists()? {
+        let mut seed = zeroize::Zeroizing::new([0u8; 32]);
+        fill_secure_random(seed.as_mut())?;
+        install_key(&path, &seed)?;
+    }
+    let seed = zeroize::Zeroizing::new(read_key(&path, true)?);
+    let signing_key = SigningKey::from_bytes(&seed);
+    let public_path = path.with_added_extension("pub");
+    install_key(&public_path, signing_key.verifying_key().as_bytes())?;
+    if read_key(&public_path, false)? != signing_key.verifying_key().to_bytes() {
+        return Err(image_error(format!(
+            "Verification key {public_path:?} does not match signing key"
+        )));
+    }
+    let signature = signing_key.sign(&image_digest(dir)?);
+    let encoded = format!("ed25519-v1:{}\n", hex::encode(signature.to_bytes()));
+    atomic_write_bytes(&dir.join(IMAGE_SIGNATURE_FILE), encoded.as_bytes(), 0o600)
 }
 
-fn compute_image_hmac(dir: &Path, key: &[u8]) -> Result<String> {
-    let mut key_block = [0u8; 64];
-    if key.len() > key_block.len() {
-        let digest = Sha256::digest(key);
-        key_block[..digest.len()].copy_from_slice(&digest);
-    } else {
-        key_block[..key.len()].copy_from_slice(key);
-    }
-
-    let mut ipad = [0x36u8; 64];
-    let mut opad = [0x5cu8; 64];
-    for (dst, src) in ipad.iter_mut().zip(key_block.iter()) {
-        *dst ^= *src;
-    }
-    for (dst, src) in opad.iter_mut().zip(key_block.iter()) {
-        *dst ^= *src;
-    }
-
-    let mut inner = Sha256::new();
-    inner.update(ipad);
-    update_image_hmac_inner(&mut inner, dir, dir)?;
-    let inner_hash = inner.finalize();
-
-    let mut outer = Sha256::new();
-    outer.update(opad);
-    outer.update(inner_hash);
-    Ok(hex::encode(outer.finalize()))
+fn verify_image_signature(dir: &Path) -> Result<()> {
+    let bytes = read_file_nofollow_bytes(&dir.join(IMAGE_SIGNATURE_FILE))?;
+    let encoded = std::str::from_utf8(&bytes).ok().and_then(|s| s.trim_end().strip_prefix("ed25519-v1:"))
+        .ok_or_else(|| image_error("Expected an Ed25519 image signature. Recommit legacy HMAC images with a signing key.".into()))?;
+    let mut sig = [0u8; 64];
+    hex::decode_to_slice(encoded, &mut sig)
+        .map_err(|_| image_error("Invalid Ed25519 image signature".into()))?;
+    let public_path = match std::env::var_os(IMAGE_VERIFY_KEY_ENV) {
+        Some(path) => std::env::current_dir()?.join(path),
+        None => signing_key_path()?.with_added_extension("pub"),
+    };
+    crate::filesystem::trusted_directory(
+        public_path
+            .parent()
+            .ok_or_else(|| image_error("Invalid verification key path".into()))?,
+        false,
+    )?;
+    let verifier = VerifyingKey::from_bytes(&read_key(&public_path, false)?)
+        .map_err(|_| image_error("Invalid Ed25519 verification key".into()))?;
+    verifier
+        .verify_strict(&image_digest(dir)?, &Signature::from_bytes(&sig))
+        .map_err(|_| image_error("Image integrity verification failed: signature mismatch".into()))
 }
 
-fn update_image_hmac_inner(hasher: &mut Sha256, root: &Path, dir: &Path) -> Result<()> {
+fn image_digest(dir: &Path) -> Result<[u8; 32]> {
+    let mut hash = Sha256::new();
+    hash.update(b"nucleus-image-ed25519-v1\0");
+    update_image_digest(&mut hash, dir, dir)?;
+    Ok(hash.finalize().into())
+}
+
+fn update_image_digest(hasher: &mut Sha256, root: &Path, dir: &Path) -> Result<()> {
     let mut entries = fs::read_dir(dir)
         .map_err(|e| image_error(format!("Failed to read image directory {:?}: {}", dir, e)))?
         .collect::<std::result::Result<Vec<_>, _>>()
@@ -1074,20 +1100,20 @@ fn update_image_hmac_inner(hasher: &mut Sha256, root: &Path, dir: &Path) -> Resu
             hasher.update(b"L\0");
             hasher.update(relative.as_bytes());
             hasher.update(b"\0");
-            update_metadata_hmac(hasher, &path, &metadata, false)?;
+            update_metadata_digest(hasher, &path, &metadata, false)?;
             hasher.update(target.as_os_str().as_encoded_bytes());
             hasher.update(b"\0");
         } else if metadata.is_dir() {
             hasher.update(b"D\0");
             hasher.update(relative.as_bytes());
             hasher.update(b"\0");
-            update_metadata_hmac(hasher, &path, &metadata, true)?;
-            update_image_hmac_inner(hasher, root, &path)?;
+            update_metadata_digest(hasher, &path, &metadata, true)?;
+            update_image_digest(hasher, root, &path)?;
         } else if metadata.is_file() {
             hasher.update(b"F\0");
             hasher.update(relative.as_bytes());
             hasher.update(b"\0");
-            update_metadata_hmac(hasher, &path, &metadata, true)?;
+            update_metadata_digest(hasher, &path, &metadata, true)?;
             hasher.update(metadata.len().to_le_bytes());
             let mut file = OpenOptions::new()
                 .read(true)
@@ -1114,7 +1140,7 @@ fn update_image_hmac_inner(hasher: &mut Sha256, root: &Path, dir: &Path) -> Resu
     Ok(())
 }
 
-fn update_metadata_hmac(
+fn update_metadata_digest(
     hasher: &mut Sha256,
     path: &Path,
     metadata: &fs::Metadata,
@@ -1133,6 +1159,7 @@ fn update_metadata_hmac(
         }
     }
     xattrs.sort_by(|(a, _), (b, _)| a.cmp(b));
+    hasher.update((xattrs.len() as u64).to_le_bytes());
     for (name, value) in xattrs {
         hasher.update(b"X\0");
         hasher.update((name.len() as u64).to_le_bytes());
@@ -1144,119 +1171,70 @@ fn update_metadata_hmac(
     Ok(())
 }
 
-fn image_hmac_key_path() -> PathBuf {
-    if let Some(path) = std::env::var_os("NUCLEUS_IMAGE_HMAC_KEY_FILE").filter(|p| !p.is_empty()) {
-        return PathBuf::from(path);
-    }
-    if Uid::effective().is_root() {
-        PathBuf::from("/var/lib/nucleus/image-hmac.key")
+fn signing_key_path() -> Result<PathBuf> {
+    let path = if let Some(path) = std::env::var_os(IMAGE_SIGNING_KEY_ENV) {
+        std::env::current_dir()?.join(path)
+    } else if std::env::var_os("NUCLEUS_IMAGE_HMAC_KEY_FILE").is_some() {
+        return Err(image_error(
+            "Replace NUCLEUS_IMAGE_HMAC_KEY_FILE with an Ed25519 signing or verification key"
+                .into(),
+        ));
+    } else if Uid::effective().is_root() {
+        PathBuf::from("/var/lib/nucleus/image-ed25519.key")
     } else {
         dirs::data_local_dir()
-            .map(|dir| dir.join("nucleus/image-hmac.key"))
-            .or_else(|| dirs::home_dir().map(|dir| dir.join(".nucleus/image-hmac.key")))
-            .unwrap_or_else(|| PathBuf::from("/tmp/nucleus-image-hmac.key"))
+            .ok_or_else(|| {
+                image_error(
+                    "Set NUCLEUS_IMAGE_SIGNING_KEY_FILE or NUCLEUS_IMAGE_VERIFY_KEY_FILE".into(),
+                )
+            })?
+            .join("nucleus/image-ed25519.key")
+    };
+    if path.file_name().is_none() {
+        return Err(image_error(format!("Invalid signing key path {path:?}")));
     }
+    Ok(path)
 }
 
-fn load_or_create_image_hmac_key() -> Result<Vec<u8>> {
-    let key_path = image_hmac_key_path();
-    let parent = key_path
-        .parent()
-        .ok_or_else(|| image_error(format!("Image HMAC key path {:?} has no parent", key_path)))?;
-    ensure_secure_key_parent_dir(parent)?;
-    reject_symlink_path(&key_path, "image HMAC key file")?;
-
-    if key_path.exists() {
-        let metadata = fs::metadata(&key_path)
-            .map_err(|e| image_error(format!("Failed to stat image HMAC key: {}", e)))?;
-        let mode = metadata.permissions().mode() & 0o777;
-        let owner = metadata.uid();
-        let euid = Uid::effective().as_raw();
-        if owner != euid {
-            return Err(image_error(format!(
-                "Image HMAC key {:?} is owned by uid {} (expected {})",
-                key_path, owner, euid
-            )));
-        }
-        if mode & 0o077 != 0 {
-            return Err(image_error(format!(
-                "Image HMAC key {:?} has insecure mode {:o}; expected owner-only access",
-                key_path, mode
-            )));
-        }
-        let key = read_file_nofollow_bytes(&key_path)
-            .map_err(|e| image_error(format!("Failed to read image HMAC key: {}", e)))?;
-        if key.len() < IMAGE_HMAC_KEY_SIZE {
-            return Err(image_error(format!(
-                "Image HMAC key {:?} is too short ({} bytes)",
-                key_path,
-                key.len()
-            )));
-        }
-        return Ok(key);
-    }
-
-    let mut key = vec![0u8; IMAGE_HMAC_KEY_SIZE];
-    fill_secure_random(&mut key)?;
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&key_path)
-        .map_err(|e| {
-            image_error(format!(
-                "Failed to create image HMAC key {:?}: {}",
-                key_path, e
-            ))
-        })?;
-    file.write_all(&key).map_err(|e| {
-        image_error(format!(
-            "Failed to write image HMAC key {:?}: {}",
-            key_path, e
-        ))
-    })?;
-    file.sync_all().map_err(|e| {
-        image_error(format!(
-            "Failed to sync image HMAC key {:?}: {}",
-            key_path, e
-        ))
-    })?;
-    Ok(key)
-}
-
-fn ensure_secure_key_parent_dir(path: &Path) -> Result<()> {
-    reject_symlink_path(path, "image HMAC key directory")?;
-    if path.exists() {
-        let metadata = fs::metadata(path)
-            .map_err(|e| image_error(format!("Failed to stat image HMAC key dir: {}", e)))?;
-        if !metadata.is_dir() {
-            return Err(image_error(format!(
-                "Image HMAC key directory {:?} is not a directory",
-                path
-            )));
-        }
-        let mode = metadata.permissions().mode() & 0o777;
-        let owner = metadata.uid();
-        let euid = Uid::effective().as_raw();
-        if owner != euid {
-            return Err(image_error(format!(
-                "Image HMAC key directory {:?} is owned by uid {} (expected {})",
-                path, owner, euid
-            )));
-        }
-        if mode & 0o077 != 0 {
-            return Err(image_error(format!(
-                "Image HMAC key directory {:?} has insecure mode {:o}; expected owner-only access",
-                path, mode
-            )));
-        }
+// Publish a complete key atomically. Concurrent first-time signers all read
+// the winning seed before deriving the companion public key.
+fn install_key(path: &Path, bytes: &[u8; 32]) -> Result<()> {
+    if path.try_exists()? {
         return Ok(());
     }
-    fs::create_dir_all(path)
-        .map_err(|e| image_error(format!("Failed to create image HMAC key dir: {}", e)))?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-        .map_err(|e| image_error(format!("Failed to secure image HMAC key dir: {}", e)))
+    let mut file = tempfile::NamedTempFile::new_in(
+        path.parent()
+            .expect("validated signing key path has a filename"),
+    )?;
+    file.write_all(bytes)?;
+    file.as_file().sync_all()?;
+    match file.persist_noclobber(path) {
+        Ok(_) => Ok(()),
+        Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e.error.into()),
+    }
+}
+
+fn read_key(path: &Path, private: bool) -> Result<[u8; 32]> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|e| image_error(format!("Cannot open image key {path:?}: {e}")))?;
+    let meta = file.metadata()?;
+    let euid = Uid::effective().as_raw();
+    if !meta.is_file()
+        || meta.len() != 32
+        || (meta.uid() != euid && (private || meta.uid() != 0))
+        || meta.mode() & (if private { 0o077 } else { 0o022 }) != 0
+    {
+        return Err(image_error(format!(
+            "Invalid image key ownership, permissions or format at {path:?}"
+        )));
+    }
+    let mut bytes = [0; 32];
+    file.read_exact(&mut bytes)?;
+    Ok(bytes)
 }
 
 fn fill_secure_random(buf: &mut [u8]) -> Result<()> {
@@ -1316,22 +1294,23 @@ mod tests {
     }
 
     struct ImageKeyEnvGuard {
+        name: &'static str,
         previous: Option<OsString>,
     }
 
     impl ImageKeyEnvGuard {
-        fn set(path: &Path) -> Self {
-            let previous = std::env::var_os("NUCLEUS_IMAGE_HMAC_KEY_FILE");
-            std::env::set_var("NUCLEUS_IMAGE_HMAC_KEY_FILE", path);
-            Self { previous }
+        fn set(name: &'static str, path: &Path) -> Self {
+            let previous = std::env::var_os(name);
+            std::env::set_var(name, path);
+            Self { name, previous }
         }
     }
 
     impl Drop for ImageKeyEnvGuard {
         fn drop(&mut self) {
             match &self.previous {
-                Some(value) => std::env::set_var("NUCLEUS_IMAGE_HMAC_KEY_FILE", value),
-                None => std::env::remove_var("NUCLEUS_IMAGE_HMAC_KEY_FILE"),
+                Some(value) => std::env::set_var(self.name, value),
+                None => std::env::remove_var(self.name),
             }
         }
     }
@@ -1464,7 +1443,7 @@ mod tests {
         let key_dir = temp.path().join("keys");
         fs::create_dir(&key_dir).unwrap();
         fs::set_permissions(&key_dir, fs::Permissions::from_mode(0o700)).unwrap();
-        let _guard = ImageKeyEnvGuard::set(&key_dir.join("image.key"));
+        let _guard = ImageKeyEnvGuard::set(IMAGE_SIGNING_KEY_ENV, &key_dir.join("image.key"));
 
         let rootfs = sample_rootfs(temp.path());
         let upper = temp.path().join("upper");
@@ -1543,13 +1522,13 @@ mod tests {
     }
 
     #[test]
-    fn test_image_hmac_detects_tampering() {
+    fn test_image_signature_detects_tampering() {
         let _lock = image_key_env_lock().lock().unwrap();
         let temp = TempDir::new().unwrap();
         let key_dir = temp.path().join("keys");
         fs::create_dir(&key_dir).unwrap();
         fs::set_permissions(&key_dir, fs::Permissions::from_mode(0o700)).unwrap();
-        let _guard = ImageKeyEnvGuard::set(&key_dir.join("image.key"));
+        let _guard = ImageKeyEnvGuard::set(IMAGE_SIGNING_KEY_ENV, &key_dir.join("image.key"));
 
         let rootfs = sample_rootfs(temp.path());
         let upper = temp.path().join("upper");
@@ -1563,19 +1542,53 @@ mod tests {
         )
         .unwrap();
 
+        // A verifier gets only the independently provisioned public key.
+        let verifier = temp.path().join("verifier");
+        fs::create_dir(&verifier).unwrap();
+        fs::copy(key_dir.join("image.key.pub"), verifier.join("trusted.pub")).unwrap();
+        fs::remove_dir_all(&key_dir).unwrap();
+        let _public = ImageKeyEnvGuard::set(IMAGE_VERIFY_KEY_ENV, &verifier.join("trusted.pub"));
+        assert!(load_image(&image_dir).is_ok());
+        assert!(!key_dir.exists());
+        let good_key = fs::read(verifier.join("trusted.pub")).unwrap();
+        let other = SigningKey::from_bytes(&[37; 32]).verifying_key();
+        fs::write(verifier.join("trusted.pub"), other.as_bytes()).unwrap();
+        assert!(load_image(&image_dir)
+            .unwrap_err()
+            .to_string()
+            .contains("signature mismatch"));
+        fs::write(verifier.join("trusted.pub"), good_key).unwrap();
+
         fs::write(image_dir.join("diff/file"), "two").unwrap();
         let err = load_image(&image_dir).unwrap_err();
-        assert!(err.to_string().contains("HMAC mismatch"));
+        assert!(err.to_string().contains("signature mismatch"));
+        fs::write(image_dir.join(IMAGE_SIGNATURE_FILE), "0".repeat(64)).unwrap();
+        assert!(load_image(&image_dir)
+            .unwrap_err()
+            .to_string()
+            .contains("legacy HMAC"));
     }
 
     #[test]
-    fn test_image_hmac_detects_metadata_tampering() {
+    fn commit_rejects_an_upperdir_with_a_symlinked_parent() {
+        let temp = TempDir::new().unwrap();
+        let rootfs = sample_rootfs(temp.path());
+        fs::create_dir_all(temp.path().join("overlay/upper")).unwrap();
+        symlink("overlay", temp.path().join("alias")).unwrap();
+        let output = temp.path().join("image");
+        let state = sample_state(&rootfs, &temp.path().join("alias/upper"));
+        assert!(commit_container_image(&state, &output, &ImageCommitOptions::default()).is_err());
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn test_image_signature_detects_metadata_tampering() {
         let _lock = image_key_env_lock().lock().unwrap();
         let temp = TempDir::new().unwrap();
         let key_dir = temp.path().join("keys");
         fs::create_dir(&key_dir).unwrap();
         fs::set_permissions(&key_dir, fs::Permissions::from_mode(0o700)).unwrap();
-        let _guard = ImageKeyEnvGuard::set(&key_dir.join("image.key"));
+        let _guard = ImageKeyEnvGuard::set(IMAGE_SIGNING_KEY_ENV, &key_dir.join("image.key"));
 
         let rootfs = sample_rootfs(temp.path());
         let upper = temp.path().join("upper");
@@ -1595,7 +1608,7 @@ mod tests {
         )
         .unwrap();
         let err = load_image(&image_dir).unwrap_err();
-        assert!(err.to_string().contains("HMAC mismatch"));
+        assert!(err.to_string().contains("signature mismatch"));
     }
 
     #[test]
@@ -1623,7 +1636,8 @@ mod tests {
         let _lock = image_key_env_lock().lock().unwrap();
         let key_temp = TempDir::new().unwrap();
         fs::set_permissions(key_temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
-        let _guard = ImageKeyEnvGuard::set(&key_temp.path().join("image.key"));
+        let _guard =
+            ImageKeyEnvGuard::set(IMAGE_SIGNING_KEY_ENV, &key_temp.path().join("image.key"));
 
         let broker = CredentialBrokerConfig::parse_endpoint("10.0.42.1:8080").unwrap();
         let mut config = ContainerConfig::try_new_with_id(
