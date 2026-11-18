@@ -8,6 +8,7 @@ use nix::sys::wait::{waitid, waitpid, Id, WaitPidFlag, WaitStatus};
 use nix::unistd::{fork, ForkResult, Pid};
 use std::ffi::CString;
 use std::fs::File;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::{AsRawFd, OwnedFd};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -131,7 +132,18 @@ impl ContainerAttach {
         for ns in ns_types {
             let ns_path = format!("/proc/{}/ns/{}", pid, ns);
             match File::open(&ns_path) {
-                Ok(f) => ns_fds.push(((*ns).to_string(), f)),
+                Ok(f) => {
+                    if *ns == "net" {
+                        // After joining a mapped user namespace the helper cannot
+                        // setns back into the host network namespace it already occupies.
+                        let current = std::fs::metadata("/proc/thread-self/ns/net")?;
+                        let target = f.metadata()?;
+                        if current.dev() == target.dev() && current.ino() == target.ino() {
+                            continue;
+                        }
+                    }
+                    ns_fds.push(((*ns).to_string(), f));
+                }
                 Err(e)
                     if e.kind() == std::io::ErrorKind::NotFound
                         && *ns != "pid"

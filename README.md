@@ -134,7 +134,7 @@ Nucleus leverages Linux kernel isolation primitives:
 - **pivot_root** – Filesystem isolation (chroot fallback available in agent mode only)
 - **Capabilities** – All capabilities dropped by default, or configured via TOML policy file (irreversible)
 - **seccomp** – Syscall whitelist filtering with per-service JSON profiles and trace-based generation (irreversible)
-- **Landlock** – Path-based filesystem access control via hardcoded defaults or TOML policy file (Linux 5.13+)
+- **Landlock** – Native filesystem and TCP access rules, with abstract Unix socket and signal scoping on Landlock ABI 6 (Linux 6.12+)
 - **gVisor** – Optional application kernel (runsc) with none, bridge handoff, and explicit gvisor-host network modes
 - **OCI bundle generation** – Emits OCI `config.json` plus bundle layout for gVisor, including `process.user`, lifecycle hooks, seccomp, resource limits, and namespace mappings
 - **Image snapshots** – Local signed manifests with optional overlay diffs rooted in attested Nix rootfs closures
@@ -636,7 +636,11 @@ keep = []
 **Landlock policy** (TOML):
 ```toml
 # config/my-service.landlock.toml
-min_abi = 3
+min_abi = 6
+
+[tcp]
+bind = [8080]
+connect = [443]
 
 [[rules]]
 path = "/bin"
@@ -660,6 +664,10 @@ Native seccomp rejects simultaneous write and execute permissions in `mmap`, `mp
 `--seccomp-allow mknod`, `mknodat`, and `kcmp` are argument-filtered: node creation is limited to FIFOs, sockets, and regular files, and `kcmp` to file-description comparison. Native seccomp profiles cannot allow `unshare`, `setns`, `mount_setattr`, `memfd_create`, `memfd_secret`, `ptrace`, `process_vm_writev`, `pidfd_getfd`, `open_by_handle_at`, `syslog`, or the clock setters.
 
 Native containers mount procfs with `nosymfollow` to prevent execution through descriptor links. Programs can read ordinary files such as `/proc/<pid>/status` using a numeric PID. Programs that follow `/proc/self`, `/proc/thread-self`, or `/dev/fd/N` need a different access path. Recreate running containers to pick up the new mounts and saved seccomp program.
+
+Native `--network none` denies all TCP binds and connects. With bridge or explicitly enabled host networking, omitting a direction leaves it to the existing network policy. An empty list denies that direction, and bind port `0` permits ephemeral port allocation. Explicit port restrictions require enforcement. The rules apply to IPv4 and IPv6 TCP.
+
+Native workloads and their descendants can use abstract Unix sockets and send signals within their Landlock domain. Use a pathname notification socket for communication with a host service manager. An attach command receives the launch ruleset and enters a separate domain, which also limits its IPC with the original workload. Production checks write and execute grants for overlap after resolving the rule paths inside the container. In custom policies, executable directories and files need an explicit `execute` grant.
 
 ### Seccomp Profile Generation
 
@@ -1066,7 +1074,7 @@ the CLI `nucleus image commit` workflow.
 | Native /proc | `hidepid=2,subset=pid` | `hidepid=2,subset=pid` | `hidepid=2,subset=pid` |
 | Mount audit | Skipped | Skipped | Post-setup flag verification (fatal) |
 | Seccomp trace mode | Allowed | Forbidden | Forbidden |
-| Landlock ABI | Best-effort | Full enforcement required on native | V3 minimum required |
+| Native Landlock ABI | V6 required for host networking, optional degradation with a private network namespace | V6 | V6 |
 | Health checks | Optional | Optional | Optional |
 | sd_notify | Optional | Optional | Optional |
 | Security policies | Optional | Optional | Optional (recommended) |

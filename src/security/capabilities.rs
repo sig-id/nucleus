@@ -22,7 +22,9 @@ enum CapPhase {
     Initial,
     /// Bounding set dropped; effective/permitted still intact for identity switch
     BoundingDropped,
-    /// All caps fully dropped (terminal state)
+    /// Explicit sets were applied and may retain capabilities.
+    PolicyApplied,
+    /// All caps fully dropped
     Dropped,
 }
 
@@ -51,35 +53,14 @@ impl CapabilityManager {
     /// This follows Docker/runc convention: bounding set is cleared first
     /// while CAP_SETPCAP is still in the effective set.
     pub fn drop_bounding_set(&mut self) -> Result<()> {
-        if self.phase != CapPhase::Initial {
+        if matches!(self.phase, CapPhase::BoundingDropped | CapPhase::Dropped) {
             debug!("Bounding set already dropped, skipping");
             return Ok(());
         }
 
         info!("Phase 1: dropping bounding set and ambient/inheritable caps");
 
-        // 1. Clear bounding set (requires CAP_SETPCAP in effective set).
-        //    Prevents regaining capabilities through exec of setuid binaries.
-        for cap in caps::all() {
-            if let Err(e) = caps::drop(None, CapSet::Bounding, cap) {
-                debug!(
-                    "Failed to drop bounding cap {:?}: {} (may not be present)",
-                    cap, e
-                );
-            }
-        }
-
-        // M4: Verify the bounding set is actually empty after the drop loop
-        let bounding = caps::read(None, CapSet::Bounding).map_err(|e| {
-            NucleusError::CapabilityError(format!("Failed to read bounding set after drop: {}", e))
-        })?;
-        if !bounding.is_empty() {
-            let leaked: Vec<String> = bounding.iter().map(|c| format!("{:?}", c)).collect();
-            return Err(NucleusError::CapabilityError(format!(
-                "Bounding set still contains capabilities after drop: [{}]",
-                leaked.join(", ")
-            )));
-        }
+        restrict_bounding(&[])?;
 
         // 2. Clear ambient set (constrained to permitted ∩ inheritable).
         caps::clear(None, CapSet::Ambient).map_err(|e| {
@@ -114,7 +95,7 @@ impl CapabilityManager {
             return Ok(());
         }
 
-        if self.phase == CapPhase::Initial {
+        if matches!(self.phase, CapPhase::Initial | CapPhase::PolicyApplied) {
             // Caller skipped phase 1 – do full drop for backwards compat
             self.drop_bounding_set()?;
         }
@@ -129,6 +110,11 @@ impl CapabilityManager {
             NucleusError::CapabilityError(format!("Failed to clear effective caps: {}", e))
         })?;
 
+        if process_caps()? != ProcessCaps::default() {
+            return Err(NucleusError::CapabilityError(
+                "Final capability sets are not empty".into(),
+            ));
+        }
         self.phase = CapPhase::Dropped;
         info!("Successfully dropped all capabilities (including bounding set)");
 
@@ -149,53 +135,19 @@ impl CapabilityManager {
     /// For most use cases, we drop ALL capabilities. This method is provided
     /// for special cases where specific capabilities are needed.
     pub fn drop_except(&mut self, keep: &[Capability]) -> Result<()> {
-        if self.phase == CapPhase::Dropped {
-            debug!("Capabilities already dropped, skipping");
-            return Ok(());
-        }
-
-        info!("Dropping capabilities except: {:?}", keep);
-
-        let all_caps = caps::all();
-
-        // 1. Drop bounding set entries FIRST (requires CAP_SETPCAP in effective).
-        for cap in &all_caps {
-            if !keep.contains(cap) {
-                if let Err(e) = caps::drop(None, CapSet::Bounding, *cap) {
-                    debug!(
-                        "Failed to drop bounding cap {:?}: {} (may not be present)",
-                        cap, e
-                    );
-                }
-            }
-        }
-
-        // 2. Clear ambient set (constrained to permitted ∩ inheritable).
-        caps::clear(None, CapSet::Ambient).map_err(|e| {
-            NucleusError::CapabilityError(format!("Failed to clear ambient caps: {}", e))
-        })?;
-
-        // 3. Drop from inheritable, permitted, effective for each non-kept cap.
-        for cap in &all_caps {
-            if !keep.contains(cap) {
-                caps::drop(None, CapSet::Inheritable, *cap).map_err(|e| {
-                    NucleusError::CapabilityError(format!("Failed to drop {cap:?}: {e}"))
-                })?;
-
-                caps::drop(None, CapSet::Permitted, *cap).map_err(|e| {
-                    NucleusError::CapabilityError(format!("Failed to drop {cap:?}: {e}"))
-                })?;
-
-                caps::drop(None, CapSet::Effective, *cap).map_err(|e| {
-                    NucleusError::CapabilityError(format!("Failed to drop {cap:?}: {e}"))
-                })?;
-            }
-        }
-
-        self.phase = CapPhase::Dropped;
-        info!("Successfully dropped capabilities");
-
-        Ok(())
+        let retained = |set| -> Result<Vec<Capability>> {
+            let mut current = caps::read(None, set)
+                .map_err(|e| NucleusError::CapabilityError(format!("Cannot read {set:?}: {e}")))?;
+            current.retain(|cap| keep.contains(cap));
+            Ok(current.into_iter().collect())
+        };
+        self.apply_sets(&CapabilitySets {
+            bounding: keep.to_vec(),
+            effective: retained(CapSet::Effective)?,
+            permitted: retained(CapSet::Permitted)?,
+            inheritable: retained(CapSet::Inheritable)?,
+            ambient: Vec::new(),
+        })
     }
 
     /// Apply explicit capability sets.
@@ -203,32 +155,17 @@ impl CapabilityManager {
     /// Bounding is handled as a drop-only upper bound; the remaining sets are
     /// set exactly to the provided values.
     pub fn apply_sets(&mut self, sets: &CapabilitySets) -> Result<()> {
-        if self.phase == CapPhase::Dropped {
-            debug!("Capabilities already dropped, skipping");
-            return Ok(());
-        }
+        self.prepare_sets(sets)?;
+        self.finish_sets(sets)
+    }
 
-        info!("Applying explicit capability sets");
-
-        for cap in caps::all() {
-            if !sets.bounding.contains(&cap) {
-                if let Err(e) = caps::drop(None, CapSet::Bounding, cap) {
-                    debug!(
-                        "Failed to drop bounding cap {:?}: {} (may not be present)",
-                        cap, e
-                    );
-                }
-            }
-        }
-
-        // M5: Set Permitted first, then Effective immediately after to avoid a
-        // window where the old effective set exceeds the new permitted set.
-        caps::set(None, CapSet::Permitted, &to_caps_hash_set(&sets.permitted)).map_err(|e| {
-            NucleusError::CapabilityError(format!("Failed to set permitted caps: {}", e))
+    pub(crate) fn prepare_sets(&mut self, sets: &CapabilitySets) -> Result<()> {
+        restrict_bounding(&sets.bounding)?;
+        caps::clear(None, CapSet::Ambient).map_err(|e| {
+            NucleusError::CapabilityError(format!("Failed to clear ambient capabilities: {e}"))
         })?;
-        caps::set(None, CapSet::Effective, &to_caps_hash_set(&sets.effective)).map_err(|e| {
-            NucleusError::CapabilityError(format!("Failed to set effective caps: {}", e))
-        })?;
+        // Set inheritable while setup privileges are available, and reduce
+        // effective before permitted to preserve the kernel's subset invariant.
         caps::set(
             None,
             CapSet::Inheritable,
@@ -237,55 +174,174 @@ impl CapabilityManager {
         .map_err(|e| {
             NucleusError::CapabilityError(format!("Failed to set inheritable caps: {}", e))
         })?;
+        self.phase = CapPhase::BoundingDropped;
+        Ok(())
+    }
+
+    pub(crate) fn finish_sets(&mut self, sets: &CapabilitySets) -> Result<()> {
+        caps::set(None, CapSet::Effective, &to_caps_hash_set(&sets.effective)).map_err(|e| {
+            NucleusError::CapabilityError(format!("Failed to set effective caps: {e}"))
+        })?;
+        caps::set(None, CapSet::Permitted, &to_caps_hash_set(&sets.permitted)).map_err(|e| {
+            NucleusError::CapabilityError(format!("Failed to set permitted caps: {e}"))
+        })?;
         caps::set(None, CapSet::Ambient, &to_caps_hash_set(&sets.ambient)).map_err(|e| {
             NucleusError::CapabilityError(format!("Failed to set ambient caps: {}", e))
         })?;
 
-        self.phase = CapPhase::Dropped;
+        let current = process_caps()?;
+        if current.bounding & !cap_mask(&sets.bounding) != 0 {
+            return Err(NucleusError::CapabilityError(
+                "Final bounding set exceeds policy".into(),
+            ));
+        }
+        for (name, actual, expected) in [
+            ("effective", current.effective, &sets.effective),
+            ("permitted", current.permitted, &sets.permitted),
+            ("inheritable", current.inheritable, &sets.inheritable),
+            ("ambient", current.ambient, &sets.ambient),
+        ] {
+            if actual != cap_mask(expected) {
+                return Err(NucleusError::CapabilityError(format!(
+                    "Final {name} capability set differs from policy"
+                )));
+            }
+        }
+
+        self.phase = CapPhase::PolicyApplied;
         info!("Successfully applied capability sets");
         Ok(())
     }
 
     /// Check if capabilities have been dropped
     pub fn is_dropped(&self) -> bool {
-        self.phase == CapPhase::Dropped
+        matches!(self.phase, CapPhase::Dropped | CapPhase::PolicyApplied)
     }
 
-    /// Verify that namespace-creating capabilities are actually absent from
-    /// the effective set. Seccomp blocks unshare, filters clone namespace flags,
-    /// and returns ENOSYS for clone3; dropping these capabilities is the
-    /// independent capability-layer guard. If the check fails in production
-    /// mode, it returns an error; otherwise it emits a warning.
-    pub fn verify_no_namespace_caps(production: bool) -> Result<()> {
-        use caps::Capability;
-        let ns_caps = [
-            Capability::CAP_SYS_ADMIN,
-            Capability::CAP_NET_ADMIN,
-            Capability::CAP_SYS_PTRACE,
-        ];
-        let effective = caps::read(None, CapSet::Effective).map_err(|e| {
-            NucleusError::CapabilityError(format!("Failed to read effective caps: {}", e))
-        })?;
-        let mut leaked = Vec::new();
-        for cap in &ns_caps {
-            if effective.contains(cap) {
-                leaked.push(format!("{:?}", cap));
+    /// Audit each capability set before handing control to a native workload.
+    pub fn verify_no_namespace_caps(_production: bool) -> Result<()> {
+        process_caps()?.verify_workload()
+    }
+}
+
+#[derive(Default, PartialEq, Eq)]
+struct ProcessCaps {
+    bounding: u64,
+    permitted: u64,
+    effective: u64,
+    inheritable: u64,
+    ambient: u64,
+}
+
+impl ProcessCaps {
+    fn verify_workload(&self) -> Result<()> {
+        let forbidden = cap_mask(super::caps_policy::DANGEROUS_CAPABILITIES);
+        for (name, value) in [
+            ("bounding", self.bounding),
+            ("permitted", self.permitted),
+            ("effective", self.effective),
+            ("inheritable", self.inheritable),
+            ("ambient", self.ambient),
+        ] {
+            if value & forbidden != 0 {
+                return Err(NucleusError::CapabilityError(format!(
+                    "Forbidden capabilities {:#x} remain in {name}",
+                    value & forbidden
+                )));
             }
-        }
-        if !leaked.is_empty() {
-            let msg = format!(
-                "SEC-CLONE3: namespace-creating capabilities still present after drop: [{}]. \
-                 seccomp denies unfilterable clone3, but these caps must still be \
-                 absent for defense in depth.",
-                leaked.join(", ")
-            );
-            if production {
-                return Err(NucleusError::CapabilityError(msg));
-            }
-            tracing::warn!("{}", msg);
         }
         Ok(())
     }
+}
+
+fn cap_mask(caps: &[Capability]) -> u64 {
+    caps.iter().fold(0, |mask, cap| mask | (cap.bitmask()))
+}
+
+/// Read the bounding and ambient masks directly. The caps crate converts
+/// per-capability prctl errors to absent bits in its set readers.
+fn kernel_masks() -> Result<(u64, u64)> {
+    let mut bounding = 0;
+    let mut ambient = 0;
+    for index in 0..=64usize {
+        // SAFETY: both queries take only integer arguments.
+        let bound = unsafe { libc::prctl(libc::PR_CAPBSET_READ, index, 0usize, 0usize, 0usize) };
+        if bound < 0 {
+            let error = std::io::Error::last_os_error();
+            if index >= 32 && error.raw_os_error() == Some(libc::EINVAL) {
+                return Ok((bounding, ambient));
+            }
+            return Err(error.into());
+        }
+        if index == 64 {
+            break;
+        }
+        let amb = unsafe {
+            libc::prctl(
+                libc::PR_CAP_AMBIENT,
+                libc::PR_CAP_AMBIENT_IS_SET as usize,
+                index,
+                0usize,
+                0usize,
+            )
+        };
+        if amb < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        bounding |= (bound as u64) << index;
+        ambient |= (amb as u64) << index;
+    }
+    Err(NucleusError::CapabilityError(
+        "Kernel capabilities exceed supported mask width".into(),
+    ))
+}
+
+fn process_caps() -> Result<ProcessCaps> {
+    let read = |set| -> Result<u64> {
+        Ok(caps::read(None, set)
+            .map_err(|e| NucleusError::CapabilityError(format!("Cannot read {set:?}: {e}")))?
+            .iter()
+            .fold(0, |mask, cap| mask | (cap.bitmask())))
+    };
+    let (bounding, ambient) = kernel_masks()?;
+    Ok(ProcessCaps {
+        bounding,
+        ambient,
+        effective: read(CapSet::Effective)?,
+        permitted: read(CapSet::Permitted)?,
+        inheritable: read(CapSet::Inheritable)?,
+    })
+}
+
+fn restrict_bounding(keep: &[Capability]) -> Result<()> {
+    let allowed = cap_mask(keep);
+    let mut remove = kernel_masks()?.0 & !allowed;
+    while remove != 0 {
+        let index = remove.trailing_zeros();
+        // SAFETY: PR_CAPBSET_DROP takes a numeric capability and no pointers.
+        if unsafe {
+            libc::prctl(
+                libc::PR_CAPBSET_DROP,
+                libc::c_ulong::from(index),
+                0usize,
+                0usize,
+                0usize,
+            )
+        } == -1
+        {
+            return Err(NucleusError::CapabilityError(format!(
+                "Cannot drop bounding capability {index}: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        remove &= remove - 1;
+    }
+    if kernel_masks()?.0 & !allowed != 0 {
+        return Err(NucleusError::CapabilityError(
+            "Bounding set exceeds the configured upper bound".into(),
+        ));
+    }
+    Ok(())
 }
 
 impl Default for CapabilityManager {
@@ -301,6 +357,63 @@ fn to_caps_hash_set(caps_list: &[Capability]) -> CapsHashSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audit_rejects_a_dangerous_bit_in_each_set() {
+        let bit = Capability::CAP_SYS_RESOURCE.bitmask();
+        for caps in [
+            ProcessCaps {
+                bounding: bit,
+                ..Default::default()
+            },
+            ProcessCaps {
+                effective: bit,
+                ..Default::default()
+            },
+            ProcessCaps {
+                permitted: bit,
+                ..Default::default()
+            },
+            ProcessCaps {
+                inheritable: bit,
+                ..Default::default()
+            },
+            ProcessCaps {
+                ambient: bit,
+                ..Default::default()
+            },
+        ] {
+            assert!(caps.verify_workload().is_err());
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a disposable privileged test thread with SETPCAP"]
+    fn custom_capability_sets_are_enforced_by_kernel() {
+        let keep = Capability::CAP_NET_BIND_SERVICE;
+        let sets = CapabilitySets {
+            bounding: vec![keep],
+            effective: vec![keep],
+            permitted: vec![keep],
+            inheritable: vec![keep],
+            ambient: vec![keep],
+        };
+        let mut manager = CapabilityManager::new();
+        manager.apply_sets(&sets).unwrap();
+        let actual = process_caps().unwrap();
+        for mask in [
+            actual.bounding,
+            actual.effective,
+            actual.permitted,
+            actual.inheritable,
+            actual.ambient,
+        ] {
+            assert_eq!(mask, keep.bitmask());
+        }
+        // SETPCAP was dropped. A stricter request must report the kernel refusal.
+        assert!(manager.drop_all().is_err());
+        assert_eq!(process_caps().unwrap().bounding, keep.bitmask());
+    }
 
     #[test]
     fn test_capability_manager_initial_state() {
