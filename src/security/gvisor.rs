@@ -399,8 +399,7 @@ impl GVisorRuntime {
         // launches when no host-side execute allowlist is active. Rootful
         // production still keeps helpers anchored on the concrete path so the
         // supervisor Landlock policy can fail closed.
-        let reexec_via_proc_self_exe =
-            rootless_handoff && !options.require_supervisor_exec_policy;
+        let reexec_via_proc_self_exe = rootless_handoff && !options.require_supervisor_exec_policy;
         let c_env = self.exec_environment(&runsc_runtime_dir, reexec_via_proc_self_exe)?;
 
         // Install an execute-only Landlock allowlist before handing control to
