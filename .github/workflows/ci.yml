@@ -45,6 +45,7 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: sudo
         run: |
           cargo test --locked --lib container::runtime::tests::host_root_rejects_foreign_bundle_and_artifact_paths -- --ignored --exact
+          cargo test --locked --lib container::state::tests::host_root_rejects_foreign_owned_state_directory -- --ignored --exact
           cargo test --locked --lib oci::tests::hook_receives_state_with_unprivileged_credentials -- --exact
 
       - name: Verify recursive bind restrictions
