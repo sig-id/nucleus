@@ -1,6 +1,9 @@
-use crate::container::{ContainerState, ProcessIdentity};
+use crate::container::{ContainerState, ContainerStateManager, ProcessIdentity};
 use crate::error::{NucleusError, Result};
-use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
+use crate::resources::Cgroup;
+use crate::security::{NativeSeccomp, SeccompManager};
+use nix::sys::signal::{kill, killpg, Signal};
+use nix::sys::wait::{waitid, waitpid, Id, WaitPidFlag, WaitStatus};
 use nix::unistd::{fork, ForkResult, Pid};
 use std::ffi::CString;
 use std::fs::File;
@@ -56,7 +59,9 @@ impl ContainerAttach {
         let pid = state.pid;
         info!("Attaching to container {} (PID {})", state.id, pid);
 
+        let policy = Self::saved_policy(state)?;
         let ns_fds = Self::open_namespace_fds(pid, state.rootless)?;
+        Self::verify_target(state)?;
 
         // Fork child
         match unsafe { fork() }
@@ -68,7 +73,7 @@ impl ContainerAttach {
             }
             ForkResult::Child => {
                 // Child: enter namespaces and exec
-                match Self::enter_and_exec(&ns_fds, &command) {
+                match Self::enter_and_exec(state, policy, &ns_fds, &command) {
                     Ok(_) => unreachable!(),
                     Err(e) => {
                         eprintln!("Attach failed: {}", e);
@@ -79,15 +84,34 @@ impl ContainerAttach {
         }
     }
 
-    fn enter_and_exec(ns_fds: &[(String, File)], command: &[String]) -> Result<()> {
+    fn saved_policy(state: &ContainerState) -> Result<&NativeSeccomp> {
+        state.native_seccomp.as_ref().ok_or_else(|| NucleusError::AttachError(
+            "Launch seccomp policy unavailable. Recreate the container to enable native helpers.".into()))
+    }
+
+    fn verify_target(state: &ContainerState) -> Result<()> {
+        if !state.is_running() {
+            return Err(NucleusError::AttachError(
+                "Target process exited or changed during helper setup".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn enter_and_exec(
+        state: &ContainerState,
+        policy: &NativeSeccomp,
+        ns_fds: &[(String, File)],
+        command: &[String],
+    ) -> Result<()> {
         if command.is_empty() {
             return Err(NucleusError::AttachError(
                 "No command specified for attach".to_string(),
             ));
         }
 
-        Self::enter_namespaces(ns_fds)?;
-        Self::apply_exec_hardening()?;
+        Self::enter_namespaces(state, ns_fds)?;
+        Self::apply_exec_hardening(state, policy)?;
         let env = Self::default_exec_env()?;
         Self::exec_with_env(command, &env)
     }
@@ -104,23 +128,29 @@ impl ContainerAttach {
             let ns_path = format!("/proc/{}/ns/{}", pid, ns);
             match File::open(&ns_path) {
                 Ok(f) => ns_fds.push(((*ns).to_string(), f)),
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::NotFound
+                        && *ns != "pid"
+                        && *ns != "user" =>
+                {
+                    info!("Skipping unavailable namespace {}: {}", ns, e);
+                }
                 Err(e) => {
-                    // Some namespaces may not be available
-                    info!("Skipping namespace {}: {}", ns, e);
+                    return Err(NucleusError::AttachError(format!(
+                        "Failed to open {}: {}",
+                        ns_path, e
+                    )))
                 }
             }
-        }
-
-        if ns_fds.is_empty() {
-            return Err(NucleusError::AttachError(
-                "Could not open any namespace FDs".to_string(),
-            ));
         }
 
         Ok(ns_fds)
     }
 
-    fn enter_namespaces(ns_fds: &[(String, File)]) -> Result<()> {
+    fn enter_namespaces(state: &ContainerState, ns_fds: &[(String, File)]) -> Result<()> {
+        if let Some(path) = &state.cgroup_path {
+            Cgroup::join_existing(path.as_ref())?;
+        }
         // Enter user namespace first (required before other setns calls in
         // rootless containers), then non-PID namespaces.
         // PID namespace membership only applies to future children after setns().
@@ -202,7 +232,7 @@ impl ContainerAttach {
         Ok(())
     }
 
-    fn apply_exec_hardening() -> Result<()> {
+    fn apply_exec_hardening(state: &ContainerState, policy: &NativeSeccomp) -> Result<()> {
         // Apply security hardening before exec: no_new_privs + capability drop +
         // seccomp + Landlock (C4: attach/exec path must match container security).
         // SAFETY: PR_SET_NO_NEW_PRIVS with arg 1 is always safe to call; it only
@@ -216,17 +246,27 @@ impl ContainerAttach {
         }
 
         let mut cap_mgr = crate::security::CapabilityManager::new();
-        cap_mgr.drop_all().map_err(|e| {
-            NucleusError::AttachError(format!("Failed to drop capabilities: {}", e))
-        })?;
-
-        // Apply seccomp filter to match container's syscall restrictions
-        let mut seccomp_mgr = crate::security::SeccompManager::new();
-        if let Err(e) = seccomp_mgr.apply_minimal_filter() {
-            tracing::warn!(
-                "Failed to apply seccomp filter on attach: {} (continuing)",
-                e
-            );
+        cap_mgr.drop_bounding_set()?;
+        crate::container::Container::apply_process_identity_to_current_process(
+            &ProcessIdentity {
+                uid: state.process_uid,
+                gid: state.process_gid,
+                additional_gids: state.additional_gids.clone(),
+            },
+            state.rootless,
+        )?;
+        cap_mgr.finalize_drop()?;
+        if let Some(max) = state.pids_max {
+            // Preserve any tighter limits the caller already had.
+            let mut limits = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            // SAFETY: limits is writable, then initialized by getrlimit.
+            nix::errno::Errno::result(unsafe { libc::getrlimit(libc::RLIMIT_NPROC, &mut limits) })?;
+            limits.rlim_cur = limits.rlim_cur.min(max);
+            limits.rlim_max = limits.rlim_max.min(max);
+            nix::errno::Errno::result(unsafe { libc::setrlimit(libc::RLIMIT_NPROC, &limits) })?;
         }
 
         // Apply Landlock filesystem restrictions
@@ -235,7 +275,8 @@ impl ContainerAttach {
             tracing::warn!("Failed to apply Landlock on attach: {} (continuing)", e);
         }
 
-        Ok(())
+        // Install last. A service profile can deny the setup syscalls themselves.
+        policy.apply()
     }
 
     fn default_exec_env() -> Result<Vec<CString>> {
@@ -317,13 +358,41 @@ impl NamespaceCommandRunner {
         process_identity: Option<&ProcessIdentity>,
         timeout: Option<Duration>,
     ) -> Result<bool> {
-        if using_gvisor {
+        // PID-only callers resolve the launch record from the configured state root.
+        // Internal callers already hold the record and also support --root overrides.
+        let state = ContainerStateManager::new()?
+            .list_running()?
+            .into_iter()
+            .find(|s| s.pid == pid && s.rootless == rootless && s.using_gvisor == using_gvisor)
+            .ok_or_else(|| {
+                NucleusError::ExecError("Missing running container state for probe".into())
+            })?;
+        if let Some(identity) = process_identity {
+            if identity.uid != state.process_uid
+                || identity.gid != state.process_gid
+                || identity.additional_gids != state.additional_gids
+            {
+                return Err(NucleusError::ExecError(
+                    "Probe identity differs from the workload".into(),
+                ));
+            }
+        }
+        Self::run_in_container(&state, probe, timeout)
+    }
+
+    pub fn run_in_container(
+        state: &ContainerState,
+        probe: NamespaceProbe,
+        timeout: Option<Duration>,
+    ) -> Result<bool> {
+        if state.using_gvisor {
             return Err(NucleusError::ExecError(
-                "Namespace-local exec probes are unsupported for gVisor containers".to_string(),
+                "Namespace-local probes are unsupported for gVisor containers".into(),
             ));
         }
-
-        let ns_fds = ContainerAttach::open_namespace_fds(pid, rootless)?;
+        let policy = ContainerAttach::saved_policy(state)?;
+        let ns_fds = ContainerAttach::open_namespace_fds(state.pid, state.rootless)?;
+        ContainerAttach::verify_target(state)?;
 
         match unsafe { fork() }.map_err(|e| {
             NucleusError::ExecError(format!("Failed to fork namespace helper: {}", e))
@@ -331,7 +400,7 @@ impl NamespaceCommandRunner {
             ForkResult::Parent { child } => Self::wait_for_probe(child, timeout),
             ForkResult::Child => {
                 let exit_code =
-                    match Self::enter_and_run(&ns_fds, probe, process_identity, rootless) {
+                    match Self::enter_and_run(state, policy, &ns_fds, probe, timeout.is_some()) {
                         Ok(true) => 0,
                         Ok(false) => 1,
                         Err(e) => {
@@ -345,21 +414,22 @@ impl NamespaceCommandRunner {
     }
 
     fn enter_and_run(
+        state: &ContainerState,
+        policy: &NativeSeccomp,
         ns_fds: &[(String, File)],
         probe: NamespaceProbe,
-        process_identity: Option<&ProcessIdentity>,
-        rootless: bool,
+        timed: bool,
     ) -> Result<bool> {
-        ContainerAttach::enter_namespaces(ns_fds)?;
-        ContainerAttach::apply_exec_hardening()?;
+        if timed {
+            // A fresh session excludes unrelated processes from the group.
+            nix::unistd::setsid()?;
+            SeccompManager::confine_probe_process_group()?;
+        }
+        ContainerAttach::enter_namespaces(state, ns_fds)?;
+        ContainerAttach::apply_exec_hardening(state, policy)?;
 
         match probe {
             NamespaceProbe::Exec(command) => {
-                if let Some(identity) = process_identity {
-                    crate::container::Container::apply_process_identity_to_current_process(
-                        identity, rootless,
-                    )?;
-                }
                 let env = ContainerAttach::default_exec_env()?;
                 ContainerAttach::exec_with_env(&command, &env)?;
                 unreachable!()
@@ -372,30 +442,154 @@ impl NamespaceCommandRunner {
     }
 
     fn wait_for_probe(child: Pid, timeout: Option<Duration>) -> Result<bool> {
+        let Some(limit) = timeout else {
+            return Ok(ContainerAttach::wait_for_child(child)? == 0);
+        };
         let start = Instant::now();
-        loop {
-            match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
-                Ok(WaitStatus::StillAlive) => {
-                    if let Some(limit) = timeout {
-                        if start.elapsed() >= limit {
-                            let _ =
-                                nix::sys::signal::kill(child, nix::sys::signal::Signal::SIGKILL);
-                            let _ = waitpid(child, None);
-                            return Ok(false);
+        // Keep the session leader waitable until group cleanup completes. This
+        // pins the numeric PGID even if the command has already returned.
+        let flags = WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT;
+        let success = loop {
+            match waitid(Id::Pid(child), flags) {
+                Ok(WaitStatus::StillAlive) if start.elapsed() < limit => {
+                    thread::sleep(
+                        Duration::from_millis(50).min(limit.saturating_sub(start.elapsed())),
+                    );
+                }
+                Ok(WaitStatus::StillAlive) => break false,
+                Ok(WaitStatus::Exited(_, code)) => break code == 0,
+                Ok(WaitStatus::Signaled(..)) => break false,
+                Err(nix::errno::Errno::EINTR) => continue,
+                Err(e) => return Err(e.into()),
+                _ => continue,
+            }
+        };
+        // A timeout can precede setsid(). Stop the leader first so it cannot
+        // create a session or fork after the group signal.
+        match kill(child, Signal::SIGKILL) {
+            Ok(()) | Err(nix::errno::Errno::ESRCH) => (),
+            Err(e) => return Err(e.into()),
+        }
+        let group_result = killpg(child, Signal::SIGKILL);
+        ContainerAttach::wait_for_child(child)?;
+        if group_result != Err(nix::errno::Errno::ESRCH) {
+            group_result?;
+        }
+        Ok(success)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::os::unix::process::CommandExt;
+    use std::process::Command;
+
+    #[test]
+    fn missing_launch_policy_and_invalid_cgroup_fail_closed() {
+        use crate::container::{ContainerStateParams, OciStatus};
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = ContainerState::new(ContainerStateParams {
+            id: "helper".into(),
+            name: "helper".into(),
+            pid: std::process::id(),
+            command: vec![],
+            memory_limit: None,
+            cpu_limit: None,
+            using_gvisor: false,
+            rootless: false,
+            cgroup_path: Some(dir.path().display().to_string()),
+            process_uid: 0,
+            process_gid: 0,
+            additional_gids: vec![],
+        });
+        state.status = OciStatus::Running;
+        let mut legacy = serde_json::to_value(&state).unwrap();
+        legacy.as_object_mut().unwrap().remove("native_seccomp");
+        let legacy = serde_json::from_value(legacy).unwrap();
+        assert!(ContainerAttach::attach(&legacy, vec![])
+            .unwrap_err()
+            .to_string()
+            .contains("Launch seccomp policy unavailable"));
+        assert!(NamespaceCommandRunner::run_in_container(
+            &legacy,
+            NamespaceProbe::TcpConnect(1),
+            None
+        )
+        .is_err());
+
+        // A missing or substituted cgroup must stop setup before setns/fork.
+        let procs = dir.path().join("cgroup.procs");
+        for regular_file in [false, true] {
+            if regular_file {
+                fs::write(&procs, "untouched").unwrap();
+            }
+            assert!(matches!(
+                ContainerAttach::enter_namespaces(&state, &[]),
+                Err(NucleusError::CgroupError(_))
+            ));
+        }
+        assert_eq!(fs::read_to_string(procs).unwrap(), "untouched");
+    }
+
+    #[test]
+    fn timed_probe_cleans_up_descendants() {
+        const FIXTURE: &str = "NUCLEUS_TIMEOUT_TEST_MARKER";
+        if let Some(marker) = std::env::var_os(FIXTURE) {
+            nix::unistd::setsid().unwrap();
+            SeccompManager::confine_probe_process_group().unwrap();
+            let mut command = Command::new("/bin/sh");
+            command
+                .args(["-c", "sleep 30 & echo \"$$ $!\" > \"$1\"; wait", "probe"])
+                .arg(marker);
+            // Verify the inherited restrictions in a non-leader before exec.
+            unsafe {
+                command.pre_exec(|| {
+                    for rc in [libc::setsid(), libc::setpgid(0, 0)] {
+                        if rc != -1 || nix::errno::Errno::last() != nix::errno::Errno::EPERM {
+                            return Err(std::io::Error::other("probe group confinement missing"));
                         }
                     }
-                    thread::sleep(Duration::from_millis(50));
+                    Ok(())
+                });
+            }
+            command.status().unwrap();
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("children");
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "isolation::attach::tests::timed_probe_cleans_up_descendants",
+            ])
+            .env(FIXTURE, &marker)
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let pids = loop {
+            if let Some(pids) = fs::read_to_string(&marker)
+                .ok()
+                .filter(|s| s.split_whitespace().count() == 2)
+            {
+                break pids;
+            }
+            assert!(child.try_wait().unwrap().is_none(), "probe fixture exited");
+            assert!(Instant::now() < deadline, "probe fixture did not start");
+            thread::sleep(Duration::from_millis(10));
+        };
+        let child_pid = Pid::from_raw(child.id() as i32);
+        assert!(!NamespaceCommandRunner::wait_for_probe(child_pid, Some(Duration::ZERO)).unwrap());
+        for pid in pids.split_whitespace() {
+            let path = format!("/proc/{pid}/stat");
+            while let Ok(stat) = fs::read_to_string(&path) {
+                if stat.rsplit_once(") ").unwrap().1.starts_with('Z') {
+                    break;
                 }
-                Ok(WaitStatus::Exited(_, code)) => return Ok(code == 0),
-                Ok(WaitStatus::Signaled(_, _, _)) => return Ok(false),
-                Err(nix::errno::Errno::EINTR) => continue,
-                Err(e) => {
-                    return Err(NucleusError::ExecError(format!(
-                        "Failed waiting for namespace helper: {}",
-                        e
-                    )));
-                }
-                _ => continue,
+                assert!(Instant::now() < deadline, "probe descendant {pid} survived");
+                thread::sleep(Duration::from_millis(10));
             }
         }
     }

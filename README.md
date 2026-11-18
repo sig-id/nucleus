@@ -1196,7 +1196,8 @@ Events include a container start record and a final summary record. The records 
 
 ## Additional Hardening Flags
 
-- `--seccomp-profile <path>` loads a custom per-service seccomp profile (OCI JSON format).
+- `--seccomp-profile <path>` loads a custom per-service seccomp profile (OCI JSON format). Native allow rules for `clone` combine the supplied argument predicates with the built-in namespace mask. The native loader rejects unsupported argument rules.
+- Native attach, exec probes, and TCP readiness probes reuse the seccomp program recorded at launch and join the configured workload cgroup. Recreate containers launched by older versions before using these helpers. Timed probe descendants share a private process group until cleanup. Calls to `setsid` and `setpgid` from these probes return `EPERM` when the workload filter permits the call.
 - `--seccomp-profile-sha256 <hex>` verifies the profile's SHA-256 hash before loading.
 - `--seccomp-mode trace|enforce` switches between trace (record all syscalls) and enforce (default).
 - `--seccomp-log <path>` writes NDJSON syscall trace when in trace mode.
