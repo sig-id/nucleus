@@ -1,6 +1,6 @@
 use crate::error::{NucleusError, Result};
 use std::fs;
-use std::os::unix::fs::{symlink, PermissionsExt};
+use std::os::unix::fs::{symlink, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use tracing::{debug, warn};
 
@@ -212,7 +212,7 @@ fn copy_entry(src: &Path, dst: &Path, metadata: &fs::Metadata, depth: u32) -> Re
         }
         fs::set_permissions(
             dst,
-            fs::Permissions::from_mode(metadata.permissions().mode()),
+            fs::Permissions::from_mode(metadata.permissions().mode() & 0o1777),
         )
         .map_err(|e| {
             NucleusError::FilesystemError(format!(
@@ -221,31 +221,28 @@ fn copy_entry(src: &Path, dst: &Path, metadata: &fs::Metadata, depth: u32) -> Re
             ))
         })?;
     } else if metadata.is_file() {
-        if let Some(parent) = dst.parent() {
-            fs::create_dir_all(parent).map_err(|e| {
-                NucleusError::FilesystemError(format!(
-                    "Failed to create workspace file parent {:?}: {}",
-                    parent, e
-                ))
-            })?;
+        // fs::copy also copies permission bits. Stream only the contents into
+        // a fresh private inode, then publish it with the sanitized mode.
+        let mut from = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(src)?;
+        let metadata = from.metadata()?;
+        if !metadata.is_file() {
+            return Err(NucleusError::FilesystemError(format!(
+                "Workspace entry is no longer a regular file: {src:?}"
+            )));
         }
-        remove_existing_path(dst)?;
-        fs::copy(src, dst).map_err(|e| {
-            NucleusError::FilesystemError(format!(
-                "Failed to copy workspace file {:?} to {:?}: {}",
-                src, dst, e
-            ))
-        })?;
-        fs::set_permissions(
-            dst,
-            fs::Permissions::from_mode(metadata.permissions().mode()),
-        )
-        .map_err(|e| {
-            NucleusError::FilesystemError(format!(
-                "Failed to set permissions on workspace file {:?}: {}",
-                dst, e
-            ))
-        })?;
+        let mut file =
+            tempfile::NamedTempFile::new_in(dst.parent().expect("workspace entry has a parent"))?;
+        std::io::copy(&mut from, &mut file)?;
+        file.as_file().set_permissions(fs::Permissions::from_mode(
+            metadata.permissions().mode() & 0o1777,
+        ))?;
+        if fs::symlink_metadata(dst).is_ok_and(|existing| existing.is_dir()) {
+            fs::remove_dir_all(dst)?;
+        }
+        file.persist(dst).map_err(|e| e.error)?;
     } else if metadata.file_type().is_symlink() {
         let target = fs::read_link(src).map_err(|e| {
             NucleusError::FilesystemError(format!(
@@ -350,6 +347,42 @@ mod tests {
             "created"
         );
         assert!(!host.path().join("delete.txt").exists());
+    }
+
+    #[test]
+    fn workspace_copy_strips_setid_from_files_and_directories() {
+        let host = tempfile::tempdir().unwrap();
+        let stage = tempfile::tempdir().unwrap();
+        let modes = [(0o4751, 0o751), (0o2640, 0o640), (0o6755, 0o755)];
+        let check = |root: &Path| {
+            assert_eq!(
+                fs::metadata(root.join("sub")).unwrap().permissions().mode() & 0o7777,
+                0o1750
+            );
+            for (i, (_, want)) in modes.iter().enumerate() {
+                let path = root.join("sub").join(i.to_string());
+                assert_eq!(
+                    fs::metadata(path).unwrap().permissions().mode() & 0o7777,
+                    *want
+                );
+            }
+        };
+        let set_modes = |root: &Path| {
+            let dir = root.join("sub");
+            fs::create_dir_all(&dir).unwrap();
+            for (i, (mode, _)) in modes.iter().enumerate() {
+                let path = dir.join(i.to_string());
+                fs::write(&path, b"workspace fixture").unwrap();
+                fs::set_permissions(path, fs::Permissions::from_mode(*mode)).unwrap();
+            }
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o7750)).unwrap();
+        };
+        set_modes(host.path());
+        copy_workspace_in(host.path(), stage.path()).unwrap();
+        check(stage.path());
+        set_modes(stage.path());
+        sync_workspace_out(stage.path(), host.path()).unwrap();
+        check(host.path());
     }
 
     #[test]

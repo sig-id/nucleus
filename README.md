@@ -293,7 +293,7 @@ process cwd defaults to `/workspace` via `--workdir /workspace`.
 |---|---|
 | `bind-rw` | Bind mount the host path read-write at `/workspace` (default). |
 | `bind-ro` | Bind mount the host path read-only at `/workspace`. |
-| `copy-in-out` | Copy the host path into a private staging directory, run against that staged tree, then sync changes back after exit. |
+| `copy-in-out` | Copy the host path into a private staging directory, run against that staged tree, then sync changes back after exit. Both directions strip set-user-ID and set-group-ID bits. |
 
 Workspace mounts are `nosuid,nodev,noexec` by default and native Landlock denies
 execution from `/workspace`. Use `--workspace-exec` for agent-mode workflows
@@ -1036,7 +1036,7 @@ the CLI `nucleus image commit` workflow.
 
 **Protect the local image signing key.** Runtime-committed image directories are verified with the host-local HMAC key selected by `NUCLEUS_IMAGE_HMAC_KEY_FILE` or the default owner-only key path. Treat that file like deployment signing material: do not share it across trust domains unless those hosts should be able to trust and produce each other's local image snapshots.
 
-**Privilege dropping is explicit.** Nucleus must start with elevated privileges to create namespaces, mount filesystems, and configure cgroups/networking. Use `--user` / `--group` (or the NixOS module's `user` / `group` options) so the workload itself does not continue running as root after setup. In production mode, staged secrets under `/run/secrets` are re-owned to that workload identity.
+**Workload identity.** When host root launches a default agent, Nucleus maps container UID/GID 0 to host UID/GID 100000. Host bind mounts use the mapped identity for permission checks. To run an agent with an existing unprivileged host identity, pass its nonzero `--user` and `--group`. With `--workspace-mode copy-in-out`, the workload edits a private copy owned by its mapped identity.
 
 **Agent mode is not hardened.** By design, agent mode applies several security mechanisms on a best-effort basis: seccomp and Landlock failures are warn-and-continue (with `--allow-degraded-security`), chroot fallback is available (with `--allow-chroot-fallback`), bridge DNS defaults to public resolvers (`8.8.8.8`), and cgroup creation failures are non-fatal. Operators requiring strict isolation for ephemeral workloads should use `--service-mode strict-agent`; operators deploying long-running NixOS services should use production mode.
 
@@ -1055,7 +1055,7 @@ the CLI `nucleus image commit` workflow.
 | Egress policy | Optional | Optional | Deny-all default where enforceable; unavailable with `gvisor-host` |
 | Memory limit | Optional | Optional | Required |
 | PID 1 init | Direct exec | Direct exec | Mini-init with zombie reaping + signal forwarding |
-| Workload uid/gid | Root by default | User namespace remapping required when running as host root | Configurable post-setup drop via `--user` / `--group` |
+| Workload uid/gid | Container root maps to host UID/GID 100000 by default when launched as root | User namespace remapping required when running as host root | Configurable post-setup drop via `--user` / `--group` |
 | Secrets | In-memory tmpfs | In-memory tmpfs | In-memory tmpfs with volatile zeroing |
 | /proc | Mounted normally | Mounted normally | `hidepid=2` (hides other processes) |
 | Mount audit | Skipped | Skipped | Post-setup flag verification (fatal) |

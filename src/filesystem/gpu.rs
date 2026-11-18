@@ -554,21 +554,27 @@ pub fn mount_gpu_passthrough(
     config: &GpuPassthroughConfig,
     identity: &ProcessIdentity,
 ) -> Result<GpuMountResult> {
-    use nix::mount::{mount, MsFlags};
-
-    let mut result = GpuMountResult {
+    let bound_devices = create_gpu_nodes(root, set, identity)?;
+    let bound_support = mount_gpu_support(root, set, config)?;
+    Ok(GpuMountResult {
+        bound_devices,
+        bound_support,
         nvidia: set.nvidia,
         amd: set.amd,
         intel: set.intel,
-        ..Default::default()
-    };
+    })
+}
 
+pub(crate) fn create_gpu_nodes(
+    root: &Path,
+    set: &GpuDeviceSet,
+    identity: &ProcessIdentity,
+) -> Result<Vec<(PathBuf, PathBuf)>> {
+    let mut devices = Vec::new();
     let dev_path = root.join("dev");
     std::fs::create_dir_all(&dev_path).map_err(|e| {
         NucleusError::FilesystemError(format!("Failed to create container /dev: {}", e))
     })?;
-
-    let bind_flags = MsFlags::MS_BIND | MsFlags::MS_REC;
 
     for host_node in &set.nodes {
         // Mirror the host path under the container /dev.
@@ -586,7 +592,7 @@ pub fn mount_gpu_passthrough(
 
         create_gpu_device_node(&host_node, &target, identity)?;
 
-        result.bound_devices.push((
+        devices.push((
             host_node.clone(),
             target.strip_prefix(root).unwrap_or(&target).to_path_buf(),
         ));
@@ -597,6 +603,17 @@ pub fn mount_gpu_passthrough(
         );
     }
 
+    Ok(devices)
+}
+
+pub(crate) fn mount_gpu_support(
+    root: &Path,
+    set: &GpuDeviceSet,
+    config: &GpuPassthroughConfig,
+) -> Result<Vec<PathBuf>> {
+    use nix::mount::{mount, MsFlags};
+    let bind_flags = MsFlags::MS_BIND | MsFlags::MS_REC;
+    let mut bound_support = Vec::new();
     // Driver support files (NVIDIA /proc, lib dirs, ICD JSON; ROCm /opt/rocm).
     for support in support_paths(set, config.bind_driver_libraries) {
         let rel = support.strip_prefix("/").unwrap_or(support.as_path());
@@ -648,13 +665,11 @@ pub fn mount_gpu_passthrough(
         })
         .ok();
 
-        result
-            .bound_support
-            .push(target.strip_prefix(root).unwrap_or(&target).to_path_buf());
+        bound_support.push(target.strip_prefix(root).unwrap_or(&target).to_path_buf());
         debug!("Bound GPU support {:?}", support);
     }
 
-    Ok(result)
+    Ok(bound_support)
 }
 
 fn gpu_device_target(root: &Path, host_node: &Path) -> Result<PathBuf> {

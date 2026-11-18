@@ -577,6 +577,9 @@ fn apply_userns(
     // requested workload uid maps to the caller's own uid and host-owned bind
     // mounts keep working. This turns a hard failure into success (no
     // regression for the nomap + run-as-container-root path).
+    if nix::unistd::Uid::effective().is_root() && userns == UsernsModeArg::NoMap {
+        return Ok(config.with_rootless());
+    }
     let mapping = match userns {
         UsernsModeArg::KeepId => UserNamespaceConfig::keep_id()
             .map_err(|e| NucleusError::ConfigError(format!("--userns=keep-id: {e}")))?,
