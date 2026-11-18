@@ -130,7 +130,7 @@ impl GVisorRuntime {
     ///
     /// This checks for runsc binary availability
     pub fn new() -> Result<Self> {
-        let runsc_path = Self::find_runsc()?;
+        let runsc_path = Self::resolve_path()?;
         info!("Found runsc at: {}", runsc_path);
         Ok(Self { runsc_path })
     }
@@ -148,19 +148,24 @@ impl GVisorRuntime {
     /// Call this before fork/unshare so the path is resolved while
     /// still unprivileged.
     pub fn resolve_path() -> Result<String> {
-        Self::find_runsc()
+        let path = Self::find_runsc()?;
+        Self::check_runsc_version(Path::new(&path))?;
+        Ok(path)
     }
 
     /// Find the runsc binary
     fn find_runsc() -> Result<String> {
         // Try common locations
-        let paths = vec![
+        let paths = [
             "/usr/local/bin/runsc",
             "/usr/bin/runsc",
             "/opt/gvisor/runsc",
         ];
 
-        for path in &paths {
+        for path in option_env!("NUCLEUS_PACKAGED_RUNSC")
+            .into_iter()
+            .chain(paths)
+        {
             if let Some(validated) = Self::validate_runsc_path(Path::new(path))? {
                 return Ok(validated);
             }
@@ -353,7 +358,10 @@ impl GVisorRuntime {
 
         let (program_path, mut exec_allow_roots) =
             self.prepare_supervisor_runsc_program(&runsc_root, options.stage_runsc_binary)?;
-        if options.runsc_rootless {
+        // Cover explicit paths and check the actual staged image before execution.
+        Self::check_runsc_version(&program_path)?;
+        let rootless_handoff = options.runsc_rootless || !Uid::effective().is_root();
+        if rootless_handoff {
             exec_allow_roots.extend(Self::rootless_userns_helper_exec_roots());
         }
 
@@ -392,7 +400,7 @@ impl GVisorRuntime {
         // production still keeps helpers anchored on the concrete path so the
         // supervisor Landlock policy can fail closed.
         let reexec_via_proc_self_exe =
-            options.runsc_rootless && !options.require_supervisor_exec_policy;
+            rootless_handoff && !options.require_supervisor_exec_policy;
         let c_env = self.exec_environment(&runsc_runtime_dir, reexec_via_proc_self_exe)?;
 
         // Install an execute-only Landlock allowlist before handing control to
@@ -443,12 +451,44 @@ impl GVisorRuntime {
 
     /// Check if gVisor is available on this system
     pub fn is_available() -> bool {
-        Self::find_runsc().is_ok()
+        Self::resolve_path().is_ok()
     }
 
     /// Get runsc version
     pub fn version(&self) -> Result<String> {
-        let output = Command::new(&self.runsc_path)
+        Self::runsc_version(Path::new(&self.runsc_path))
+    }
+
+    fn check_runsc_version(path: &Path) -> Result<()> {
+        let output = Self::runsc_version(path)?;
+        // Official binaries report "runsc version release-YYYYMMDD.N".
+        // Some distributions omit the release- prefix. Ignore the OCI spec line.
+        let release = output
+            .lines()
+            .next()
+            .and_then(|line| line.strip_prefix("runsc version "));
+        let supported = release
+            .map(|v| v.strip_prefix("release-").unwrap_or(v))
+            .and_then(|v| v.split_once('.'))
+            .is_some_and(|(date, revision)| {
+                date.len() == 8
+                    && date.bytes().all(|b| b.is_ascii_digit())
+                    && date >= "20260831"
+                    && !revision.is_empty()
+                    && revision.bytes().all(|b| b.is_ascii_digit())
+            });
+        if !supported {
+            return Err(NucleusError::GVisorError(format!(
+                "runsc at {} requires a verifiable release >= 20260831.0 (CVE-2026-95702), got {:?}",
+                path.display(), output.lines().next().unwrap_or("")
+            )));
+        }
+        Ok(())
+    }
+
+    fn runsc_version(path: &Path) -> Result<String> {
+        let output = Command::new(path)
+            .env_clear()
             .arg("--version")
             .output()
             .map_err(|e| NucleusError::GVisorError(format!("Failed to get version: {}", e)))?;
@@ -555,7 +595,28 @@ impl GVisorRuntime {
         // over broader host paths when a supervisor policy is installed.
         let stage_dir = Self::create_unique_runsc_stage_dir(&private_dir)?;
         let staged = stage_dir.join("runsc");
-        Self::copy_runsc_nofollow(&canonical, &staged)?;
+        let owner = fs::metadata(&canonical)?.uid();
+        Self::copy_runsc_nofollow(&canonical, &staged, owner)?;
+        // Recent releases execute sibling helpers from gvisor-bin. Keep them
+        // alongside the private copy without granting execute over /usr/bin.
+        let sidecars = canonical.with_file_name("gvisor-bin");
+        match fs::symlink_metadata(&sidecars) {
+            Ok(meta) => {
+                if !meta.is_dir() || meta.uid() != owner || meta.mode() & 0o022 != 0 {
+                    return Err(NucleusError::GVisorError(format!(
+                        "Untrusted runsc sidecar directory {sidecars:?}"
+                    )));
+                }
+                let dest = stage_dir.join("gvisor-bin");
+                DirBuilder::new().mode(0o700).create(&dest)?;
+                for entry in fs::read_dir(sidecars)? {
+                    let entry = entry?;
+                    Self::copy_runsc_nofollow(&entry.path(), &dest.join(entry.file_name()), owner)?;
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
 
         Ok((staged, Self::supervisor_exec_allow_roots(private_dir)))
     }
@@ -976,10 +1037,10 @@ impl GVisorRuntime {
         )))
     }
 
-    fn copy_runsc_nofollow(source: &Path, staged: &Path) -> Result<()> {
+    fn copy_runsc_nofollow(source: &Path, staged: &Path, owner: u32) -> Result<()> {
         let mut source_file = OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_CLOEXEC)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
             .open(source)
             .map_err(|e| {
                 NucleusError::GVisorError(format!(
@@ -991,9 +1052,13 @@ impl GVisorRuntime {
         let source_meta = source_file.metadata().map_err(|e| {
             NucleusError::GVisorError(format!("Failed to stat runsc source {:?}: {}", source, e))
         })?;
-        if !source_meta.file_type().is_file() {
+        if !source_meta.is_file()
+            || source_meta.uid() != owner
+            || source_meta.mode() & 0o022 != 0
+            || source_meta.mode() & 0o111 == 0
+        {
             return Err(NucleusError::GVisorError(format!(
-                "runsc source {:?} is not a regular file",
+                "Untrusted runsc executable {:?}",
                 source
             )));
         }
@@ -1210,6 +1275,29 @@ mod tests {
     }
 
     #[test]
+    fn runsc_version_gate_checks_the_release_line_and_exit_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("runsc");
+        for (label, exit, supported) in [
+            ("release-20260831.0", 0, true),
+            ("20261116.0", 0, true),
+            ("release-20260406.0", 0, false),
+            ("20260830.99", 0, false),
+            ("VERSION_MISSING", 0, false),
+            ("20260831.0-rc1", 0, false),
+            ("20261116.0", 1, false),
+        ] {
+            fs::write(&binary, format!("#!/bin/sh\n[ \"$1\" = --version ] || exit 2\necho 'runsc version {label}'\necho 'spec: 20261116.0'\nexit {exit}\n")).unwrap();
+            fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+            assert_eq!(
+                GVisorRuntime::check_runsc_version(&binary).is_ok(),
+                supported,
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
     fn test_validate_runsc_rejects_world_writable() {
         let dir = tempfile::tempdir().unwrap();
         let fake_runsc = dir.path().join("runsc");
@@ -1372,7 +1460,7 @@ mod tests {
             "runsc --rootless must not force the host-side supervisor execute policy"
         );
         assert!(
-            fn_body.contains("options.runsc_rootless && !options.require_supervisor_exec_policy"),
+            fn_body.contains("rootless_handoff && !options.require_supervisor_exec_policy"),
             "rootless runsc must use /proc/self/exe helper re-exec only without supervisor policy"
         );
     }
@@ -1490,6 +1578,11 @@ mod tests {
         std::fs::write(&fake_runsc, b"fake-runsc").unwrap();
         std::fs::set_permissions(&fake_runsc, std::fs::Permissions::from_mode(0o500)).unwrap();
 
+        let sidecars = tmp.path().join("gvisor-bin");
+        fs::create_dir(&sidecars).unwrap();
+        let sentry = sidecars.join("gvisor_sentry");
+        fs::write(&sentry, b"sentry").unwrap();
+        fs::set_permissions(sentry, fs::Permissions::from_mode(0o500)).unwrap();
         let rt = GVisorRuntime::with_path(fake_runsc.to_string_lossy().to_string());
         let runsc_root = tmp.path().join("runsc-root");
         let (program, allow_roots) = rt
@@ -1499,6 +1592,10 @@ mod tests {
         assert!(program.starts_with(runsc_root.join("exec-allow")));
         assert_eq!(allow_roots, vec![runsc_root.join("exec-allow")]);
         assert_eq!(std::fs::read(&program).unwrap(), b"fake-runsc");
+        assert_eq!(
+            fs::read(program.with_file_name("gvisor-bin").join("gvisor_sentry")).unwrap(),
+            b"sentry"
+        );
         let mode = std::fs::metadata(&program).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o500);
     }

@@ -1700,6 +1700,14 @@ impl ContainerConfig {
         }
 
         self.validate_credential_broker()?;
+        if self.use_gvisor
+            && matches!(self.network, crate::network::NetworkMode::Bridge(_))
+            && self.egress_policy.is_some()
+        {
+            return Err(crate::error::NucleusError::ConfigError(
+                "gVisor bridge netstack transmits at the link layer and cannot enforce Nucleus iptables OUTPUT egress rules".into(),
+            ));
+        }
 
         if self.rootfs_mode == RootfsMode::Overlay {
             if self.rootfs_path.is_none() {
@@ -1894,6 +1902,20 @@ mod tests {
     }
 
     #[test]
+    fn gvisor_netstack_rejects_namespace_output_policy() {
+        let config = ContainerConfig::try_new(None, vec!["/bin/true".into()])
+            .unwrap()
+            .with_gvisor(true)
+            .with_network(NetworkMode::Bridge(crate::network::BridgeConfig::default()))
+            .with_egress_policy(EgressPolicy::default());
+        assert!(config
+            .validate_runtime_support()
+            .unwrap_err()
+            .to_string()
+            .contains("OUTPUT"));
+    }
+
+    #[test]
     fn test_config_security_defaults_are_hardened() {
         let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()]).unwrap();
         assert!(!cfg.allow_degraded_security);
@@ -1922,6 +1944,7 @@ mod tests {
             crate::network::CredentialBrokerConfig::parse_endpoint("10.0.42.1:8080").unwrap();
         let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
             .unwrap()
+            .with_gvisor(false)
             .with_network(NetworkMode::Bridge(crate::network::BridgeConfig::default()))
             .with_credential_broker(broker.clone())
             .with_egress_policy(broker.egress_policy());

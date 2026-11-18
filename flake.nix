@@ -228,11 +228,7 @@
 
         inherit (pkgs) lib;
 
-        gvisor = pkgs.gvisor.overrideAttrs (old: {
-          patches = (old.patches or [ ]) ++ [
-            ./nix/patches/gvisor-runsc-real-exe-path.patch
-          ];
-        });
+        gvisor = pkgs.callPackage ./nix/gvisor.nix { };
         gvisorRuntimePkgs = lib.optionals pkgs.stdenv.hostPlatform.isLinux [ gvisor ];
         networkRuntimePkgs = lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.iptables pkgs.slirp4netns ];
         runtimePath = lib.makeBinPath (gvisorRuntimePkgs ++ networkRuntimePkgs);
@@ -268,6 +264,8 @@
         # Common arguments
         commonArgs = {
           inherit src;
+          ${if pkgs.stdenv.hostPlatform.isLinux then "NUCLEUS_PACKAGED_RUNSC" else null} =
+            "${gvisor}/bin/runsc";
           pname = "nucleus";
           version = "0.4.0";
           strictDeps = true;
@@ -369,7 +367,7 @@
           });
         };
 
-        packages = lib.optionalAttrs cargoLockExists {
+        packages = lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux { inherit gvisor; } // lib.optionalAttrs cargoLockExists {
           default = my-crate;
           agent-toolchain-rootfs = self.lib.mkAgentToolchainRootfs {
             inherit pkgs;
@@ -411,14 +409,13 @@
             just
 
             # Container runtime
-            gvisor
             iptables
             slirp4netns
 
             # Formal verification tools
             z3
             apalache
-          ];
+          ] ++ gvisorRuntimePkgs;
         };
       });
 }

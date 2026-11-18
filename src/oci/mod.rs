@@ -145,6 +145,8 @@ pub struct OciLinux {
 pub struct OciNamespace {
     #[serde(rename = "type")]
     pub namespace_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -836,18 +838,23 @@ impl OciConfig {
                 namespaces: Some(vec![
                     OciNamespace {
                         namespace_type: "pid".to_string(),
+                        path: None,
                     },
                     OciNamespace {
                         namespace_type: "network".to_string(),
+                        path: None,
                     },
                     OciNamespace {
                         namespace_type: "ipc".to_string(),
+                        path: None,
                     },
                     OciNamespace {
                         namespace_type: "uts".to_string(),
+                        path: None,
                     },
                     OciNamespace {
                         namespace_type: "mount".to_string(),
+                        path: None,
                     },
                 ]),
                 resources: None,
@@ -1426,41 +1433,49 @@ impl OciConfig {
         if config.pid {
             namespaces.push(OciNamespace {
                 namespace_type: "pid".to_string(),
+                path: None,
             });
         }
         if config.net {
             namespaces.push(OciNamespace {
                 namespace_type: "network".to_string(),
+                path: None,
             });
         }
         if config.ipc {
             namespaces.push(OciNamespace {
                 namespace_type: "ipc".to_string(),
+                path: None,
             });
         }
         if config.uts {
             namespaces.push(OciNamespace {
                 namespace_type: "uts".to_string(),
+                path: None,
             });
         }
         if config.mnt {
             namespaces.push(OciNamespace {
                 namespace_type: "mount".to_string(),
+                path: None,
             });
         }
         if config.cgroup {
             namespaces.push(OciNamespace {
                 namespace_type: "cgroup".to_string(),
+                path: None,
             });
         }
         if config.time {
             namespaces.push(OciNamespace {
                 namespace_type: "time".to_string(),
+                path: None,
             });
         }
         if config.user {
             namespaces.push(OciNamespace {
                 namespace_type: "user".to_string(),
+                path: None,
             });
         }
 
@@ -1512,6 +1527,7 @@ impl OciConfig {
             if let Some(namespaces) = &mut linux.namespaces {
                 namespaces.push(OciNamespace {
                     namespace_type: "user".to_string(),
+                    path: None,
                 });
             }
         }
@@ -1528,6 +1544,21 @@ impl OciConfig {
         }
 
         self
+    }
+
+    /// Join the configured interface and routes in the launcher's private bridge namespace.
+    pub(crate) fn with_bridge_network_namespace(self, pid: u32) -> Self {
+        let mut config = self.without_network_namespace();
+        if let Some(linux) = &mut config.linux {
+            linux
+                .namespaces
+                .get_or_insert_with(Vec::new)
+                .push(OciNamespace {
+                    namespace_type: "network".to_owned(),
+                    path: Some(PathBuf::from(format!("/proc/{pid}/ns/net"))),
+                });
+        }
+        config
     }
 
     /// Remove the OCI user namespace entry so runsc inherits a namespace that
@@ -1557,6 +1588,7 @@ impl OciConfig {
                 if !namespaces.iter().any(|ns| ns.namespace_type == "user") {
                     namespaces.push(OciNamespace {
                         namespace_type: "user".to_string(),
+                        path: None,
                     });
                 }
             }

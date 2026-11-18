@@ -1151,8 +1151,10 @@ When using gVisor (`--runtime gvisor`), the network mode is selected explicitly:
 | Container `--network` | gVisor `--network` flag | Description |
 |---|---|---|
 | `none` | `none` | Fully isolated (default for agents) |
-| `bridge` | `host` | Nucleus prepares a bridge/userspace NAT namespace, then runsc inherits it |
+| `bridge` | `sandbox` | gVisor netstack uses the interface and routes in the Nucleus-prepared network namespace |
 | `gvisor-host` | `host` | gVisor hostinet mode; omits the OCI network namespace and requires `--allow-host-network` |
+
+Nucleus requires a versioned runsc release of **20260831.0 or later** for gVisor launches. The Nix package includes runsc 20261116.0 and its matching sidecars. Bridge netstack sends packets at the link layer, so Nucleus rejects gVisor bridge configurations that request its iptables `OUTPUT` egress policy, including credential broker policies.
 
 The `gvisor-host` mode is intentionally separate from native `host` networking. Native `host` remains a direct host namespace mode. `gvisor-host` keeps the gVisor runtime boundary, but weakens network isolation by letting runsc hostinet use the host network stack. Because there is no Nucleus-owned network namespace in this mode, Nucleus egress policy is unavailable with `gvisor-host`.
 
