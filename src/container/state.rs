@@ -377,9 +377,27 @@ impl ContainerStateManager {
         })?;
         Self::reject_symlink_path(&state_dir)?;
         Self::ensure_secure_state_dir_permissions(&state_dir)?;
-        Self::ensure_state_dir_writable(&state_dir)?;
 
-        Ok(Self { state_dir })
+        // Trust gate shared with every other root-consumed path. The chmod
+        // above succeeds for root even when the directory is owned by another
+        // uid, and a forged state file there supplies the pid, uid, saved
+        // seccomp program and Landlock socket consumed by attach/exec/probe —
+        // running the attacker's workload as host uid 0. Resolve symlinks
+        // first (mirroring the OCI hook check) so default roots such as
+        // /var/run keep working where /var/run is a symlink to /run.
+        let resolved = state_dir.canonicalize().map_err(|e| {
+            NucleusError::ConfigError(format!(
+                "Failed to resolve state directory {:?}: {}",
+                state_dir, e
+            ))
+        })?;
+        crate::filesystem::trusted_directory(&resolved, false)?;
+
+        Self::ensure_state_dir_writable(&resolved)?;
+
+        Ok(Self {
+            state_dir: resolved,
+        })
     }
 
     fn reject_symlink_path(state_dir: &Path) -> Result<()> {
@@ -414,7 +432,10 @@ impl ContainerStateManager {
                 let mode = metadata.permissions().mode() & 0o777;
                 let owner = metadata.uid();
                 let current_uid = nix::unistd::Uid::effective().as_raw();
-                let is_owner_ok = owner == current_uid || nix::unistd::Uid::effective().is_root();
+                // Ownership is required even for root: root's chmod would
+                // otherwise succeed on a directory another uid controls. The
+                // trusted_directory gate in with_state_dir re-enforces this.
+                let is_owner_ok = owner == current_uid;
                 let is_mode_ok = mode & 0o077 == 0;
 
                 if is_owner_ok && is_mode_ok {
@@ -1126,6 +1147,58 @@ mod tests {
         assert!(
             result.is_ok(),
             "delete_state must be idempotent for missing files"
+        );
+    }
+
+    #[test]
+    fn test_with_state_dir_resolves_to_canonical_path() {
+        // The manager must store the canonicalized, trust-checked directory.
+        let temp = TempDir::new().unwrap();
+        let state_dir = temp.path().join("state");
+        let mgr = ContainerStateManager::with_state_dir(state_dir).unwrap();
+        assert_eq!(
+            mgr.state_dir,
+            temp.path().join("state").canonicalize().unwrap()
+        );
+        // The directory must have been tightened to 0700.
+        let mode = fs::metadata(&mgr.state_dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "state directory must be tightened to 0700");
+    }
+
+    #[test]
+    fn test_with_state_dir_rejects_group_writable_ancestor() {
+        // A state directory reachable only through a group-writable ancestor
+        // must be rejected: another member of that group can swap directory
+        // entries and forge state consumed as host root.
+        let temp = TempDir::new().unwrap();
+        let ancestor = temp.path().join("shared");
+        fs::create_dir(&ancestor).unwrap();
+        fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o770)).unwrap();
+
+        let result = ContainerStateManager::with_state_dir(ancestor.join("nucleus"));
+        assert!(
+            result.is_err(),
+            "group-writable ancestor must be rejected by the trusted-directory gate"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires host root to exercise uid ownership checks"]
+    fn host_root_rejects_foreign_owned_state_directory() {
+        // Root must not consume a state directory owned by another uid: the
+        // 0700 chmod succeeds for root regardless of ownership, so ownership
+        // has to be enforced explicitly by the trusted-directory gate.
+        assert!(nix::unistd::Uid::effective().is_root());
+        let temp = TempDir::new().unwrap();
+        let state_dir = temp.path().join("stolen");
+        fs::create_dir(&state_dir).unwrap();
+        fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        nix::unistd::chown(&state_dir, Some(nix::unistd::Uid::from_raw(65534)), None).unwrap();
+
+        let result = ContainerStateManager::with_state_dir(state_dir);
+        assert!(
+            result.is_err(),
+            "root must reject a user-owned state directory even though chmod succeeds"
         );
     }
 }
