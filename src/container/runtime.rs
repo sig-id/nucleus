@@ -312,7 +312,57 @@ impl Container {
             ))
         })?;
 
+        // Setting NUCLEUS_GVISOR_ARTIFACT_BASE only relocates the default
+        // bundle: an explicit --bundle path is used unchanged by
+        // setup_and_exec_gvisor_oci after the child has become the mapped
+        // supervisor. Prepare that directory here, while still host root, so
+        // the demoted child can create and secure the bundle in place.
+        if config.use_gvisor {
+            if let Some(bundle_dir) = config.bundle_dir.as_deref() {
+                Self::prepare_mapped_bundle_dir(bundle_dir, host_uid, host_gid)?;
+            }
+        }
+
         Ok(Some(base))
+    }
+
+    /// Prepare an explicit `--bundle` directory for the mapped gVisor
+    /// supervisor.
+    ///
+    /// Root-launched agent handoffs demote the fork child to the mapped
+    /// supervisor (the host identity of container ID 0) before
+    /// `OciBundle::create` runs against the explicit bundle path. Create the
+    /// directory while still host root and transfer it to the supervisor so
+    /// previously working explicit bundles keep working.
+    fn prepare_mapped_bundle_dir(path: &Path, host_uid: u32, host_gid: u32) -> Result<()> {
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(NucleusError::FilesystemError(format!(
+                    "Refusing symlink explicit gVisor bundle directory {:?}",
+                    path
+                )));
+            }
+            Ok(_) | Err(_) => {}
+        }
+
+        std::fs::create_dir_all(path).map_err(|e| {
+            NucleusError::FilesystemError(format!(
+                "Failed to create explicit gVisor bundle directory {:?}: {}",
+                path, e
+            ))
+        })?;
+        chown(
+            path,
+            Some(Uid::from_raw(host_uid)),
+            Some(Gid::from_raw(host_gid)),
+        )
+        .map_err(|e| {
+            NucleusError::FilesystemError(format!(
+                "Failed to chown explicit gVisor bundle directory {:?} to {}:{}: {}",
+                path, host_uid, host_gid, e
+            ))
+        })?;
+        Ok(())
     }
 
     fn ensure_runtime_parent_dir(path: &std::path::Path) -> Result<()> {
@@ -3498,5 +3548,44 @@ mod tests {
             !probe_body.contains("/dev/tcp"),
             "TCP readiness probe must not use /dev/tcp (bash-specific, fails on dash/ash)"
         );
+    }
+    #[test]
+    fn test_mapped_runtime_base_prepares_explicit_bundle_dir() {
+        let source = include_str!("runtime.rs");
+        let fn_body = extract_fn_body(source, "fn prepare_runtime_base_override");
+        assert!(
+            fn_body.contains("prepare_mapped_bundle_dir"),
+            "root remap handoff must prepare explicit --bundle directories for the mapped supervisor"
+        );
+        let helper = extract_fn_body(source, "fn prepare_mapped_bundle_dir");
+        assert!(
+            helper.contains("symlink_metadata") && helper.contains("Refusing symlink"),
+            "explicit bundle preparation must refuse symlinked paths before chowning"
+        );
+    }
+
+    #[test]
+    fn test_prepare_mapped_bundle_dir_creates_and_transfers_ownership() {
+        let temp = tempfile::tempdir().unwrap();
+        let bundle = temp.path().join("explicit-bundle");
+        // chown to the current identity keeps the test rootless-capable.
+        let uid = Uid::effective();
+        let gid = Gid::effective();
+
+        Container::prepare_mapped_bundle_dir(&bundle, uid.as_raw(), gid.as_raw()).unwrap();
+        assert!(bundle.is_dir());
+
+        // Repeated launches must be idempotent.
+        Container::prepare_mapped_bundle_dir(&bundle, uid.as_raw(), gid.as_raw()).unwrap();
+
+        // Symlinked bundle paths are refused before any ownership change.
+        let target = temp.path().join("real-target");
+        std::fs::create_dir(&target).unwrap();
+        let link = temp.path().join("bundle-link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let err = Container::prepare_mapped_bundle_dir(&link, uid.as_raw(), gid.as_raw())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Refusing symlink"));
     }
 }
