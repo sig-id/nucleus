@@ -261,16 +261,14 @@ impl CriuRuntime {
             cgroup.install_gpu_device_allowlist(&filter.gpu, &filter.supervisor, filter.include_tty, false)?;
         }
         let membership = cgroup.membership_file()?;
-        self.state = self.state.transition(CheckpointState::Restoring)?;
-
-        // Capture the restored init PID explicitly.
-        let pidfile = Builder::new()
+        // CRIU creates the pidfile with O_EXCL. Give it a fresh name in a
+        // supervisor-only directory and read it after CRIU reports success.
+        let pid_dir = Builder::new()
             .prefix("nucleus-criu-restore-")
-            .tempfile()
-            .map_err(|e| {
-                NucleusError::CheckpointError(format!("Failed to create CRIU pidfile: {}", e))
-            })?;
-        let pidfile_path = pidfile.path().to_path_buf();
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir()?;
+        let pidfile_path = pid_dir.path().join("init.pid");
+        self.state = self.state.transition(CheckpointState::Restoring)?;
 
         // Run criu restore
         let mut cmd = Command::new(&self.binary_path);
