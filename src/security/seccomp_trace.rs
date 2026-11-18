@@ -163,6 +163,13 @@ fn record_loop(
                 if e.kind() == std::io::ErrorKind::Interrupted {
                     continue;
                 }
+                if kmsg_loss_is_recoverable(&e) {
+                    warn!(
+                        "Seccomp trace: kernel log buffer overran and some records \
+                         were lost; continuing with the trace collected so far"
+                    );
+                    continue;
+                }
                 return Err(e.into());
             }
         };
@@ -177,6 +184,18 @@ fn record_loop(
     write_trace_file(output, &syscalls)?;
     info!("Seccomp trace: recorded {} unique syscalls", syscalls.len());
     Ok(())
+}
+
+/// Whether a `/dev/kmsg` read error indicates lost records that the reader
+/// can recover from.
+///
+/// Per the kernel ABI (`Documentation/ABI/testing/dev-kmsg`), a read returns
+/// `EPIPE` when the printk ring buffer overran: the cursor is advanced and
+/// subsequent reads return newer records. The recorder must keep reading
+/// instead of aborting, which would discard every syscall already collected
+/// and leave the trace file empty.
+fn kmsg_loss_is_recoverable(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::BrokenPipe
 }
 
 /// Extract the syscall number from an audit SECCOMP line.
@@ -807,5 +826,36 @@ mod tests {
         assert!(json.contains("\"syscall\":0"));
         assert!(json.contains("\"name\":\"read\""));
         assert!(json.contains("\"count\":42"));
+    }
+    #[test]
+    fn test_kmsg_ring_buffer_overrun_is_recoverable() {
+        // /dev/kmsg reports lost records via EPIPE and keeps its cursor
+        // advancing; the recorder must continue instead of aborting.
+        let epipe = std::io::Error::from_raw_os_error(libc::EPIPE);
+        assert!(kmsg_loss_is_recoverable(&epipe));
+        // Other errors stay fatal.
+        assert!(!kmsg_loss_is_recoverable(
+            &std::io::Error::from_raw_os_error(libc::EIO)
+        ));
+        assert!(!kmsg_loss_is_recoverable(
+            &std::io::Error::from_raw_os_error(libc::EBADF)
+        ));
+    }
+
+    #[test]
+    fn test_record_loop_survives_kmsg_overrun_before_writing_trace() {
+        // Structural regression: the EPIPE recovery must run inside the read
+        // loop (before write_trace_file), so an overrun can no longer discard
+        // the collected trace and leave the output file empty.
+        let source = include_str!("seccomp_trace.rs");
+        let fn_body = extract_fn_body(source, "fn record_loop");
+        let recoverable = fn_body.find("kmsg_loss_is_recoverable").unwrap();
+        let warn = fn_body.find("kernel log buffer overran").unwrap();
+        let fatal = fn_body.find("return Err(e.into())").unwrap();
+        let write = fn_body.find("write_trace_file(output").unwrap();
+        assert!(
+            recoverable < fatal && fatal < write && warn < fatal,
+            "overrun recovery must precede the fatal error path and the trace write"
+        );
     }
 }
