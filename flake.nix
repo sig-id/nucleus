@@ -408,14 +408,10 @@
             sccache
             just
 
-            # Container runtime
-            iptables
-            slirp4netns
-
             # Formal verification tools
             z3
             apalache
-          ] ++ gvisorRuntimePkgs;
+          ] ++ gvisorRuntimePkgs ++ networkRuntimePkgs;
         };
       });
 }
