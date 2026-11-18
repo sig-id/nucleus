@@ -305,6 +305,71 @@ pub fn copy_image_diff_to_upper(image_dir: &Path, upperdir: &Path) -> Result<()>
     VerifiedImage::open(image_dir)?.copy_diff_to_upper(upperdir)
 }
 
+/// Translate ownership of an imported layer tree into user-namespace host IDs.
+///
+/// The image diff carries container-relative numeric ownership: a directory
+/// owned by service uid 1000 must become host uid 100000+1000 once a root
+/// launch forces the `root_remapped` user namespace, or the remapped service
+/// (a different host identity) can no longer traverse its own 0700 data.
+/// Every mapped owner is chowned to its host counterpart; owners outside the
+/// mapping keep their numeric identity and surface as the overflow ID inside
+/// the namespace. Symlinks are skipped — their ownership is irrelevant and
+/// `chown(2)` would follow them. As a side effect of `chown(2)`, set-user-ID
+/// and set-group-ID bits on regular files are cleared, matching the posture
+/// of workspace copies.
+pub fn remap_layer_ownership(
+    root: &Path,
+    uid_map: &crate::isolation::IdMapping,
+    gid_map: &crate::isolation::IdMapping,
+) -> Result<()> {
+    let metadata = fs::symlink_metadata(root).map_err(|e| {
+        NucleusError::FilesystemError(format!(
+            "Failed to stat imported layer path {:?}: {}",
+            root, e
+        ))
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Ok(());
+    }
+
+    if metadata.is_dir() {
+        for entry in fs::read_dir(root).map_err(|e| {
+            NucleusError::FilesystemError(format!(
+                "Failed to read imported layer dir {:?}: {}",
+                root, e
+            ))
+        })? {
+            let entry = entry.map_err(|e| {
+                NucleusError::FilesystemError(format!(
+                    "Failed to read imported layer entry in {:?}: {}",
+                    root, e
+                ))
+            })?;
+            remap_layer_ownership(&entry.path(), uid_map, gid_map)?;
+        }
+    }
+
+    use std::os::unix::fs::MetadataExt;
+    let uid = metadata.uid();
+    let gid = metadata.gid();
+    let new_uid = uid_map.host_id_for(uid).unwrap_or(uid);
+    let new_gid = gid_map.host_id_for(gid).unwrap_or(gid);
+    if new_uid != uid || new_gid != gid {
+        nix::unistd::chown(
+            root,
+            Some(nix::unistd::Uid::from_raw(new_uid)),
+            Some(nix::unistd::Gid::from_raw(new_gid)),
+        )
+        .map_err(|e| {
+            NucleusError::FilesystemError(format!(
+                "Failed to remap imported layer owner {:?} from {}:{} to {}:{}: {}",
+                root, uid, gid, new_uid, new_gid, e
+            ))
+        })?;
+    }
+    Ok(())
+}
+
 fn replay_deleted_paths(upperdir: &Path, deleted_paths: &[String]) -> Result<()> {
     for deleted in deleted_paths {
         let relative = validate_manifest_relative_path(deleted)?;
@@ -1655,5 +1720,65 @@ mod tests {
                 "broker-derived env `{key}` was baked into the committed image"
             );
         }
+    }
+    #[test]
+    fn remap_layer_ownership_keeps_unmapped_and_symlink_owners() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("upper");
+        std::fs::create_dir(&root).unwrap();
+        let data = root.join("data");
+        std::fs::write(&data, b"x").unwrap();
+        let link = root.join("link");
+        symlink(&data, &link).unwrap();
+
+        // The current identity maps to itself; nothing else is mapped.
+        let uid = nix::unistd::getuid().as_raw();
+        let gid = nix::unistd::getgid().as_raw();
+        let uid_map = crate::isolation::IdMapping::new(0, uid, 1);
+        let gid_map = crate::isolation::IdMapping::new(0, gid, 1);
+
+        remap_layer_ownership(&root, &uid_map, &gid_map).unwrap();
+
+        assert_eq!(std::fs::symlink_metadata(&data).unwrap().uid(), uid);
+        assert_eq!(
+            std::fs::symlink_metadata(&link).unwrap().uid(),
+            uid,
+            "symlink owners must not be followed or changed"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires root with CAP_CHOWN; remaps foreign owners in a disposable tree"]
+    fn remap_layer_ownership_translates_foreign_service_owners() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("upper");
+        std::fs::create_dir(&root).unwrap();
+        // A committed layer from a non-remapped container: service uid/gid 1000.
+        let service_dir = root.join("service");
+        std::fs::create_dir(&service_dir).unwrap();
+        std::fs::set_permissions(&service_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        nix::unistd::chown(
+            &service_dir,
+            Some(nix::unistd::Uid::from_raw(1000)),
+            Some(nix::unistd::Gid::from_raw(1000)),
+        )
+        .unwrap();
+        let file = service_dir.join("state");
+        std::fs::write(&file, b"x").unwrap();
+        nix::unistd::chown(
+            &file,
+            Some(nix::unistd::Uid::from_raw(1000)),
+            Some(nix::unistd::Gid::from_raw(1000)),
+        )
+        .unwrap();
+
+        let mapping = crate::isolation::UserNamespaceConfig::root_remapped();
+        remap_layer_ownership(&root, &mapping.uid_mappings[0], &mapping.gid_mappings[0]).unwrap();
+
+        assert_eq!(std::fs::metadata(&service_dir).unwrap().uid(), 101_000);
+        assert_eq!(std::fs::metadata(&service_dir).unwrap().gid(), 101_000);
+        assert_eq!(std::fs::metadata(&file).unwrap().uid(), 101_000);
     }
 }

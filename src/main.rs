@@ -2092,13 +2092,20 @@ fn try_main() -> Result<i32> {
                     // The state root is private. The setup process holds a cwd in
                     // this parent and only needs search permission after remapping.
                     std::fs::set_permissions(&overlay_dir, std::fs::Permissions::from_mode(0o711))?;
-                    for path in [&upperdir, &workdir] {
-                        nix::unistd::chown(
-                            path,
-                            Some(nix::unistd::Uid::from_raw(mapping.uid_mappings[0].host_id)),
-                            Some(nix::unistd::Gid::from_raw(mapping.gid_mappings[0].host_id)),
-                        )?;
-                    }
+                    // The imported layer carries container-relative ownership
+                    // from the image. Translate it into the namespace mapping so
+                    // nonzero service identities keep access to their own data
+                    // as remapped host identities; unmapped owners are left as-is.
+                    image::remap_layer_ownership(
+                        &upperdir,
+                        &mapping.uid_mappings[0],
+                        &mapping.gid_mappings[0],
+                    )?;
+                    nix::unistd::chown(
+                        &workdir,
+                        Some(nix::unistd::Uid::from_raw(mapping.uid_mappings[0].host_id)),
+                        Some(nix::unistd::Gid::from_raw(mapping.gid_mappings[0].host_id)),
+                    )?;
                 }
                 config = config.with_rootfs_overlay(upperdir, workdir);
 
