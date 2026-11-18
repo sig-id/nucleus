@@ -151,6 +151,14 @@ impl SeccompManager {
             // has namespace-flag filtering. Removing SYS_fork forces all forks
             // through the filtered clone path (defense-in-depth against fork bombs
             // and unfiltered namespace creation).
+            //
+            // vfork cannot be redirected the same way: libc issues the raw
+            // syscall directly (dash and other shells use it for subshell
+            // spawning), and unlike clone it takes no flags, so it cannot
+            // create namespaces. Fork bombs stay bounded by the pids cgroup
+            // controller. Only x86_64 has a vfork entry in the syscall table.
+            #[cfg(target_arch = "x86_64")]
+            libc::SYS_vfork,
             libc::SYS_execve,
             // execveat is conditionally allowed below (AT_EMPTY_PATH blocked)
             libc::SYS_wait4,
@@ -1245,7 +1253,6 @@ impl SeccompManager {
         "ioprio_set",
         "ioprio_get",
         // Process (non-default, low risk)
-        "vfork",
         "pause",
         "alarm",
         "tkill",
@@ -2008,15 +2015,28 @@ mod tests {
         let net = SeccompManager::network_mode_syscalls(true);
 
         // Include argument-filtered syscalls in the complete policy counts.
-        assert_eq!(base.len(), 167);
+        // vfork is x86_64-only in the syscall table.
+        #[cfg(target_arch = "x86_64")]
+        const BASE_COUNT: usize = 168;
+        #[cfg(not(target_arch = "x86_64"))]
+        const BASE_COUNT: usize = 167;
+        #[cfg(target_arch = "x86_64")]
+        const FULL_COUNT_OFFLINE: usize = 180;
+        #[cfg(not(target_arch = "x86_64"))]
+        const FULL_COUNT_OFFLINE: usize = 179;
+        assert_eq!(base.len(), BASE_COUNT);
         assert_eq!(net.len(), 9);
         assert_eq!(
             SeccompManager::minimal_filter(false, &[]).unwrap().len(),
-            179
+            FULL_COUNT_OFFLINE
         );
+        #[cfg(target_arch = "x86_64")]
+        const FULL_COUNT_NETWORK: usize = 190;
+        #[cfg(not(target_arch = "x86_64"))]
+        const FULL_COUNT_NETWORK: usize = 189;
         assert_eq!(
             SeccompManager::minimal_filter(true, &[]).unwrap().len(),
-            189
+            FULL_COUNT_NETWORK
         );
     }
 
@@ -2082,11 +2102,15 @@ mod tests {
         let base = SeccompManager::base_allowed_syscalls();
         // chown/fchown/lchown/fchownat: allowed – safe after CAP_CHOWN/CAP_FOWNER drop
         // mlock/munlock: allowed – needed by databases, bounded by RLIMIT_MEMLOCK
+        // vfork: allowed on x86_64 – libc issues the raw syscall directly and
+        // it cannot create namespaces (no flags argument); see the base
+        // allowlist rationale. fork stays excluded to force modern libc
+        // through the argument-filtered clone path.
         let removed = [
             libc::SYS_sync,
             libc::SYS_syncfs,
             libc::SYS_mincore,
-            libc::SYS_vfork,
+            libc::SYS_fork,
             libc::SYS_tkill,
             // io_uring: large attack surface, many CVEs – require custom profile
             libc::SYS_io_uring_setup,
