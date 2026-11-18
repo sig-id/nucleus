@@ -301,7 +301,7 @@ fn decode_mountinfo_field(field: &str) -> String {
 
 fn parse_mountinfo_line(line: &str) -> Option<(String, std::collections::HashSet<String>)> {
     let (left, _) = line.split_once(" - ")?;
-    let fields: Vec<&str> = left.split_whitespace().collect();
+    let fields: Vec<&str> = left.split_ascii_whitespace().collect();
     if fields.len() < 6 {
         return None;
     }
@@ -315,6 +315,60 @@ fn parse_mountinfo_line(line: &str) -> Option<(String, std::collections::HashSet
         .collect();
 
     Some((mount_point, options))
+}
+
+/// Disable traversal of procfs magic links before handing a native mount
+/// namespace to the workload. Apply this to procfs aliases in recursive binds
+/// as well as /proc. MS_NOEXEC on procfs alone does not constrain the target
+/// mount of a magic link.
+pub(crate) fn restrict_procfs_links() -> Result<()> {
+    let table = format!("/proc/{}/mountinfo", std::process::id());
+    let unprotected = || -> Result<Vec<String>> {
+        let mut file = std::fs::File::open(&table)?;
+        if nix::sys::statfs::fstatfs(&file)?.filesystem_type() != nix::sys::statfs::PROC_SUPER_MAGIC
+        {
+            return Err(NucleusError::FilesystemError(
+                "Expected procfs mount information".into(),
+            ));
+        }
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)?;
+        let mut targets = Vec::new();
+        for line in contents.lines() {
+            if line
+                .split_once(" - ")
+                .is_some_and(|(_, right)| right.starts_with("proc "))
+            {
+                let (path, flags) = parse_mountinfo_line(line).ok_or_else(|| {
+                    NucleusError::FilesystemError("Invalid procfs mount record".into())
+                })?;
+                if !flags.contains("nosymfollow") {
+                    targets.push(path);
+                }
+            }
+        }
+        Ok(targets)
+    };
+    for path in unprotected()? {
+        let fd = open(
+            Path::new(&path),
+            OFlag::O_PATH | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )?;
+        if nix::sys::statfs::fstatfs(&fd)?.filesystem_type() != nix::sys::statfs::PROC_SUPER_MAGIC {
+            return Err(NucleusError::FilesystemError(format!(
+                "Procfs mount changed at {path:?}"
+            )));
+        }
+        super::target::set_mount_attributes(&fd, libc::MOUNT_ATTR_NOSYMFOLLOW, false)
+            .map_err(|e| NucleusError::FilesystemError(format!("Cannot restrict procfs links at {path:?}: {e}")))?;
+    }
+    if !unprotected()?.is_empty() {
+        return Err(NucleusError::FilesystemError(
+            "Cannot restrict all workload procfs mounts".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Audit all mounts in the container's mount namespace.

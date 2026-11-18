@@ -82,7 +82,7 @@ pub fn subgid_range_for_user(username: &str, uid: u32) -> Option<SubidRange> {
 /// container uid (e.g. host uid 1000 -> container uid 1000) and a naive
 /// `owner == effective_uid` comparison wrongly rejects them.
 pub fn current_userns_container_ranges() -> Option<Vec<(u32, u32)>> {
-    let contents = fs::read_to_string("/proc/self/uid_map").ok()?;
+    let contents = fs::read_to_string(format!("/proc/{}/uid_map", std::process::id())).ok()?;
     let mut ranges = Vec::new();
     let mut identity_root = false;
     for line in contents.lines() {

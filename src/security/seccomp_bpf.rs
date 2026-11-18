@@ -100,15 +100,23 @@ fn compile_bitmap_bpf(
     compile_bitmap_bpf_with_errno_syscalls(rules, &[], mismatch_action, match_action, target_arch)
 }
 
+/// An errno denial may cover a whole syscall or a single int-valued option.
+#[derive(Clone, Copy)]
+pub(super) struct ErrnoRule {
+    pub nr: i64,
+    pub arg0: Option<u32>,
+    pub errno: i32,
+}
+
 /// Compile a seccomp BPF program with exact-match syscall errno overrides.
 ///
 /// `errno_syscalls` are checked before both the unconditional allow bitmap and
 /// the argument-filtered chains. This lets the policy return ENOSYS for syscalls
 /// such as clone3, where libc can safely fall back to an older syscall that the
 /// filter can inspect.
-pub fn compile_bitmap_bpf_with_errno_syscalls(
+pub(super) fn compile_bitmap_bpf_with_errno_syscalls(
     rules: BTreeMap<i64, Vec<SeccompRule>>,
-    errno_syscalls: &[(i64, u32)],
+    errno_syscalls: &[ErrnoRule],
     mismatch_action: SeccompAction,
     match_action: SeccompAction,
     target_arch: TargetArch,
@@ -116,17 +124,6 @@ pub fn compile_bitmap_bpf_with_errno_syscalls(
     let mismatch_val: u32 = mismatch_action.into();
     let match_val: u32 = match_action.into();
     let audit_arch = arch_audit_value(target_arch);
-    let errno_actions: Vec<(u32, u32)> = errno_syscalls
-        .iter()
-        .filter_map(|(nr, errno)| {
-            if *nr < 0 || *nr > u32::MAX as i64 {
-                None
-            } else {
-                Some((*nr as u32, SeccompAction::Errno(*errno).into()))
-            }
-        })
-        .collect();
-
     // Separate unconditional allows (bitmap) from arg-filtered (linear scan).
     let mut bitmap: [u32; NUM_BITMAP_WORDS] = [0; NUM_BITMAP_WORDS];
     let mut arg_filtered: Vec<(i64, Vec<SeccompRule>)> = Vec::new();
@@ -168,12 +165,20 @@ pub fn compile_bitmap_bpf_with_errno_syscalls(
     prog.push(bpf_stmt(BPF_RET | BPF_K, libc::SECCOMP_RET_KILL_PROCESS));
 
     // === Section 1b: Exact-match errno denies ===
-    if !errno_actions.is_empty() {
+    for rule in errno_syscalls {
         prog.push(bpf_stmt(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_NR_OFFSET));
-        for (nr, action) in errno_actions {
-            prog.push(bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, nr, 0, 1));
-            prog.push(bpf_stmt(BPF_RET | BPF_K, action));
+        let skip = if rule.arg0.is_some() { 3 } else { 1 };
+        prog.push(bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, rule.nr as u32, 0, skip));
+        if let Some(value) = rule.arg0 {
+            // All supported targets use little-endian seccomp_data arguments.
+            let offset = std::mem::offset_of!(libc::seccomp_data, args) as u32;
+            prog.push(bpf_stmt(BPF_LD | BPF_W | BPF_ABS, offset));
+            prog.push(bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, value, 0, 1));
         }
+        prog.push(bpf_stmt(
+            BPF_RET | BPF_K,
+            SeccompAction::Errno(rule.errno as u32).into(),
+        ));
     }
 
     // === Section 2: Setup ===
@@ -486,7 +491,11 @@ mod tests {
 
         let prog = compile_bitmap_bpf_with_errno_syscalls(
             rules,
-            &[(123, libc::ENOSYS as u32)],
+            &[ErrnoRule {
+                nr: 123,
+                arg0: None,
+                errno: libc::ENOSYS,
+            }],
             SeccompAction::KillProcess,
             SeccompAction::Allow,
             TargetArch::x86_64,
@@ -852,7 +861,158 @@ mod tests {
     }
 
     #[test]
-    fn test_builtin_prctl_allows_pr_set_mm_for_kernel_capability_check() {
+    fn hardened_mapping_transfer_and_gpu_rules_survive_compilation() {
+        use crate::security::SeccompManager;
+        let action = |prog: &BpfProgram, nr: i64, args: [u64; 6]| {
+            bpf_eval(
+                prog,
+                &make_seccomp_data(
+                    nr as u32,
+                    arch_audit_value(std::env::consts::ARCH.try_into().unwrap()),
+                    args,
+                ),
+            )
+        };
+        let extra = [
+            "mmap",
+            "pkey_mprotect",
+            "personality",
+            "splice",
+            "tee",
+            "sendfile",
+            "pidfd_getfd",
+            "mknodat",
+            "kcmp",
+        ]
+        .map(String::from);
+        let gpu = SeccompManager::compile_builtin(false, &extra, true).unwrap();
+        let custom = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(custom.path(), r#"{"defaultAction":"SCMP_ACT_KILL_PROCESS","architectures":[],"syscalls":[{"names":["mmap","mprotect","pkey_mprotect","shmat","personality","prctl","ioctl","mknodat","kcmp"],"action":"SCMP_ACT_ALLOW"}]}"#).unwrap();
+        let profile = SeccompManager::compile_profile(custom.path(), None).unwrap();
+        for prog in [&gpu, &profile] {
+            for nr in [libc::SYS_mmap, libc::SYS_mprotect, libc::SYS_pkey_mprotect] {
+                for (prot, expected) in [
+                    (libc::PROT_READ | libc::PROT_WRITE, RET_ALLOW),
+                    (libc::PROT_READ | libc::PROT_EXEC, RET_ALLOW),
+                    (
+                        libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+                        RET_KILL,
+                    ),
+                ] {
+                    assert_eq!(action(prog, nr, [0, 4096, prot as u64, 0, 0, 0]), expected);
+                }
+            }
+            // A read-only executable view could alias a writable attachment.
+            for (flags, expected) in [
+                (0, RET_ALLOW),
+                (libc::SHM_RDONLY, RET_ALLOW),
+                (libc::SHM_EXEC, RET_KILL),
+                (libc::SHM_EXEC | libc::SHM_RDONLY, RET_KILL),
+            ] {
+                assert_eq!(
+                    action(prog, libc::SYS_shmat, [0, 0, flags as u64, 0, 0, 0]),
+                    expected
+                );
+            }
+            // FIFOs, sockets and regular files may be created; devices may not.
+            for (kind, expected) in [
+                (libc::S_IFIFO, RET_ALLOW),
+                (libc::S_IFSOCK, RET_ALLOW),
+                (libc::S_IFREG, RET_ALLOW),
+                (0, RET_ALLOW),
+                (libc::S_IFCHR, RET_KILL),
+                (libc::S_IFBLK, RET_KILL),
+            ] {
+                assert_eq!(
+                    action(
+                        prog,
+                        libc::SYS_mknodat,
+                        [0, 0, (kind | 0o600) as u64, 0, 0, 0]
+                    ),
+                    expected
+                );
+            }
+            for (kind, expected) in [(0, RET_ALLOW), (1, RET_KILL), (6, RET_KILL)] {
+                assert_eq!(
+                    action(prog, libc::SYS_kcmp, [1, 1, kind, 0, 0, 0]),
+                    expected
+                );
+            }
+            assert_eq!(
+                action(
+                    prog,
+                    libc::SYS_personality,
+                    [libc::READ_IMPLIES_EXEC as u64, 0, 0, 0, 0, 0]
+                ),
+                RET_KILL
+            );
+            for option in [libc::PR_SET_MM_MAP, libc::PR_SET_MM_ARG_START] {
+                assert_eq!(
+                    action(
+                        prog,
+                        libc::SYS_prctl,
+                        [
+                            (1 << 32) | libc::PR_SET_MM as u64,
+                            option as u64,
+                            0,
+                            0,
+                            0,
+                            0
+                        ]
+                    ),
+                    libc::SECCOMP_RET_ERRNO | libc::EPERM as u32
+                );
+            }
+            // Terminal injection, console keyboard (KDSKBSENT, KDSETMODE) and
+            // virtual terminal (VT_ACTIVATE, VT_SETMODE) requests.
+            for request in [
+                libc::TIOCLINUX,
+                libc::TIOCSTI,
+                libc::TIOCCONS,
+                0x4b49,
+                0x4b3a,
+                0x5606,
+                0x5602,
+            ] {
+                assert_eq!(
+                    action(prog, libc::SYS_ioctl, [1, (1 << 32) | request, 0, 0, 0, 0]),
+                    RET_KILL
+                );
+            }
+        }
+        // Representative DRM, AMD KFD and range-boundary requests remain
+        // available to the GPU driver.
+        for request in [
+            0xc0406400, 0x80084b01, 0x4aff, 0x4c00, 0x53ff, 0x5500, 0x5700,
+        ] {
+            assert_eq!(
+                action(&gpu, libc::SYS_ioctl, [3, request, 0, 0, 0, 0]),
+                RET_ALLOW
+            );
+        }
+        for network in [false, true] {
+            let default = SeccompManager::compile_builtin(network, &[], false).unwrap();
+            for nr in [
+                libc::SYS_splice,
+                libc::SYS_tee,
+                crate::security::syscall_numbers::SYS_SENDFILE,
+            ] {
+                // Callers fall back to read/write when the syscall is absent.
+                assert_eq!(
+                    action(&default, nr, [0; 6]),
+                    libc::SECCOMP_RET_ERRNO | libc::ENOSYS as u32
+                );
+                assert_eq!(action(&gpu, nr, [0; 6]), RET_ALLOW);
+            }
+            for nr in [libc::SYS_mknodat, libc::SYS_kcmp] {
+                assert_eq!(action(&default, nr, [0; 6]), RET_KILL);
+            }
+        }
+        assert_eq!(action(&gpu, libc::SYS_pidfd_getfd, [0; 6]), RET_KILL);
+    }
+
+    #[test]
+    fn test_builtin_prctl_denies_pr_set_mm_before_capability_checks() {
         let rules = crate::security::SeccompManager::minimal_filter_for_test(true, &[]);
         let prog = compile_bitmap_bpf_with_errno_syscalls(
             rules,
@@ -875,7 +1035,10 @@ mod tests {
                 0,
             ],
         );
-        assert_eq!(bpf_eval(&prog, &set_mm_arg_start), RET_ALLOW);
+        assert_eq!(
+            bpf_eval(&prog, &set_mm_arg_start),
+            libc::SECCOMP_RET_ERRNO | libc::EPERM as u32
+        );
     }
 
     #[test]
@@ -1066,8 +1229,7 @@ mod tests {
         )
         .unwrap();
 
-        // The network-enabled filter uses 426 instructions on x86_64, including
-        // the futex commands and socket type/protocol combinations.
+        // Keep the network-enabled filter compact as argument predicates evolve.
         assert!(
             prog.len() < 450,
             "BPF program should be compact, got {} instructions",

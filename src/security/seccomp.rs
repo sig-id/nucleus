@@ -1,3 +1,4 @@
+use super::seccomp_bpf::ErrnoRule;
 use crate::container::{ContainerConfig, SeccompMode};
 use crate::error::{NucleusError, Result};
 use crate::network::NetworkMode;
@@ -125,17 +126,8 @@ impl SeccompManager {
             libc::SYS_flock,
             libc::SYS_fstatfs,
             libc::SYS_statfs,
-            #[cfg(any(
-                target_arch = "x86_64",
-                target_arch = "aarch64",
-                target_arch = "riscv64"
-            ))]
-            SYS_SENDFILE,
             libc::SYS_copy_file_range,
-            libc::SYS_splice,
-            libc::SYS_tee,
-            // Memory management
-            libc::SYS_mmap,
+            // Memory management (mmap and mprotect are argument-filtered below).
             libc::SYS_munmap,
             libc::SYS_brk,
             libc::SYS_mremap,
@@ -147,7 +139,6 @@ impl SeccompManager {
             // SysV shared memory – used by PostgreSQL, Redis, and many databases
             // for shared buffer pools. Safe in PID/IPC namespaces (isolated keyspace).
             libc::SYS_shmget,
-            libc::SYS_shmat,
             libc::SYS_shmdt,
             libc::SYS_shmctl,
             // POSIX semaphores (used by PostgreSQL for lightweight locking)
@@ -160,6 +151,14 @@ impl SeccompManager {
             // has namespace-flag filtering. Removing SYS_fork forces all forks
             // through the filtered clone path (defense-in-depth against fork bombs
             // and unfiltered namespace creation).
+            //
+            // vfork cannot be redirected the same way: libc issues the raw
+            // syscall directly (dash and other shells use it for subshell
+            // spawning), and unlike clone it takes no flags, so it cannot
+            // create namespaces. Fork bombs stay bounded by the pids cgroup
+            // controller. Only x86_64 has a vfork entry in the syscall table.
+            #[cfg(target_arch = "x86_64")]
+            libc::SYS_vfork,
             libc::SYS_execve,
             // execveat is conditionally allowed below (AT_EMPTY_PATH blocked)
             libc::SYS_wait4,
@@ -390,7 +389,9 @@ impl SeccompManager {
 
             if let Some(nr) = syscall_name_to_number(name) {
                 if let std::collections::btree_map::Entry::Vacant(entry) = rules.entry(nr) {
-                    if Self::SECURITY_CRITICAL_DENIED_SYSCALLS.contains(&name.as_str()) {
+                    if Self::SECURITY_CRITICAL_DENIED_SYSCALLS.contains(&name.as_str())
+                        || Self::PRIVILEGED_SYSCALLS.contains(&name.as_str())
+                    {
                         warn!(
                             "--seccomp-allow: security-critical syscall '{}' is always blocked",
                             name
@@ -519,12 +520,6 @@ impl SeccompManager {
             38, // PR_SET_NO_NEW_PRIVS
             40, // PR_GET_TID_ADDRESS – read-only, returns thread ID address
             39, // PR_GET_NO_NEW_PRIVS
-            // Some Nix-packaged binaries attempt PR_SET_MM_ARG_START to update
-            // their visible argv range. The operation is kernel-gated by
-            // CAP_SYS_RESOURCE; Nucleus drops all capabilities before seccomp,
-            // so allowing this option lets the kernel return EPERM instead of
-            // killing otherwise ordinary workloads.
-            libc::PR_SET_MM as u64,
         ];
         let mut prctl_rules = Vec::new();
         for &option in prctl_allowed {
@@ -593,24 +588,48 @@ impl SeccompManager {
         })?;
         rules.insert(libc::SYS_prlimit64, vec![prlimit_rule]);
 
-        // mprotect: permit RW or RX transitions, but reject PROT_WRITE|PROT_EXEC.
-        let mut mprotect_rules = Vec::new();
-        for allowed in [0, libc::PROT_WRITE as u64, libc::PROT_EXEC as u64] {
-            let condition = SeccompCondition::new(
-                2, // arg2 is prot for mprotect(addr, len, prot)
-                seccompiler::SeccompCmpArgLen::Dword,
-                seccompiler::SeccompCmpOp::MaskedEq((libc::PROT_WRITE | libc::PROT_EXEC) as u64),
-                allowed,
-            )
-            .map_err(|e| {
-                NucleusError::SeccompError(format!("Failed to create mprotect condition: {}", e))
-            })?;
-            let rule = SeccompRule::new(vec![condition]).map_err(|e| {
-                NucleusError::SeccompError(format!("Failed to create mprotect rule: {}", e))
-            })?;
-            mprotect_rules.push(rule);
+        // These syscalls all take the protection mask in argument 2.
+        let prot_rules = [libc::PROT_WRITE, libc::PROT_EXEC]
+            .into_iter()
+            .map(|bit| Self::int_rule(&[(2, MaskedEq(bit as u64), 0)]))
+            .collect::<Result<Vec<_>>>()?;
+        rules.insert(libc::SYS_mmap, prot_rules.clone());
+        if extra_syscalls.iter().any(|name| name == "pkey_mprotect") {
+            rules.insert(libc::SYS_pkey_mprotect, prot_rules.clone());
         }
-        rules.insert(libc::SYS_mprotect, mprotect_rules);
+        rules.insert(libc::SYS_mprotect, prot_rules);
+        // Deny every executable attachment. A read-only executable view can
+        // alias a writable attachment of the same segment.
+        rules.insert(
+            libc::SYS_shmat,
+            vec![Self::int_rule(&[(2, MaskedEq(libc::SHM_EXEC as u64), 0)])?],
+        );
+        if extra_syscalls.iter().any(|name| name == "personality") {
+            rules.insert(libc::SYS_personality, vec![Self::int_rule(&[(0, Eq, -1)])?]);
+        }
+        // mknod/mknodat: FIFOs, sockets and regular files only. Device nodes
+        // stay denied. The kernel reads the mode as a 16-bit umode_t.
+        for (name, mode_arg) in [("mknod", 1), ("mknodat", 2)] {
+            let Some(nr) = syscall_name_to_number(name) else {
+                continue;
+            };
+            if extra_syscalls.iter().any(|extra| extra == name) {
+                let node_rules = [0, libc::S_IFREG, libc::S_IFIFO, libc::S_IFSOCK]
+                    .into_iter()
+                    .map(|kind| {
+                        Self::int_rule(&[(mode_arg, MaskedEq(libc::S_IFMT as u64), kind as i32)])
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                rules.insert(nr, node_rules);
+            }
+        }
+        // kcmp: file-description comparison only (used by Mesa and systemd).
+        if extra_syscalls.iter().any(|name| name == "kcmp") {
+            rules.insert(
+                libc::SYS_kcmp,
+                vec![Self::int_rule(&[(2, Eq, Self::KCMP_FILE)])?],
+            );
+        }
 
         // preadv2/pwritev2: allow only flags == 0, which makes them equivalent
         // to preadv/pwritev. Nonzero RWF_* flags include cache-observing
@@ -645,12 +664,8 @@ impl SeccompManager {
         // clone: allow but deny namespace-creating flags to prevent nested namespace creation
         rules.insert(libc::SYS_clone, vec![Self::clone_rule(&[])?]);
 
-        // execveat: allow but block AT_EMPTY_PATH (0x1000) to prevent fileless
-        // execution. With AT_EMPTY_PATH, execveat can execute code from any open
-        // fd (e.g., open + unlink, or even a socket fd), bypassing filesystem
-        // controls – not just memfd_create. Blocking memfd_create alone is
-        // insufficient. Normal execveat with dirfd+pathname (no AT_EMPTY_PATH)
-        // remains allowed.
+        // Deny direct execution by descriptor. Native procfs mount restrictions
+        // separately cover pathname resolution through procfs descriptor links.
         let execveat_condition = SeccompCondition::new(
             4, // arg4 = flags for execveat(dirfd, pathname, argv, envp, flags)
             seccompiler::SeccompCmpArgLen::Dword,
@@ -695,7 +710,9 @@ impl SeccompManager {
                 continue;
             }
 
-            if Self::SECURITY_CRITICAL_DENIED_SYSCALLS.contains(&name.as_str()) {
+            if Self::SECURITY_CRITICAL_DENIED_SYSCALLS.contains(&name.as_str())
+                || Self::PRIVILEGED_SYSCALLS.contains(&name.as_str())
+            {
                 return Err(NucleusError::ConfigError(format!(
                     "Production mode forbids --seccomp-allow for security-critical syscall '{}'",
                     name
@@ -735,7 +752,7 @@ impl SeccompManager {
     }
 
     #[cfg(test)]
-    pub(crate) fn errno_denied_syscalls_for_test() -> &'static [(i64, u32)] {
+    pub(super) fn errno_denied_syscalls_for_test() -> &'static [ErrnoRule] {
         Self::errno_denied_syscalls()
     }
 
@@ -788,11 +805,8 @@ impl SeccompManager {
 
     /// Apply the seccomp filter with an optional GPU relaxation.
     ///
-    /// When `gpu_mode` is `true`, the restrictive terminal-only `ioctl`
-    /// allowlist is replaced with an unconditional allow. GPU drivers issue
-    /// dozens of vendor-specific ioctl request codes (DRM, NV_ESC_RM, KFD)
-    /// that cannot be enumerated, so the narrow allowlist is incompatible with
-    /// GPU passthrough. This is an audited, opt-in relaxation.
+    /// GPU mode permits vendor request codes while blocking terminal input
+    /// injection and Linux console multiplexing on every descriptor.
     pub fn apply_filter_with_options(
         &mut self,
         allow_network: bool,
@@ -844,17 +858,42 @@ impl SeccompManager {
         }
     }
 
-    fn compile_builtin(
+    pub(super) fn compile_builtin(
         allow_network: bool,
         extra_syscalls: &[String],
         gpu_mode: bool,
     ) -> Result<BpfProgram> {
         let mut rules = Self::minimal_filter(allow_network, extra_syscalls)?;
         if gpu_mode {
-            rules.insert(libc::SYS_ioctl, Vec::new());
-            info!("GPU mode: relaxing seccomp ioctl filter to allow-all");
+            // Keep the normal allowlist for legacy Linux tty requests (0x54xx)
+            // and deny the legacy console keyboard (0x4Bxx) and virtual
+            // terminal (0x56xx) requests. Driver commands outside those ranges
+            // remain available: DRM, NVIDIA and KFD requests carry direction
+            // and size bits above bit 16. The kernel truncates the request to
+            // unsigned int on every supported ABI.
+            use seccompiler::SeccompCmpOp::{Gt, Lt};
+            let ioctl = rules
+                .get_mut(&libc::SYS_ioctl)
+                .expect("built-in ioctl rules");
+            ioctl.push(Self::int_rule(&[(1, Lt, 0x4b00)])?);
+            ioctl.push(Self::int_rule(&[(1, Gt, 0x4bff), (1, Lt, 0x5400)])?);
+            ioctl.push(Self::int_rule(&[(1, Gt, 0x54ff), (1, Lt, 0x5600)])?);
+            ioctl.push(Self::int_rule(&[(1, Gt, 0x56ff)])?);
+            info!("GPU mode: permitting driver ioctls with legacy tty and console filtering");
         }
-        Self::compile_rules(rules)
+        // Programs probe these transfer syscalls and fall back to read/write
+        // on ENOSYS. Killing the process would break ordinary file copies.
+        let mut errno_rules = Self::errno_denied_syscalls().to_vec();
+        for nr in [libc::SYS_splice, libc::SYS_tee, SYS_SENDFILE] {
+            if !rules.contains_key(&nr) {
+                errno_rules.push(ErrnoRule {
+                    nr,
+                    arg0: None,
+                    errno: libc::ENOSYS,
+                });
+            }
+        }
+        Self::compile_rules(rules, &errno_rules)
     }
 
     /// Apply a seccomp profile loaded from a JSON file.
@@ -949,6 +988,11 @@ impl SeccompManager {
             }
             if syscall_group.action == "SCMP_ACT_ALLOW" {
                 for name in &syscall_group.names {
+                    if Self::PRIVILEGED_SYSCALLS.contains(&name.as_str()) {
+                        return Err(NucleusError::SeccompError(format!(
+                            "Native seccomp profile cannot allow {name}"
+                        )));
+                    }
                     if name == "clone" {
                         rules
                             .entry(libc::SYS_clone)
@@ -976,7 +1020,7 @@ impl SeccompManager {
         // Custom profiles that allow clone/ioctl/prctl/socket/mprotect by name
         // without argument-level filters would silently remove all hardening.
         // Overwrite their empty rules with the built-in argument-filtered rules.
-        let builtin_rules = Self::minimal_filter(true, &[])?;
+        let builtin_rules = Self::minimal_filter(true, &Self::opt_in_arg_filtered())?;
         for syscall_name in Self::ARG_FILTERED_SYSCALLS {
             if let Some(nr) = syscall_name_to_number(syscall_name) {
                 if let std::collections::btree_map::Entry::Occupied(mut entry) = rules.entry(nr) {
@@ -992,16 +1036,19 @@ impl SeccompManager {
                 }
             }
         }
-        Self::compile_rules(rules)
+        Self::compile_rules(rules, Self::errno_denied_syscalls())
     }
 
-    fn compile_rules(rules: BTreeMap<i64, Vec<SeccompRule>>) -> Result<BpfProgram> {
+    fn compile_rules(
+        rules: BTreeMap<i64, Vec<SeccompRule>>,
+        errno_rules: &[ErrnoRule],
+    ) -> Result<BpfProgram> {
         let arch = std::env::consts::ARCH.try_into().map_err(|e| {
             NucleusError::SeccompError(format!("Unsupported architecture: {:?}", e))
         })?;
         super::seccomp_bpf::compile_bitmap_bpf_with_errno_syscalls(
             rules,
-            Self::errno_denied_syscalls(),
+            errno_rules,
             SeccompAction::KillProcess,
             SeccompAction::Allow,
             arch,
@@ -1079,7 +1126,14 @@ impl SeccompManager {
         "execveat",
         "futex",
         "ioctl",
+        "mmap",
         "mprotect",
+        "pkey_mprotect",
+        "personality",
+        "shmat",
+        "mknod",
+        "mknodat",
+        "kcmp",
         "preadv2",
         "prctl",
         "pwritev2",
@@ -1087,6 +1141,15 @@ impl SeccompManager {
         "socket",
         "socketpair",
     ];
+
+    const KCMP_FILE: i32 = 0;
+
+    /// Argument-filtered syscalls that are absent unless explicitly requested.
+    fn opt_in_arg_filtered() -> Vec<String> {
+        ["pkey_mprotect", "personality", "mknod", "mknodat", "kcmp"]
+            .map(String::from)
+            .to_vec()
+    }
 
     fn arg_filtered_in_mode(name: &str, allow_network: bool) -> bool {
         Self::ARG_FILTERED_SYSCALLS.contains(&name) && (allow_network || name != "setsockopt")
@@ -1105,8 +1168,43 @@ impl SeccompManager {
         "keyctl",
     ];
 
-    fn errno_denied_syscalls() -> &'static [(i64, u32)] {
-        &[(libc::SYS_clone3, libc::ENOSYS as u32)]
+    // These operations are forbidden even with an explicit profile.
+    const PRIVILEGED_SYSCALLS: &'static [&'static str] = &[
+        // Host-facing descriptors, kernel log and clocks.
+        "pidfd_getfd",
+        "open_by_handle_at",
+        "syslog",
+        "clock_settime",
+        "clock_adjtime",
+        "adjtimex",
+        "settimeofday",
+        // Namespace entry and mount attribute changes can clear the procfs
+        // nosymfollow flag, which the kernel does not lock across user
+        // namespaces.
+        "unshare",
+        "setns",
+        "mount_setattr",
+        // Writable aliases of executable memory bypass the mapping checks.
+        "memfd_create",
+        "memfd_secret",
+        "ptrace",
+        "process_vm_writev",
+    ];
+
+    fn errno_denied_syscalls() -> &'static [ErrnoRule] {
+        &[
+            ErrnoRule {
+                nr: libc::SYS_clone3,
+                arg0: None,
+                errno: libc::ENOSYS,
+            },
+            // Nix wrappers probe PR_SET_MM_ARG_START and tolerate EPERM.
+            ErrnoRule {
+                nr: libc::SYS_prctl,
+                arg0: Some(libc::PR_SET_MM as u32),
+                errno: libc::EPERM,
+            },
+        ]
     }
 
     /// Non-default syscalls that may be opted into via `--seccomp-allow`.
@@ -1165,10 +1263,12 @@ impl SeccompManager {
         "syncfs",
         "sync_file_range",
         "readahead",
+        "splice",
+        "tee",
+        "sendfile",
         "vmsplice",
         "openat2",
         "name_to_handle_at",
-        "open_by_handle_at",
         "io_cancel",
         "io_pgetevents",
         "creat",
@@ -1208,7 +1308,6 @@ impl SeccompManager {
         "ioprio_set",
         "ioprio_get",
         // Process (non-default, low risk)
-        "vfork",
         "pause",
         "alarm",
         "tkill",
@@ -1218,7 +1317,6 @@ impl SeccompManager {
         "time",
         "pidfd_open",
         "pidfd_send_signal",
-        "pidfd_getfd",
         // UID/GID
         "setuid",
         "setgid",
@@ -1237,13 +1335,6 @@ impl SeccompManager {
         // Signals (non-default)
         "rt_tgsigqueueinfo",
         // Misc
-        "mknod",
-        "mknodat",
-        "syslog",
-        "clock_settime",
-        "clock_adjtime",
-        "adjtimex",
-        "kcmp",
         "epoll_pwait2",
         // Futex (non-default)
         "futex_waitv",
@@ -1260,6 +1351,17 @@ impl SeccompManager {
     }
 
     fn apply_bpf_program(bpf_prog: &BpfProgram, log_denied: bool) -> Result<()> {
+        // With this inherited personality flag the kernel can add PROT_EXEC
+        // after a read/write mapping has already passed the seccomp check.
+        // SAFETY: the query and update use scalar personality flags only.
+        let persona = nix::errno::Errno::result(unsafe { libc::personality(0xffff_ffff) })?;
+        if persona & libc::READ_IMPLIES_EXEC != 0 {
+            // SAFETY: retain the current scalar flags except for implicit execution.
+            nix::errno::Errno::result(unsafe {
+                libc::personality((persona & !libc::READ_IMPLIES_EXEC) as libc::c_ulong)
+            })?;
+        }
+
         let mut flags: libc::c_ulong = 0;
         if log_denied {
             flags |= libc::SECCOMP_FILTER_FLAG_LOG as libc::c_ulong;
@@ -1918,8 +2020,8 @@ mod tests {
             "fadvise64 must be allowed on architectures with a generic syscall table"
         );
         assert!(
-            base.contains(&SYS_SENDFILE),
-            "sendfile must be allowed on architectures with a generic syscall table"
+            !base.contains(&SYS_SENDFILE),
+            "sendfile requires explicit opt-in"
         );
     }
 
@@ -1968,15 +2070,28 @@ mod tests {
         let net = SeccompManager::network_mode_syscalls(true);
 
         // Include argument-filtered syscalls in the complete policy counts.
-        assert_eq!(base.len(), 172);
+        // vfork is x86_64-only in the syscall table.
+        #[cfg(target_arch = "x86_64")]
+        const BASE_COUNT: usize = 168;
+        #[cfg(not(target_arch = "x86_64"))]
+        const BASE_COUNT: usize = 167;
+        #[cfg(target_arch = "x86_64")]
+        const FULL_COUNT_OFFLINE: usize = 180;
+        #[cfg(not(target_arch = "x86_64"))]
+        const FULL_COUNT_OFFLINE: usize = 179;
+        assert_eq!(base.len(), BASE_COUNT);
         assert_eq!(net.len(), 9);
         assert_eq!(
             SeccompManager::minimal_filter(false, &[]).unwrap().len(),
-            182
+            FULL_COUNT_OFFLINE
         );
+        #[cfg(target_arch = "x86_64")]
+        const FULL_COUNT_NETWORK: usize = 190;
+        #[cfg(not(target_arch = "x86_64"))]
+        const FULL_COUNT_NETWORK: usize = 189;
         assert_eq!(
             SeccompManager::minimal_filter(true, &[]).unwrap().len(),
-            192
+            FULL_COUNT_NETWORK
         );
     }
 
@@ -2022,7 +2137,7 @@ mod tests {
         assert!(
             SeccompManager::errno_denied_syscalls()
                 .iter()
-                .any(|(nr, errno)| *nr == libc::SYS_clone3 && *errno == libc::ENOSYS as u32),
+                .any(|rule| rule.nr == libc::SYS_clone3 && rule.errno == libc::ENOSYS),
             "clone3 must be denied with ENOSYS to trigger libc fallback"
         );
     }
@@ -2042,11 +2157,15 @@ mod tests {
         let base = SeccompManager::base_allowed_syscalls();
         // chown/fchown/lchown/fchownat: allowed – safe after CAP_CHOWN/CAP_FOWNER drop
         // mlock/munlock: allowed – needed by databases, bounded by RLIMIT_MEMLOCK
+        // vfork: allowed on x86_64 – libc issues the raw syscall directly and
+        // it cannot create namespaces (no flags argument); see the base
+        // allowlist rationale. fork stays excluded to force modern libc
+        // through the argument-filtered clone path.
         let removed = [
             libc::SYS_sync,
             libc::SYS_syncfs,
             libc::SYS_mincore,
-            libc::SYS_vfork,
+            libc::SYS_fork,
             libc::SYS_tkill,
             // io_uring: large attack surface, many CVEs – require custom profile
             libc::SYS_io_uring_setup,
@@ -2069,7 +2188,8 @@ mod tests {
         // argument-level filtering to block namespace-creating flags.
         // Verify by inspecting the built-in filter rules that serve as the
         // merge source for apply_profile_from_file.
-        let rules = SeccompManager::minimal_filter(true, &[]).unwrap();
+        let rules =
+            SeccompManager::minimal_filter(true, &SeccompManager::opt_in_arg_filtered()).unwrap();
 
         // Every ARG_FILTERED_SYSCALLS entry must have non-empty argument-level
         // rules in the built-in filter so apply_profile_from_file can merge them.
@@ -2394,6 +2514,26 @@ mod tests {
     }
 
     #[test]
+    fn privileged_syscalls_are_denied_in_fragments_and_profiles() {
+        let profile = tempfile::NamedTempFile::new().unwrap();
+        for &name in SeccompManager::PRIVILEGED_SYSCALLS {
+            let extra = [name.to_string()];
+            let rules = SeccompManager::minimal_filter(false, &extra).unwrap();
+            if let Some(nr) = syscall_name_to_number(name) {
+                assert!(!rules.contains_key(&nr), "{name}");
+            }
+            assert!(SeccompManager::validate_extra_syscalls_for_production(false, &extra).is_err());
+            let json = serde_json::json!({"defaultAction": "SCMP_ACT_KILL_PROCESS",
+                "architectures": [], "syscalls": [{"names": [name], "action": "SCMP_ACT_ALLOW"}]});
+            std::fs::write(profile.path(), json.to_string()).unwrap();
+            assert!(SeccompManager::compile_profile(profile.path(), None)
+                .unwrap_err()
+                .to_string()
+                .contains(name));
+        }
+    }
+
+    #[test]
     fn test_extra_syscalls_clone3_remains_blocked() {
         let extra = vec!["clone3".to_string()];
         let rules = SeccompManager::minimal_filter(true, &extra).unwrap();
@@ -2404,7 +2544,7 @@ mod tests {
         assert!(
             SeccompManager::errno_denied_syscalls()
                 .iter()
-                .any(|(nr, _)| *nr == libc::SYS_clone3),
+                .any(|rule| rule.nr == libc::SYS_clone3),
             "clone3 must remain covered by the exact ENOSYS deny"
         );
     }

@@ -116,8 +116,7 @@ CLI surface:
    Device creation or ownership failures abort setup; native GPU setup requires
    permission to create device nodes. Existing target inodes are never reused.
 4. **Seccomp:** built-in filter is built with `gpu_mode = true`, which replaces
-   the restrictive terminal-only `ioctl` rule with an unconditional allow.
-   Custom `--seccomp-profile` users own their ioctl policy.
+   the default restriction for driver requests. Legacy tty requests (`0x54xx`) retain the regular terminal allowlist on every fd, and legacy console keyboard (`0x4Bxx`) and virtual terminal (`0x56xx`) requests are denied. Native custom profiles that allow `ioctl` retain the default argument checks.
 5. **Landlock:** each selected GPU character node receives read, write and
    device-ioctl permissions.
 

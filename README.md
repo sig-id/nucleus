@@ -655,6 +655,12 @@ path = "/tmp"
 access = ["read", "write", "create", "remove"]
 ```
 
+Native seccomp rejects simultaneous write and execute permissions in `mmap`, `mprotect`, and `pkey_mprotect` requests, and rejects every executable `shmat` attachment. A mapping can still be written first and made executable afterwards, so this is an exploit mitigation and does not stop a workload from introducing native code. It returns `EPERM` for `PR_SET_MM`. The built-in policy requires explicit `--seccomp-allow` entries for `splice`, `tee`, and `sendfile` in every network mode; without them these calls return `ENOSYS` so callers fall back to `read` and `write`. GPU mode still blocks `TIOCSTI`, `TIOCLINUX`, and the legacy console keyboard and virtual terminal requests (`0x4Bxx`, `0x56xx`) on all file descriptors.
+
+`--seccomp-allow mknod`, `mknodat`, and `kcmp` are argument-filtered: node creation is limited to FIFOs, sockets, and regular files, and `kcmp` to file-description comparison. Native seccomp profiles cannot allow `unshare`, `setns`, `mount_setattr`, `memfd_create`, `memfd_secret`, `ptrace`, `process_vm_writev`, `pidfd_getfd`, `open_by_handle_at`, `syslog`, or the clock setters.
+
+Native containers mount procfs with `nosymfollow` to prevent execution through descriptor links. Programs can read ordinary files such as `/proc/<pid>/status` using a numeric PID. Programs that follow `/proc/self`, `/proc/thread-self`, or `/dev/fd/N` need a different access path. Recreate running containers to pick up the new mounts and saved seccomp program.
+
 ### Seccomp Profile Generation
 
 Profiles shouldn't be hand-written from scratch. Use trace mode to record actual syscall usage, then generate a minimal profile:

@@ -66,6 +66,44 @@ mod tests {
         assert_eq!((created.uid(), created.gid()), (100_000, 100_000));
     }
 
+    #[test]
+    #[ignore = "requires host root, native namespaces and mount privileges"]
+    fn native_procfs_exposes_status_but_refuses_descriptor_links() {
+        let state = TempDir::new().unwrap();
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_nucleus"))
+            .args(["create", "--root"])
+            .arg(state.path())
+            .args([
+                "--runtime",
+                "native",
+                "--trust-level",
+                "trusted",
+                "--network",
+                "none",
+                "--pids",
+                "0",
+                "--allow-degraded-security",
+                "--",
+                "/bin/sh",
+                "-ec",
+                r#"exec 3</dev/null
+                   test -r "/proc/$$/status"
+                   test -L "/proc/$$/fd/3"
+                   test ! -r "/proc/$$/fd/3"
+                   test ! -r /proc/self/fd/3
+                   exec 4</bin/sh
+                   if "/proc/$$/fd/4" -c true 2>/dev/null; then exit 1; fi
+                   /bin/sh -ec 'test -r "/proc/$$/status" && test ! -r "/proc/$$/fd/3"'"#,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     // --- ContextPopulator: file copying ---
 
     #[test]
