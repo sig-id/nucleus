@@ -635,6 +635,123 @@ mod tests {
         assert_eq!(bpf_eval(&prog, &data), RET_ERRNO_ENOSYS);
     }
 
+    // Exercise the assembled program with --seccomp-allow requests included.
+    // The requests must preserve all argument checks and network-mode gates.
+    fn network_and_futex_program(network: bool) -> BpfProgram {
+        let extra = ["futex", "socket", "socketpair", "setsockopt"].map(String::from);
+        let rules = crate::security::SeccompManager::minimal_filter_for_test(network, &extra);
+        compile_bitmap_bpf(
+            rules,
+            SeccompAction::KillProcess,
+            SeccompAction::Allow,
+            TargetArch::x86_64,
+        )
+        .unwrap()
+    }
+
+    fn check_int_args(prog: &BpfProgram, syscall: i64, args: [i32; 3], expected: u32) {
+        // The kernel interprets each of these arguments as a 32-bit int.
+        for high_bits in [0, 1u64 << 32] {
+            let [a, b, c] = args.map(|arg| high_bits | arg as u32 as u64);
+            let data = make_seccomp_data(syscall as u32, AUDIT_ARCH_X86_64, [a, b, c, 0, 0, 0]);
+            assert_eq!(
+                bpf_eval(prog, &data),
+                expected,
+                "syscall {syscall}, args {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_builtin_futex_operations() {
+        for network in [false, true] {
+            let prog = network_and_futex_program(network);
+            for flags in [
+                0,
+                libc::FUTEX_PRIVATE_FLAG,
+                libc::FUTEX_CLOCK_REALTIME,
+                libc::FUTEX_PRIVATE_FLAG | libc::FUTEX_CLOCK_REALTIME,
+            ] {
+                for op in [
+                    libc::FUTEX_WAIT,
+                    libc::FUTEX_WAKE,
+                    libc::FUTEX_WAIT_BITSET,
+                    libc::FUTEX_WAKE_BITSET,
+                    libc::FUTEX_REQUEUE,
+                    libc::FUTEX_CMP_REQUEUE,
+                    libc::FUTEX_WAKE_OP,
+                ] {
+                    check_int_args(&prog, libc::SYS_futex, [0, op | flags, 0], RET_ALLOW);
+                }
+                for op in [
+                    libc::FUTEX_LOCK_PI,
+                    libc::FUTEX_LOCK_PI2,
+                    libc::FUTEX_TRYLOCK_PI,
+                    libc::FUTEX_UNLOCK_PI,
+                    libc::FUTEX_WAIT_REQUEUE_PI,
+                    libc::FUTEX_CMP_REQUEUE_PI,
+                    0x10000 | libc::FUTEX_WAIT,
+                ] {
+                    check_int_args(&prog, libc::SYS_futex, [0, op | flags, 0], RET_KILL);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_builtin_socket_protocols_and_options() {
+        const IPPROTO_L2TP: i32 = 115;
+        for network in [false, true] {
+            let prog = network_and_futex_program(network);
+            let network_action = if network { RET_ALLOW } else { RET_KILL };
+            for nr in [libc::SYS_socket, libc::SYS_socketpair] {
+                for kind in [libc::SOCK_STREAM, libc::SOCK_DGRAM, libc::SOCK_SEQPACKET] {
+                    check_int_args(&prog, nr, [libc::AF_UNIX, kind, 0], RET_ALLOW);
+                }
+                check_int_args(&prog, nr, [libc::AF_NETLINK, libc::SOCK_DGRAM, 0], RET_KILL);
+            }
+            for domain in [libc::AF_INET, libc::AF_INET6] {
+                for flags in [
+                    0,
+                    libc::SOCK_NONBLOCK,
+                    libc::SOCK_CLOEXEC,
+                    libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+                ] {
+                    for (kind, proto) in [
+                        (libc::SOCK_STREAM, 0),
+                        (libc::SOCK_STREAM, libc::IPPROTO_TCP),
+                        (libc::SOCK_DGRAM, 0),
+                        (libc::SOCK_DGRAM, libc::IPPROTO_UDP),
+                    ] {
+                        let args = [domain, kind | flags, proto];
+                        check_int_args(&prog, libc::SYS_socket, args, network_action);
+                        check_int_args(&prog, libc::SYS_socketpair, args, RET_KILL);
+                    }
+                }
+                for (kind, proto) in [
+                    (libc::SOCK_STREAM, libc::IPPROTO_SCTP),
+                    (libc::SOCK_STREAM, libc::IPPROTO_MPTCP),
+                    (libc::SOCK_DGRAM, IPPROTO_L2TP),
+                    (libc::SOCK_RAW, libc::IPPROTO_TCP),
+                    (libc::SOCK_SEQPACKET, 0),
+                    (libc::SOCK_STREAM, libc::IPPROTO_UDP),
+                    (libc::SOCK_DGRAM, libc::IPPROTO_TCP),
+                    (libc::SOCK_STREAM | 0x10000, 0),
+                ] {
+                    check_int_args(&prog, libc::SYS_socket, [domain, kind, proto], RET_KILL);
+                }
+            }
+            for (level, option, action) in [
+                (libc::IPPROTO_TCP, libc::TCP_ULP, RET_KILL),
+                (libc::IPPROTO_TCP, libc::TCP_NODELAY, network_action),
+                (libc::SOL_SOCKET, libc::SO_REUSEADDR, network_action),
+                (libc::SOL_SOCKET, libc::TCP_ULP, network_action),
+            ] {
+                check_int_args(&prog, libc::SYS_setsockopt, [0, level, option], action);
+            }
+        }
+    }
+
     #[test]
     fn test_builtin_prctl_cap_ambient_only_allows_is_set() {
         let rules = crate::security::SeccompManager::minimal_filter_for_test(true, &[]);
@@ -910,10 +1027,10 @@ mod tests {
         )
         .unwrap();
 
-        // Linear scan produces ~1119 instructions. Bitmap: ~246 (78% reduction).
-        // The remaining instructions are mostly arg-check chains for ~7 syscalls.
+        // The network-enabled filter uses 426 instructions on x86_64, including
+        // the futex commands and socket type/protocol combinations.
         assert!(
-            prog.len() < 400,
+            prog.len() < 450,
             "BPF program should be compact, got {} instructions",
             prog.len()
         );
