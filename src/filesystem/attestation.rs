@@ -1,11 +1,12 @@
 use crate::error::{NucleusError, Result};
 use crate::filesystem::ContextPopulator;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{BufReader, Read};
-use std::path::{Component, Path};
+use std::os::unix::fs::MetadataExt;
+use std::path::{Component, Path, PathBuf};
 
 pub const ROOTFS_ATTESTATION_FILE: &str = ".nucleus-rootfs-sha256";
 pub const ROOTFS_STORE_PATHS_FILE: &str = ".nucleus-rootfs-store-paths";
@@ -15,9 +16,9 @@ const NIX_STORE_HASH_ALPHABET: &[u8] = b"0123456789abcdfghijklmnpqrsvwxyz";
 pub type DirectoryManifest = BTreeMap<String, String>;
 
 #[derive(Clone, Copy)]
-enum ScanMode {
+enum ScanMode<'a> {
     Context,
-    Rootfs,
+    Rootfs(&'a RootfsSources),
 }
 
 pub fn snapshot_context_dir(root: &Path) -> Result<DirectoryManifest> {
@@ -36,19 +37,165 @@ pub fn verify_context_manifest(expected: &DirectoryManifest, dest: &Path) -> Res
     compare_manifests(expected, &actual, "context")
 }
 
-pub fn verify_rootfs_attestation(root: &Path) -> Result<()> {
-    let manifest_path = root.join(ROOTFS_ATTESTATION_FILE);
-    if !manifest_path.exists() {
+pub fn verify_rootfs_attestation(root: &Path) -> Result<PathBuf> {
+    let resolved = root.canonicalize()?;
+    if root != resolved && is_immediate_nix_store_object_path(root) {
         return Err(NucleusError::FilesystemError(format!(
-            "Rootfs attestation requested but manifest is missing: {:?}",
-            manifest_path
+            "Configured store rootfs changed identity: {root:?}"
         )));
     }
-
-    let expected = read_manifest_file(&manifest_path)?;
+    let root = resolved;
+    if !is_immediate_nix_store_object_path(&root) {
+        return Err(NucleusError::FilesystemError(format!(
+            "Attested rootfs must be a registered Nix store object: {root:?}"
+        )));
+    }
+    // Verify against the host store database before consuming the in-tree
+    // manifest or its dependency list. Never take the verifier from PATH.
+    verify_registered_objects(std::slice::from_ref(&root))?;
+    let sources = RootfsSources::load(&root)?;
+    let closure: Vec<_> = sources.store_paths.iter().cloned().collect();
+    for group in closure.chunks(128) {
+        verify_registered_objects(group)?;
+    }
+    for object in std::iter::once(&root).chain(&closure) {
+        verify_store_metadata(object)?;
+    }
+    let expected = read_rootfs_attestation(&root)?;
     let mut actual = BTreeMap::new();
-    scan_dir(root, root, ScanMode::Rootfs, &mut actual)?;
-    compare_manifests(&expected, &actual, "rootfs")
+    scan_dir(&root, &root, ScanMode::Rootfs(&sources), &mut actual)?;
+    compare_manifests(&expected, &actual, "rootfs")?;
+    Ok(root)
+}
+
+fn verify_registered_objects(objects: &[PathBuf]) -> Result<()> {
+    let tool = [
+        option_env!("NUCLEUS_PACKAGED_NIX_STORE"),
+        Some("/run/current-system/sw/bin/nix-store"),
+        Some("/nix/var/nix/profiles/default/bin/nix-store"),
+        Some("/usr/bin/nix-store"),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|p| Path::new(p).is_file())
+    .ok_or_else(|| {
+        NucleusError::FilesystemError("Rootfs verification requires host nix-store".into())
+    })?;
+    let status = std::process::Command::new(tool)
+        .env_clear()
+        .env("HOME", "/")
+        .args(["--store", "daemon", "--verify-path"])
+        .args(objects)
+        .status()?;
+    if !status.success() {
+        return Err(NucleusError::FilesystemError(format!(
+            "Host Nix store integrity verification failed: {status}"
+        )));
+    }
+    Ok(())
+}
+
+// The registered NAR hash covers node type, directory membership, symlink
+// text, contents and executability. Verify the metadata NAR omits separately.
+fn verify_store_metadata(path: &Path) -> Result<()> {
+    let m = fs::symlink_metadata(path)?;
+    let mode = m.mode() & 0o7777;
+    let valid = if m.is_symlink() {
+        mode == 0o777
+    } else if m.is_dir() {
+        mode == 0o555
+    } else {
+        m.is_file() && matches!(mode, 0o444 | 0o555)
+    };
+    if !valid || m.uid() != 0 || m.gid() != 0 {
+        return Err(NucleusError::FilesystemError(format!(
+            "Invalid Nix store ownership, mode or file type at {path:?}"
+        )));
+    }
+    if m.is_dir() {
+        for entry in fs::read_dir(path)? {
+            verify_store_metadata(&entry?.path())?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) struct RootfsSources {
+    root: PathBuf,
+    dir: std::os::fd::OwnedFd,
+    pub store_paths: BTreeSet<PathBuf>,
+}
+
+impl RootfsSources {
+    pub fn load(root: &Path) -> Result<Self> {
+        let root = root.canonicalize()?;
+        let dir = nix::fcntl::open(
+            &root,
+            nix::fcntl::OFlag::O_PATH
+                | nix::fcntl::OFlag::O_DIRECTORY
+                | nix::fcntl::OFlag::O_NOFOLLOW
+                | nix::fcntl::OFlag::O_CLOEXEC,
+            nix::sys::stat::Mode::empty(),
+        )?;
+        if fs::read_link(super::fd_path(&dir))? != root {
+            return Err(NucleusError::FilesystemError(format!(
+                "Rootfs changed during setup: {root:?}"
+            )));
+        }
+        let path = super::fd_path(&dir).join(ROOTFS_STORE_PATHS_FILE);
+        let mut store_paths = BTreeSet::new();
+        match fs::symlink_metadata(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+            Err(e) => return Err(e.into()),
+            Ok(_) => {
+                let data = super::read_regular_file_nofollow(&path)?;
+                let data = std::str::from_utf8(&data).map_err(|_| {
+                    NucleusError::FilesystemError(format!("Invalid UTF-8 in {path:?}"))
+                })?;
+                for line in data.lines().map(str::trim).filter(|s| !s.is_empty()) {
+                    let object = Path::new(line);
+                    if !is_immediate_nix_store_object_path(object)
+                        || object.canonicalize()? != object
+                    {
+                        return Err(NucleusError::FilesystemError(format!("Invalid rootfs store path {line:?}: expected immediate /nix/store object")));
+                    }
+                    store_paths.insert(object.to_owned());
+                }
+            }
+        }
+        Ok(Self {
+            root,
+            dir,
+            store_paths,
+        })
+    }
+
+    pub fn validate_resolved(&self, resolved: &Path) -> Result<()> {
+        if resolved.starts_with(&self.root)
+            || resolved.ancestors().any(|p| self.store_paths.contains(p))
+        {
+            return Ok(());
+        }
+        Err(NucleusError::FilesystemError(format!(
+            "Rootfs source resolves outside allowed roots: {resolved:?}"
+        )))
+    }
+
+    pub fn open_subdir(&self, name: &str) -> Result<Option<std::os::fd::OwnedFd>> {
+        use nix::fcntl::{openat, OFlag};
+        let fd = match openat(
+            &self.dir,
+            name,
+            OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+            nix::sys::stat::Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(nix::errno::Errno::ENOENT) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        self.validate_resolved(&fs::read_link(super::fd_path(&fd))?)?;
+        Ok(Some(fd))
+    }
 }
 
 pub fn read_rootfs_attestation(root: &Path) -> Result<DirectoryManifest> {
@@ -110,7 +257,7 @@ fn is_valid_nix_store_name_byte(byte: u8) -> bool {
 }
 
 fn read_manifest_file(path: &Path) -> Result<DirectoryManifest> {
-    let content = fs::read_to_string(path).map_err(|e| {
+    let content = String::from_utf8(super::read_regular_file_nofollow(path)?).map_err(|e| {
         NucleusError::FilesystemError(format!("Failed to read manifest {:?}: {}", path, e))
     })?;
 
@@ -215,7 +362,7 @@ fn scan_dir(
 
         match mode {
             ScanMode::Context => scan_context_entry(root, &path, manifest)?,
-            ScanMode::Rootfs => scan_rootfs_entry(root, &path, manifest)?,
+            ScanMode::Rootfs(sources) => scan_rootfs_entry(root, &path, manifest, sources)?,
         }
     }
 
@@ -225,7 +372,7 @@ fn scan_dir(
 fn should_skip(mode: &ScanMode, name: &OsStr, path: &Path, root: &Path) -> Result<bool> {
     match mode {
         ScanMode::Context => Ok(ContextPopulator::should_exclude_name(name)),
-        ScanMode::Rootfs => {
+        ScanMode::Rootfs(_) => {
             let rel = relative_path(root, path)?;
             Ok(rel == ROOTFS_ATTESTATION_FILE)
         }
@@ -252,18 +399,23 @@ fn scan_context_entry(root: &Path, path: &Path, manifest: &mut DirectoryManifest
     Ok(())
 }
 
-fn scan_rootfs_entry(root: &Path, path: &Path, manifest: &mut DirectoryManifest) -> Result<()> {
+fn scan_rootfs_entry(
+    root: &Path,
+    path: &Path,
+    manifest: &mut DirectoryManifest,
+    sources: &RootfsSources,
+) -> Result<()> {
     let symlink_metadata = fs::symlink_metadata(path)
         .map_err(|e| NucleusError::FilesystemError(format!("Failed to stat {:?}: {}", path, e)))?;
     if symlink_metadata.is_symlink() {
-        validate_rootfs_symlink_target(root, path)?;
+        sources.validate_resolved(&path.canonicalize()?)?;
     }
 
     let metadata = fs::metadata(path)
         .map_err(|e| NucleusError::FilesystemError(format!("Failed to stat {:?}: {}", path, e)))?;
 
     if metadata.is_dir() {
-        scan_dir(root, path, ScanMode::Rootfs, manifest)?;
+        scan_dir(root, path, ScanMode::Rootfs(sources), manifest)?;
         return Ok(());
     }
 
@@ -272,36 +424,6 @@ fn scan_rootfs_entry(root: &Path, path: &Path, manifest: &mut DirectoryManifest)
     }
 
     Ok(())
-}
-
-fn validate_rootfs_symlink_target(root: &Path, path: &Path) -> Result<()> {
-    let resolved = fs::canonicalize(path).map_err(|e| {
-        NucleusError::FilesystemError(format!(
-            "Failed to resolve rootfs symlink target {:?}: {}",
-            path, e
-        ))
-    })?;
-    let canonical_root = fs::canonicalize(root).map_err(|e| {
-        NucleusError::FilesystemError(format!("Failed to resolve rootfs {:?}: {}", root, e))
-    })?;
-
-    if resolved.starts_with(&canonical_root) {
-        return Ok(());
-    }
-    if let Some((store_name, _)) = nix_store_object_name(&resolved) {
-        if is_valid_nix_store_object_name(store_name) {
-            return Ok(());
-        }
-        return Err(NucleusError::FilesystemError(format!(
-            "Rootfs symlink {:?} resolves to invalid /nix/store path: {:?}",
-            path, resolved
-        )));
-    }
-
-    Err(NucleusError::FilesystemError(format!(
-        "Rootfs symlink {:?} resolves outside allowed roots: {:?}",
-        path, resolved
-    )))
 }
 
 fn relative_path(root: &Path, path: &Path) -> Result<String> {
@@ -401,6 +523,62 @@ mod tests {
     }
 
     #[test]
+    fn rootfs_subdirs_are_confined_without_attestation() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("etc")).unwrap();
+        let sources = RootfsSources::load(dir.path()).unwrap();
+        assert!(sources.open_subdir("etc").is_err());
+        let undeclared = Path::new("/nix/store/0123456789abcdfghijklmnpqrsvwxyz-other/lib");
+        assert!(sources.validate_resolved(undeclared).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires root to test ownership and canonical store metadata"]
+    fn rejects_noncanonical_store_metadata() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("file");
+        fs::write(&file, b"fixture").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o555)).unwrap();
+        verify_store_metadata(&file).unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o4555)).unwrap();
+        assert!(verify_store_metadata(&file).is_err());
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o444)).unwrap();
+        nix::unistd::chown(&file, Some(nix::unistd::Uid::from_raw(1234)), None).unwrap();
+        assert!(verify_store_metadata(&file).is_err());
+        let fifo = dir.path().join("pipe");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRUSR).unwrap();
+        assert!(verify_store_metadata(&fifo).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires a trusted host Nix daemon and canonical store ownership"]
+    fn verify_registered_rootfs_with_empty_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("attestation-fixture");
+        fs::create_dir_all(root.join("empty")).unwrap();
+        fs::write(root.join(ROOTFS_ATTESTATION_FILE), "").unwrap();
+        let output = std::process::Command::new("nix-store")
+            .args(["--store", "daemon", "--add"])
+            .arg(&root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        verify_rootfs_attestation(Path::new(
+            std::str::from_utf8(&output.stdout).unwrap().trim(),
+        ))
+        .unwrap();
+        if let Some(root) = std::env::var_os("NUCLEUS_TEST_ATTESTED_ROOTFS") {
+            verify_rootfs_attestation(Path::new(&root)).unwrap();
+        }
+    }
+
+    #[test]
     fn test_rootfs_attestation_rejects_symlink_targets_outside_allowed_roots() {
         let temp = tempfile::TempDir::new().unwrap();
         let root = temp.path().join("rootfs");
@@ -417,7 +595,12 @@ mod tests {
         )
         .unwrap();
 
-        let err = verify_rootfs_attestation(&root).unwrap_err();
+        assert!(verify_rootfs_attestation(&root)
+            .unwrap_err()
+            .to_string()
+            .contains("registered Nix store object"));
+        let sources = RootfsSources::load(&root).unwrap();
+        let err = sources.validate_resolved(&outside).unwrap_err();
         assert!(err.to_string().contains("outside allowed roots"));
     }
 }

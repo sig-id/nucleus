@@ -2,7 +2,7 @@ use crate::error::{NucleusError, Result};
 use crate::filesystem::{
     create_dev_nodes, create_minimal_fs, read_regular_file_nofollow, resolve_container_destination,
     snapshot_context_dir, validate_production_rootfs_path, verify_context_manifest,
-    verify_rootfs_attestation, ContextPopulator, GpuDeviceSet,
+    ContextPopulator, GpuDeviceSet,
 };
 use crate::network::{BridgeNetwork, NetworkMode};
 use crate::security::{
@@ -33,6 +33,42 @@ fn gvisor_network_mode(network: &NetworkMode) -> Result<GVisorNetworkMode> {
         NetworkMode::GVisorHost => GVisorNetworkMode::Host,
         NetworkMode::Bridge(_) => GVisorNetworkMode::Sandbox,
     })
+}
+
+/// runsc resolves OCI source pathnames after exec. Give it private mountpoints
+/// backed by the descriptors checked in the launcher namespace.
+fn stage_bind_sources(
+    dir: &std::path::Path,
+    offset: usize,
+    mounts: &mut [OciMount],
+    pin: impl Fn(&std::path::Path) -> Result<std::os::fd::OwnedFd>,
+) -> Result<()> {
+    use crate::filesystem::{bind_tree, fd_path, mount_target};
+    for (i, mount) in mounts
+        .iter_mut()
+        .enumerate()
+        .filter(|(_, m)| m.mount_type == "bind")
+    {
+        let fd = pin(std::path::Path::new(&mount.source))?;
+        let source = fd_path(&fd);
+        let directory = std::fs::metadata(&source)?.is_dir();
+        let relative = std::path::PathBuf::from(format!("bind-{}", offset + i));
+        let target = mount_target(dir, &relative, directory)?;
+        let mut attrs = libc::MOUNT_ATTR_NOSUID | libc::MOUNT_ATTR_NODEV;
+        if mount.options.iter().any(|v| v == "ro") {
+            attrs |= libc::MOUNT_ATTR_RDONLY;
+        }
+        if mount.options.iter().any(|v| v == "noexec") {
+            attrs |= libc::MOUNT_ATTR_NOEXEC;
+        }
+        bind_tree(&source, &target, directory, attrs)?;
+        mount.source = dir
+            .join(relative)
+            .to_str()
+            .ok_or_else(|| NucleusError::ConfigError("OCI staging path must be UTF-8".into()))?
+            .to_owned();
+    }
+    Ok(())
 }
 
 impl Container {
@@ -160,23 +196,63 @@ impl Container {
             } else {
                 rootfs_path.clone()
             };
-            if self.config.verify_rootfs_attestation {
-                verify_rootfs_attestation(&rootfs_path)?;
+            let offset = oci_config.mounts.len();
+            let sources = crate::filesystem::RootfsSources::load(&rootfs_path)?;
+            oci_config = oci_config.with_rootfs_sources(&sources)?;
+            if !crate::filesystem::is_immediate_nix_store_object_path(&rootfs_path) {
+                stage_bind_sources(
+                    &artifact_dir,
+                    offset,
+                    &mut oci_config.mounts[offset..],
+                    |p| {
+                        let fd = nix::fcntl::open(
+                            p,
+                            nix::fcntl::OFlag::O_PATH | nix::fcntl::OFlag::O_CLOEXEC,
+                            nix::sys::stat::Mode::empty(),
+                        )?;
+                        sources.validate_resolved(&std::fs::read_link(
+                            crate::filesystem::fd_path(&fd),
+                        )?)?;
+                        Ok(fd)
+                    },
+                )?;
             }
-            oci_config = oci_config.with_rootfs_binds(&rootfs_path)?;
         } else {
             oci_config = oci_config.with_host_runtime_binds();
         }
 
+        let offset = oci_config.mounts.len();
         oci_config = oci_config.with_workspace_mount(&self.config.workspace)?;
+        if self.config.workspace.mode != super::WorkspaceMode::CopyInOut {
+            stage_bind_sources(
+                &artifact_dir,
+                offset,
+                &mut oci_config.mounts[offset..],
+                crate::filesystem::pin_workspace_source,
+            )?;
+        }
 
         if !self.config.provider_configs.is_empty() {
+            let offset = oci_config.mounts.len();
             oci_config = oci_config
                 .with_provider_config_mounts(&self.config.home, &self.config.provider_configs)?;
+            stage_bind_sources(
+                &artifact_dir,
+                offset,
+                &mut oci_config.mounts[offset..],
+                crate::filesystem::pin_provider_source,
+            )?;
         }
 
         if !self.config.volumes.is_empty() {
+            let offset = oci_config.mounts.len();
             oci_config = oci_config.with_volume_mounts(&self.config.volumes)?;
+            stage_bind_sources(
+                &artifact_dir,
+                offset,
+                &mut oci_config.mounts[offset..],
+                crate::filesystem::pin_volume_source,
+            )?;
         }
 
         if let Some(context_dir) = &self.config.context_dir {
@@ -235,8 +311,10 @@ impl Container {
         // binds + NVIDIA env. runsc owns device node creation and the cgroup
         // device rules inside its sandbox.
         if let (Some(set), Some(gpu_config)) = (gpu_device_set, &self.config.gpu) {
+            let mut gpu_config = gpu_config.clone();
+            gpu_config.bind_driver_libraries &= self.config.rootfs_path.is_none();
             oci_config =
-                oci_config.with_gpu_passthrough(gpu_config, set, &self.config.process_identity)?;
+                oci_config.with_gpu_passthrough(&gpu_config, set, &self.config.process_identity)?;
         }
 
         // Use --bundle path if provided, otherwise default
@@ -543,7 +621,10 @@ impl Container {
         let mut staged = Vec::with_capacity(secrets.len());
 
         for secret in secrets {
-            let staged_source = resolve_container_destination(stage_dir, &secret.dest)?;
+            let staged_source = resolve_container_destination(
+                stage_dir,
+                &crate::filesystem::normalize_secret_destination(&secret.dest)?,
+            )?;
             if let Some(parent) = staged_source.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| {
                     NucleusError::FilesystemError(format!(

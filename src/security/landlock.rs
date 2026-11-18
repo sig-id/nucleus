@@ -359,6 +359,20 @@ impl LandlockManager {
             }
         }
 
+        // Shell redirection opens /dev/null for writing with O_TRUNC. Grant
+        // that operation on the null device inode in the private /dev.
+        if let Ok(fd) = PathFd::new("/dev/null") {
+            use nix::sys::stat::{fstat, makedev, SFlag};
+            let stat = fstat(&fd)?;
+            if SFlag::from_bits_truncate(stat.st_mode) == SFlag::S_IFCHR
+                && stat.st_rdev == makedev(1, 3)
+            {
+                ruleset = ruleset
+                    .add_rule(PathBeneath::new(fd, AccessFs::WriteFile | AccessFs::Truncate))
+                    .map_err(ll_err)?;
+            }
+        }
+
         // /dev/shm: read+write for POSIX shared memory (shm_open).
         // Required by PostgreSQL, Redis, and other programs.
         // No execute – same policy as /tmp.

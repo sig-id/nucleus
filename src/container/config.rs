@@ -1663,7 +1663,7 @@ impl ContainerConfig {
         }
 
         for secret in &self.secrets {
-            normalize_container_destination(&secret.dest)?;
+            crate::filesystem::normalize_secret_destination(&secret.dest)?;
         }
 
         for provider_config in &self.provider_configs {

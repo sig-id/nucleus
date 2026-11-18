@@ -538,7 +538,7 @@ encrypted = true
 
 [volumes.db-data]
 volume_type = "persistent"
-path = "/var/lib/nucleus/myapp/db"
+path = "/srv/nucleus/myapp/db"
 owner = "70:70"
 
 [services.postgres]
@@ -862,7 +862,7 @@ name = "test"
 
 [volumes.data]
 volume_type = "persistent"
-path = "/var/lib/test"
+path = "/srv/test"
 owner = "abc:def"
 
 [services.web]

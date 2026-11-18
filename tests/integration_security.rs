@@ -228,7 +228,9 @@ mod tests {
             mode: 0o400,
         }];
 
-        let config = OciConfig::new(vec!["/bin/sh".to_string()], None).with_secret_mounts(&secrets);
+        let config = OciConfig::new(vec!["/bin/sh".to_string()], None)
+            .with_secret_mounts(&secrets)
+            .unwrap();
 
         let secret_mount = config
             .mounts
@@ -247,8 +249,8 @@ mod tests {
 
         let stage_dir = TempDir::new().unwrap();
         let staged = vec![SecretMount {
-            source: stage_dir.path().join("etc/tls/cert.pem"),
-            dest: std::path::PathBuf::from("/etc/tls/cert.pem"),
+            source: stage_dir.path().join("app/tls/cert.pem"),
+            dest: std::path::PathBuf::from("/app/tls/cert.pem"),
             mode: 0o400,
         }];
 
@@ -261,7 +263,7 @@ mod tests {
             .iter()
             .any(|m| m.destination == "/run/secrets"));
         assert!(config.mounts.iter().any(|m| {
-            m.destination == "/etc/tls/cert.pem" && m.source.ends_with("etc/tls/cert.pem")
+            m.destination == "/app/tls/cert.pem" && m.source.ends_with("app/tls/cert.pem")
         }));
     }
 

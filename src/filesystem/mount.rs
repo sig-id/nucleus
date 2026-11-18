@@ -1,4 +1,3 @@
-use super::attestation::{is_immediate_nix_store_object_path, ROOTFS_STORE_PATHS_FILE};
 use super::{bind_tree, fd_path, mount_target, READ_ONLY};
 use crate::error::{NucleusError, Result};
 use nix::fcntl::{open, OFlag};
@@ -169,6 +168,11 @@ fn validate_rootfs_path_under_store(rootfs_path: &Path, store_root: &Path) -> Re
         ))
     })?;
 
+    if super::is_immediate_nix_store_object_path(rootfs_path) && rootfs_path != canonical {
+        return Err(NucleusError::ConfigError(format!(
+            "Configured store rootfs changed identity: {rootfs_path:?}"
+        )));
+    }
     if !canonical.starts_with(store_root) {
         return Err(NucleusError::ConfigError(format!(
             "Production mode requires rootfs path to resolve under {}: {} -> {}",
@@ -248,7 +252,7 @@ pub fn validate_agent_toolchain_rootfs_path(rootfs_path: &Path) -> Result<PathBu
 pub(crate) fn read_regular_file_nofollow(path: &Path) -> Result<Vec<u8>> {
     let mut file = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
         .open(path)
         .map_err(|e| {
             NucleusError::FilesystemError(format!(
@@ -473,6 +477,54 @@ pub fn create_dev_nodes(dev_path: &Path, include_tty: bool) -> Result<()> {
     create_base_dev_nodes(dev_path, include_tty, None)
 }
 
+fn base_devices(include_tty: bool) -> impl Iterator<Item = (&'static str, u64, u64)> {
+    [
+        ("null", 1, 3),
+        ("zero", 1, 5),
+        ("full", 1, 7),
+        ("random", 1, 8),
+        ("urandom", 1, 9),
+    ]
+    .into_iter()
+    .chain(include_tty.then_some(("tty", 5, 0)))
+}
+
+pub(crate) fn populate_native_dev(
+    dev: &Path,
+    include_tty: bool,
+    rootless: bool,
+    identity: &crate::container::ProcessIdentity,
+) -> Result<()> {
+    if !rootless {
+        return create_base_dev_nodes(dev, include_tty, Some((identity.uid, identity.gid)));
+    }
+    // Linux forces nodev on tmpfs created in a user namespace. Import only the
+    // exact base character devices, each on its own nosuid/noexec mount.
+    for (name, major, minor) in base_devices(include_tty) {
+        let fd = open(
+            &Path::new("/dev").join(name),
+            OFlag::O_PATH | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )?;
+        let stat = fstat(&fd)?;
+        if SFlag::from_bits_truncate(stat.st_mode) != SFlag::S_IFCHR
+            || stat.st_rdev != makedev(major, minor)
+        {
+            return Err(NucleusError::FilesystemError(format!(
+                "Unexpected host device /dev/{name}"
+            )));
+        }
+        let target = mount_target(dev, Path::new(name), false)?;
+        bind_tree(
+            &fd_path(&fd),
+            &target,
+            false,
+            libc::MOUNT_ATTR_NOSUID | libc::MOUNT_ATTR_NOEXEC,
+        )?;
+    }
+    Ok(())
+}
+
 fn create_base_dev_nodes(
     dev_path: &Path,
     include_tty: bool,
@@ -480,27 +532,15 @@ fn create_base_dev_nodes(
 ) -> Result<()> {
     info!("Creating device nodes at {:?}", dev_path);
 
-    // Device nodes: (name, type, major, minor)
-    let mut devices = vec![
-        ("null", SFlag::S_IFCHR, 1, 3),
-        ("zero", SFlag::S_IFCHR, 1, 5),
-        ("full", SFlag::S_IFCHR, 1, 7),
-        ("random", SFlag::S_IFCHR, 1, 8),
-        ("urandom", SFlag::S_IFCHR, 1, 9),
-    ];
-    if include_tty {
-        devices.push(("tty", SFlag::S_IFCHR, 5, 0));
-    }
-
     let mut created_count = 0;
     let mut failed_count = 0;
 
-    for (name, dev_type, major, minor) in devices {
+    for (name, major, minor) in base_devices(include_tty) {
         let path = dev_path.join(name);
         let mode = Mode::from_bits_truncate(0o660);
         let dev = makedev(major, minor);
 
-        match mknod(&path, dev_type, mode, dev) {
+        match mknod(&path, SFlag::S_IFCHR, mode, dev) {
             Ok(_) => {
                 if let Some((uid, gid)) = owner {
                     nix::unistd::chown(
@@ -597,39 +637,14 @@ pub fn bind_mount_rootfs(root: &Path, rootfs_path: &Path) -> Result<()> {
         rootfs_path, root
     );
 
-    if std::fs::symlink_metadata(rootfs_path).is_err() {
-        return Err(NucleusError::FilesystemError(format!(
-            "Rootfs path does not exist: {:?}",
-            rootfs_path
-        )));
-    }
-
-    // Bind mount the rootfs contents into the container root.
-    // The rootfs is expected to contain a standard FHS layout (/bin, /lib, /etc, etc.)
-    // produced by a Nix buildEnv or similar.
-    let subdirs = ["bin", "sbin", "lib", "lib64", "usr", "etc", "nix"];
-
-    for subdir in &subdirs {
-        let source = rootfs_path.join(subdir);
-        if !source.exists() {
-            debug!("Rootfs subdir {} not present, skipping", subdir);
-            continue;
+    let sources = super::RootfsSources::load(rootfs_path)?;
+    for name in ["bin", "sbin", "lib", "lib64", "usr", "etc", "nix"] {
+        if let Some(source) = sources.open_subdir(name)? {
+            let target = mount_target(root, Path::new(name), true)?;
+            bind_tree(&fd_path(&source), &target, true, READ_ONLY)?;
         }
-        let source = std::fs::canonicalize(&source).map_err(|e| {
-            NucleusError::FilesystemError(format!(
-                "Failed to canonicalize rootfs mount source {:?}: {}",
-                source, e
-            ))
-        })?;
-
-        let target = mount_target(root, Path::new(subdir), true)?;
-        bind_tree(&source, &target, true, READ_ONLY)?;
-
-        info!("Mounted rootfs/{} read-only", subdir);
     }
-
-    bind_mount_rootfs_store_paths(root, rootfs_path)?;
-
+    bind_store_paths(root, &sources)?;
     Ok(())
 }
 
@@ -737,57 +752,15 @@ fn overlay_option_path(path: &Path, label: &str) -> Result<String> {
 }
 
 fn bind_mount_rootfs_store_paths(root: &Path, rootfs_path: &Path) -> Result<()> {
-    let store_paths_file = rootfs_path.join(ROOTFS_STORE_PATHS_FILE);
-    if !store_paths_file.exists() {
-        return Ok(());
+    bind_store_paths(root, &super::RootfsSources::load(rootfs_path)?)
+}
+
+fn bind_store_paths(root: &Path, sources: &super::RootfsSources) -> Result<()> {
+    for source in &sources.store_paths {
+        let relative = source.strip_prefix("/").expect("validated store path");
+        let target = mount_target(root, relative, source.is_dir())?;
+        bind_tree(source, &target, source.is_dir(), READ_ONLY)?;
     }
-
-    let content = std::fs::read_to_string(&store_paths_file).map_err(|e| {
-        NucleusError::FilesystemError(format!(
-            "Failed to read rootfs store paths {:?}: {}",
-            store_paths_file, e
-        ))
-    })?;
-
-    for (line_no, line) in content.lines().enumerate() {
-        let source = line.trim();
-        if source.is_empty() {
-            continue;
-        }
-        let source = Path::new(source);
-        if !is_immediate_nix_store_object_path(source) {
-            return Err(NucleusError::FilesystemError(format!(
-                "Invalid rootfs store path on line {} in {:?}: {} (expected immediate /nix/store/<32-char-hash>-<name> object)",
-                line_no + 1,
-                store_paths_file,
-                source.display()
-            )));
-        }
-        let store_name = source.file_name().ok_or_else(|| {
-            NucleusError::FilesystemError(format!(
-                "Invalid rootfs store path on line {} in {:?}: {}",
-                line_no + 1,
-                store_paths_file,
-                source.display()
-            ))
-        })?;
-        let source = std::fs::canonicalize(source).map_err(|e| {
-            NucleusError::FilesystemError(format!(
-                "Failed to canonicalize rootfs store path {:?}: {}",
-                source, e
-            ))
-        })?;
-        if !is_immediate_nix_store_object_path(&source) {
-            return Err(NucleusError::FilesystemError(format!(
-                "Rootfs store path must resolve to an immediate /nix/store/<32-char-hash>-<name> object: {}",
-                source.display()
-            )));
-        }
-
-        let target = mount_target(root, &Path::new("nix/store").join(store_name), true)?;
-        bind_tree(&source, &target, true, READ_ONLY)?;
-    }
-
     Ok(())
 }
 
@@ -828,7 +801,20 @@ const DENIED_BIND_MOUNT_SOURCES_EXACT: &[&str] = &["/"];
 
 /// Sensitive host subtrees that must not be exposed to a container at all.
 const DENIED_BIND_MOUNT_SOURCE_PREFIXES: &[&str] = &[
-    "/boot", "/dev", "/etc", "/home", "/proc", "/root", "/run", "/sys", "/var/log", "/var/run",
+    "/boot",
+    "/dev",
+    "/etc",
+    "/home",
+    "/proc",
+    "/root",
+    "/run",
+    "/sys",
+    "/var/log",
+    "/var/run",
+    "/var/lib",
+    "/var/spool",
+    "/nix/var",
+    "/tmp",
 ];
 
 /// Sensitive host paths still denied for explicit provider config mounts.
@@ -839,7 +825,18 @@ const DENIED_BIND_MOUNT_SOURCE_PREFIXES: &[&str] = &[
 const DENIED_PROVIDER_CONFIG_SOURCE_EXACT: &[&str] = &["/", "/home", "/root"];
 
 const DENIED_PROVIDER_CONFIG_SOURCE_PREFIXES: &[&str] = &[
-    "/boot", "/dev", "/etc", "/proc", "/run", "/sys", "/var/log", "/var/run",
+    "/boot",
+    "/dev",
+    "/etc",
+    "/proc",
+    "/run",
+    "/sys",
+    "/var/log",
+    "/var/run",
+    "/var/lib",
+    "/var/spool",
+    "/nix/var",
+    "/tmp",
 ];
 
 /// Container destinations where user-supplied volumes must not be mounted.
@@ -907,7 +904,7 @@ fn reject_denied_bind_mount_source(source: &Path) -> Result<()> {
 
     for denied in DENIED_BIND_MOUNT_SOURCE_PREFIXES {
         let denied_path = Path::new(denied);
-        if source == denied_path || source.starts_with(denied_path) {
+        if denied_path.starts_with(source) || source.starts_with(denied_path) {
             return Err(NucleusError::ConfigError(format!(
                 "Bind mount source '{}' is under sensitive host path '{}' and cannot be mounted into containers",
                 source.display(),
@@ -938,7 +935,7 @@ fn reject_denied_provider_config_source(source: &Path) -> Result<()> {
 
     for denied in DENIED_PROVIDER_CONFIG_SOURCE_PREFIXES {
         let denied_path = Path::new(denied);
-        if source == denied_path || source.starts_with(denied_path) {
+        if denied_path.starts_with(source) || source.starts_with(denied_path) {
             return Err(NucleusError::ConfigError(format!(
                 "Provider config source '{}' is under sensitive host path '{}' and cannot be mounted into containers",
                 source.display(),
@@ -962,47 +959,41 @@ pub fn validate_bind_mount_source_policy(source: &Path) -> Result<PathBuf> {
 
 /// Validate that a bind mount source exists and is not a sensitive host path or subtree.
 pub fn validate_bind_mount_source(source: &Path) -> Result<()> {
-    validate_bind_mount_source_policy(source)?;
+    pin_volume_source(source).map(drop)
+}
 
-    let canonical = std::fs::canonicalize(source).map_err(|e| {
-        NucleusError::ConfigError(format!(
-            "Failed to resolve bind mount source {:?}: {}",
-            source, e
-        ))
-    })?;
-    reject_denied_bind_mount_source(&canonical)
+pub(crate) fn pin_volume_source(source: &Path) -> Result<OwnedFd> {
+    validate_bind_mount_source_policy(source)?;
+    pin_checked_source(source, reject_denied_bind_mount_source)
+}
+
+pub(crate) fn pin_provider_source(source: &Path) -> Result<OwnedFd> {
+    reject_denied_provider_config_source(&normalize_bind_mount_source_for_policy(source)?)?;
+    pin_checked_source(source, reject_denied_provider_config_source)
+}
+
+fn pin_checked_source(source: &Path, check: fn(&Path) -> Result<()>) -> Result<OwnedFd> {
+    let fd = open(source, OFlag::O_PATH | OFlag::O_CLOEXEC, Mode::empty())?;
+    let resolved = std::fs::read_link(fd_path(&fd))?;
+    let kind = SFlag::from_bits_truncate(fstat(&fd)?.st_mode);
+    if !resolved.is_absolute() || !matches!(kind, SFlag::S_IFREG | SFlag::S_IFDIR) {
+        return Err(NucleusError::ConfigError(format!(
+            "Expected a regular file or directory at {source:?}"
+        )));
+    }
+    check(&resolved)?;
+    Ok(fd)
 }
 
 /// Validate that an explicit provider config mount source exists and is narrow.
 pub fn validate_provider_config_source(source: &Path) -> Result<()> {
-    normalize_bind_mount_source_for_policy(source)?;
-
-    let canonical = std::fs::canonicalize(source).map_err(|e| {
-        NucleusError::ConfigError(format!(
-            "Failed to resolve provider config source {:?}: {}",
-            source, e
-        ))
-    })?;
-    let metadata = std::fs::metadata(&canonical).map_err(|e| {
-        NucleusError::ConfigError(format!(
-            "Failed to stat provider config source {:?}: {}",
-            canonical, e
-        ))
-    })?;
-    if !metadata.is_file() && !metadata.is_dir() {
-        return Err(NucleusError::ConfigError(format!(
-            "Provider config source '{}' must be a regular file or directory",
-            canonical.display()
-        )));
-    }
-
-    reject_denied_provider_config_source(&canonical)
+    pin_provider_source(source).map(drop)
 }
 
 fn reject_reserved_volume_destination(dest: &Path) -> Result<()> {
     for reserved in RESERVED_VOLUME_DESTINATION_PREFIXES {
         let reserved_path = Path::new(reserved);
-        if dest == reserved_path || dest.starts_with(reserved_path) {
+        if reserved_path.starts_with(dest) || dest.starts_with(reserved_path) {
             return Err(NucleusError::ConfigError(format!(
                 "Volume destination '{}' is reserved for trusted container/runtime paths and cannot be overlaid",
                 dest.display()
@@ -1018,6 +1009,16 @@ pub fn normalize_volume_destination(dest: &Path) -> Result<PathBuf> {
     let normalized = normalize_container_destination(dest)?;
     reject_reserved_volume_destination(&normalized)?;
     Ok(normalized)
+}
+
+/// Secrets may occupy a file below the dedicated secrets mount.
+pub fn normalize_secret_destination(dest: &Path) -> Result<PathBuf> {
+    let dest = normalize_container_destination(dest)?;
+    let secrets = Path::new("/run/secrets");
+    if dest == secrets || !dest.starts_with(secrets) {
+        reject_reserved_volume_destination(&dest)?;
+    }
+    Ok(dest)
 }
 
 /// Normalize a provider config destination under the configured container home.
@@ -1096,19 +1097,8 @@ pub fn mount_volumes(root: &Path, volumes: &[crate::container::VolumeMount]) -> 
 
         match &volume.source {
             VolumeSource::Bind { source } => {
-                // H7: Deny bind-mounting sensitive host paths
-                validate_bind_mount_source(source)?;
-
-                // Use symlink_metadata (lstat) instead of .exists() to avoid
-                // following symlinks in the existence check (O_NOFOLLOW semantics).
-                if std::fs::symlink_metadata(source).is_err() {
-                    return Err(NucleusError::FilesystemError(format!(
-                        "Volume source does not exist: {:?}",
-                        source
-                    )));
-                }
-
-                let recursive = source.is_dir();
+                let pinned = pin_volume_source(source)?;
+                let recursive = fd_path(&pinned).is_dir();
                 let target = mount_target(
                     root,
                     dest.strip_prefix(root)
@@ -1122,7 +1112,7 @@ pub fn mount_volumes(root: &Path, volumes: &[crate::container::VolumeMount]) -> 
                     } else {
                         0
                     };
-                bind_tree(source, &target, recursive, attrs)?;
+                bind_tree(&fd_path(&pinned), &target, recursive, attrs)?;
 
                 info!(
                     "Mounted bind volume {:?} -> {:?} ({})",
@@ -1246,19 +1236,9 @@ pub fn mount_provider_configs(
     );
 
     for provider_config in provider_configs {
-        validate_provider_config_source(&provider_config.source)?;
-        let canonical_source = std::fs::canonicalize(&provider_config.source).map_err(|e| {
-            NucleusError::FilesystemError(format!(
-                "Failed to canonicalize provider config source {:?}: {}",
-                provider_config.source, e
-            ))
-        })?;
-        let metadata = std::fs::metadata(&canonical_source).map_err(|e| {
-            NucleusError::FilesystemError(format!(
-                "Failed to stat provider config source {:?}: {}",
-                canonical_source, e
-            ))
-        })?;
+        let pinned = pin_provider_source(&provider_config.source)?;
+        let canonical_source = fd_path(&pinned);
+        let metadata = std::fs::metadata(&canonical_source)?;
         let container_dest = normalize_provider_config_destination(home, &provider_config.dest)?;
         let dest = resolve_container_destination(root, &container_dest)?;
 
@@ -1298,22 +1278,15 @@ pub fn mount_workspace(root: &Path, workspace: &crate::container::WorkspaceConfi
         return Ok(());
     };
 
-    if workspace.mode == crate::container::WorkspaceMode::CopyInOut {
-        let metadata = std::fs::symlink_metadata(source).map_err(|e| {
-            NucleusError::FilesystemError(format!(
-                "Failed to stat workspace staging path {:?}: {}",
-                source, e
-            ))
-        })?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err(NucleusError::FilesystemError(format!(
-                "Workspace staging path must be a real directory: {:?}",
-                source
-            )));
-        }
+    let pinned = if workspace.mode == crate::container::WorkspaceMode::CopyInOut {
+        open(
+            source,
+            OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )?
     } else {
-        crate::filesystem::validate_workspace_host_path(source)?;
-    }
+        super::pin_workspace_source(source)?
+    };
     let dest = resolve_container_destination(root, &workspace.container_path)?;
     let target = mount_target(
         root,
@@ -1333,7 +1306,7 @@ pub fn mount_workspace(root: &Path, workspace: &crate::container::WorkspaceConfi
         } else {
             libc::MOUNT_ATTR_NOEXEC
         };
-    bind_tree(source, &target, true, attrs)?;
+    bind_tree(&fd_path(&pinned), &target, true, attrs)?;
 
     info!(
         "Mounted workspace {:?} -> {:?} (mode={:?}, exec={})",
@@ -1343,89 +1316,57 @@ pub fn mount_workspace(root: &Path, workspace: &crate::container::WorkspaceConfi
     Ok(())
 }
 
-/// Mount procfs at the given path
-///
-/// In rootless mode, procfs mounting should work due to user namespace capabilities.
-/// When `hide_pids` is true, mounts with hidepid=2 so processes cannot enumerate
-/// other PIDs (production hardening). The best-effort fallback only applies to
-/// non-hardened procfs mounts; requested hidepid hardening is fail-closed.
-pub fn mount_procfs(
-    proc_path: &Path,
-    best_effort: bool,
-    read_only: bool,
-    hide_pids: bool,
-) -> Result<()> {
-    info!(
-        "Mounting procfs at {:?} (hidepid={})",
-        proc_path,
-        if hide_pids { "2" } else { "0" }
-    );
-
-    let mount_data: Option<&str> = if hide_pids { Some("hidepid=2") } else { None };
-
-    let mounted = match mount(
-        Some("proc"),
-        proc_path,
-        Some("proc"),
-        MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
-        mount_data,
-    ) {
-        Ok(_) => true,
-        Err(e) => handle_procfs_mount_failure(e, best_effort, hide_pids)?,
-    };
-
-    if mounted {
-        if read_only {
-            mount(
-                None::<&str>,
-                proc_path,
-                None::<&str>,
-                MsFlags::MS_REMOUNT
-                    | MsFlags::MS_RDONLY
-                    | MsFlags::MS_NOSUID
-                    | MsFlags::MS_NODEV
-                    | MsFlags::MS_NOEXEC,
-                mount_data,
-            )
-            .map_err(|e| {
-                NucleusError::FilesystemError(format!("Failed to remount procfs read-only: {}", e))
-            })?;
-            info!("Successfully mounted procfs (read-only)");
-        } else {
-            info!("Successfully mounted procfs");
-        }
+/// Mount a fresh PID-only procfs and verify the effective view before pivot.
+pub fn mount_procfs(proc_path: &Path, read_only: bool) -> Result<()> {
+    let mut flags = MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC;
+    if read_only {
+        flags |= MsFlags::MS_RDONLY;
     }
+    mount(
+        Some("proc"),
+        proc_path,
+        Some("proc"),
+        flags,
+        Some("hidepid=2,subset=pid"),
+    )
+    .map_err(|e| {
+        NucleusError::FilesystemError(format!(
+            "Cannot mount PID-only procfs at {proc_path:?}: {e}"
+        ))
+    })?;
 
-    Ok(())
-}
-
-fn handle_procfs_mount_failure(
-    e: nix::errno::Errno,
-    best_effort: bool,
-    hide_pids: bool,
-) -> Result<bool> {
-    if hide_pids {
+    let info = std::fs::read_to_string("/proc/self/mountinfo")?;
+    let verified = info.lines().any(|line| {
+        let Some((left, right)) = line.split_once(" - ") else {
+            return false;
+        };
+        let mut fields = right.split_ascii_whitespace();
+        let Some(point) = left.split_ascii_whitespace().nth(4) else {
+            return false;
+        };
+        if Path::new(&decode_mountinfo_field(point)) != proc_path || fields.next() != Some("proc") {
+            return false;
+        }
+        fields.nth(1).is_some_and(|opts| {
+            opts.split(',')
+                .any(|v| matches!(v, "hidepid=2" | "hidepid=invisible"))
+                && opts.split(',').any(|v| v == "subset=pid")
+        })
+    });
+    if !verified {
         return Err(NucleusError::FilesystemError(format!(
-            "Failed to mount procfs with required hidepid=2: {}",
-            e
+            "Missing required procfs mount options at {proc_path:?}"
         )));
     }
-
-    if best_effort {
-        warn!("Failed to mount procfs: {} (continuing anyway)", e);
-        Ok(false)
-    } else {
-        Err(NucleusError::FilesystemError(format!(
-            "Failed to mount procfs: {}",
-            e
-        )))
-    }
+    verify_proc_masks(proc_path)
 }
 
 /// Paths to mask with /dev/null (files) – matches OCI runtime spec masked paths.
 /// Exposed for testing; the canonical list of sensitive /proc entries that must
 /// be hidden from container processes.
 pub const PROC_NULL_MASKED: &[&str] = &[
+    "interrupts",
+    "kmsg",
     "kallsyms",
     "kcore",
     "sched_debug",
@@ -1444,126 +1385,27 @@ pub const PROC_NULL_MASKED: &[&str] = &[
 pub const PROC_READONLY_PATHS: &[&str] = &["bus", "fs", "irq", "sys"];
 
 /// Paths to mask with empty tmpfs (directories).
-pub const PROC_TMPFS_MASKED: &[&str] = &["acpi", "scsi"];
+pub const PROC_TMPFS_MASKED: &[&str] = &["acpi", "scsi", "asound", "sysvipc"];
 
-fn remount_proc_path_readonly(target: &Path) -> Result<()> {
-    let fd = open(
-        target,
-        OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
-        Mode::empty(),
-    )?;
-    bind_tree(target, &fd, true, READ_ONLY | libc::MOUNT_ATTR_NOEXEC)
-}
-
-/// Mask sensitive /proc paths by bind-mounting /dev/null or tmpfs over them
-///
-/// This reduces kernel information leakage from the container. Follows OCI runtime
-/// conventions for masked paths.
-///
-/// SEC-06: When `production` is true, failures to mask critical paths
-/// (kcore, kallsyms, sysrq-trigger) are fatal instead of warn-and-continue.
-pub fn mask_proc_paths(proc_path: &Path, production: bool) -> Result<()> {
-    info!("Masking sensitive /proc paths");
-
-    const CRITICAL_PROC_PATHS: &[&str] = &["kcore", "kallsyms", "sysrq-trigger"];
-
-    for name in PROC_READONLY_PATHS {
-        let target = proc_path.join(name);
-        if !target.exists() {
-            continue;
-        }
-        match remount_proc_path_readonly(&target) {
-            Ok(_) => debug!("Remounted /proc/{} read-only", name),
-            Err(e) => {
-                if production {
-                    return Err(NucleusError::FilesystemError(format!(
-                        "Failed to remount /proc/{} read-only in production mode: {}",
-                        name, e
-                    )));
-                }
-                warn!(
-                    "Failed to remount /proc/{} read-only: {} (continuing)",
-                    name, e
-                );
-            }
-        }
-    }
-
-    let dev_null = Path::new("/dev/null");
-
-    for name in PROC_NULL_MASKED {
-        let target = proc_path.join(name);
-        if !target.exists() {
-            continue;
-        }
-        match mount(
-            Some(dev_null),
-            &target,
-            None::<&str>,
-            MsFlags::MS_BIND,
-            None::<&str>,
-        ) {
+/// A PID-only procfs omits global kernel files entirely. Check the effective
+/// view after mounting, including entries that previously required overmounts.
+fn verify_proc_masks(proc_path: &Path) -> Result<()> {
+    for name in PROC_NULL_MASKED
+        .iter()
+        .chain(PROC_TMPFS_MASKED)
+        .chain(PROC_READONLY_PATHS)
+    {
+        let path = proc_path.join(name);
+        match std::fs::symlink_metadata(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+            Err(e) => return Err(e.into()),
             Ok(_) => {
-                // Remount read-only: Linux ignores MS_RDONLY on the initial bind mount,
-                // so a separate MS_REMOUNT|MS_BIND|MS_RDONLY call is required.
-                if let Err(e) = mount(
-                    None::<&str>,
-                    &target,
-                    None::<&str>,
-                    MsFlags::MS_REMOUNT | MsFlags::MS_BIND | MsFlags::MS_RDONLY,
-                    None::<&str>,
-                ) {
-                    if production && CRITICAL_PROC_PATHS.contains(name) {
-                        return Err(NucleusError::FilesystemError(format!(
-                            "Failed to remount /proc/{} read-only in production mode: {}",
-                            name, e
-                        )));
-                    }
-                    warn!(
-                        "Failed to remount /proc/{} read-only: {} (continuing)",
-                        name, e
-                    );
-                }
-                debug!("Masked /proc/{} (read-only)", name);
-            }
-            Err(e) => {
-                if production && CRITICAL_PROC_PATHS.contains(name) {
-                    return Err(NucleusError::FilesystemError(format!(
-                        "Failed to mask critical /proc/{} in production mode: {}",
-                        name, e
-                    )));
-                }
-                warn!("Failed to mask /proc/{}: {} (continuing)", name, e);
+                return Err(NucleusError::FilesystemError(format!(
+                    "Global procfs entry visible at {path:?}"
+                )))
             }
         }
     }
-
-    for name in PROC_TMPFS_MASKED {
-        let target = proc_path.join(name);
-        if !target.exists() {
-            continue;
-        }
-        match mount(
-            Some("tmpfs"),
-            &target,
-            Some("tmpfs"),
-            MsFlags::MS_RDONLY | MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
-            Some("size=0"),
-        ) {
-            Ok(_) => debug!("Masked /proc/{}", name),
-            Err(e) => {
-                if production {
-                    return Err(NucleusError::FilesystemError(format!(
-                        "Failed to mask /proc/{} in production mode: {}",
-                        name, e
-                    )));
-                }
-                warn!("Failed to mask /proc/{}: {} (continuing)", name, e);
-            }
-        }
-    }
-
-    info!("Finished masking sensitive /proc paths");
     Ok(())
 }
 
@@ -1737,7 +1579,8 @@ pub fn mount_secrets(root: &Path, secrets: &[crate::container::SecretMount]) -> 
         let source_fd_path = PathBuf::from(format!("/proc/self/fd/{}", source_fd.as_raw_fd()));
 
         // Destination inside container root
-        let dest = resolve_container_destination(root, &secret.dest)?;
+        let dest =
+            resolve_container_destination(root, &normalize_secret_destination(&secret.dest)?)?;
 
         let target = mount_target(
             root,
@@ -1847,7 +1690,10 @@ fn mount_secrets_inmemory_inner(
         let mut content = read_regular_file_nofollow(&secret.source)?;
 
         // Determine destination path inside the secrets tmpfs
-        let dest = resolve_container_destination(secrets_dir, &secret.dest)?;
+        let dest = resolve_container_destination(
+            secrets_dir,
+            &normalize_secret_destination(&secret.dest)?,
+        )?;
 
         // Create parent directories within the tmpfs
         if let Some(parent) = dest.parent() {
@@ -1895,7 +1741,8 @@ fn mount_secrets_inmemory_inner(
         drop(content);
 
         // Also bind-mount the secret to its expected container path for compatibility
-        let container_dest = resolve_container_destination(root, &secret.dest)?;
+        let container_dest =
+            resolve_container_destination(root, &normalize_secret_destination(&secret.dest)?)?;
         if container_dest != dest {
             let target = mount_target(
                 root,
@@ -1917,8 +1764,23 @@ fn mount_secrets_inmemory_inner(
 }
 
 #[cfg(test)]
+pub(crate) fn volume_test_dir() -> tempfile::TempDir {
+    let candidates = [
+        std::env::temp_dir(),
+        std::env::current_dir().unwrap(),
+        PathBuf::from("/var/tmp"),
+    ];
+    candidates
+        .iter()
+        .filter(|dir| validate_bind_mount_source_policy(dir).is_ok())
+        .find_map(|dir| tempfile::tempdir_in(dir).ok())
+        .expect("writable directory allowed as a volume source")
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use crate::filesystem::ROOTFS_STORE_PATHS_FILE;
     use std::os::unix::fs::symlink;
 
     #[test]
@@ -1946,6 +1808,12 @@ mod tests {
             "/run/secrets",
             "/sys/fs/cgroup",
             "/var/log",
+            "/var",
+            "/nix",
+            "/nix/var",
+            "/var/lib/docker",
+            "/var/spool/cron",
+            "/tmp/data",
         ] {
             let err = validate_bind_mount_source(Path::new(path)).unwrap_err();
             assert!(
@@ -1957,7 +1825,7 @@ mod tests {
 
     #[test]
     fn test_validate_bind_mount_source_allows_regular_host_paths() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = crate::filesystem::volume_test_dir();
         let safe_path = temp.path().join("data");
         std::fs::create_dir(&safe_path).unwrap();
 
@@ -1966,7 +1834,7 @@ mod tests {
 
     #[test]
     fn test_validate_provider_config_source_allows_regular_paths() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = crate::filesystem::volume_test_dir();
         let safe_path = temp.path().join("config.json");
         std::fs::write(&safe_path, "{}").unwrap();
 
@@ -1984,7 +1852,7 @@ mod tests {
 
     #[test]
     fn test_validate_bind_mount_source_normalizes_parent_components_before_filtering() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = crate::filesystem::volume_test_dir();
         let safe_path = temp.path().join("data");
         std::fs::create_dir(&safe_path).unwrap();
 
@@ -1999,6 +1867,40 @@ mod tests {
             err.to_string().contains("sensitive host path"),
             "expected sensitive-path rejection before path creation, got: {err}"
         );
+    }
+
+    #[test]
+    fn secrets_respect_runtime_mounts() {
+        for path in [
+            "/etc/passwd",
+            "/bin/tool",
+            "/nix/store/file",
+            "/run",
+            "/run/secrets",
+            "/proc/self",
+        ] {
+            assert!(
+                normalize_secret_destination(Path::new(path)).is_err(),
+                "{path}"
+            );
+        }
+        for path in ["/run/secrets/token", "/app/tls/key"] {
+            assert_eq!(
+                normalize_secret_destination(Path::new(path)).unwrap(),
+                Path::new(path)
+            );
+        }
+    }
+
+    #[test]
+    fn pinned_volume_keeps_the_checked_file() {
+        let dir = volume_test_dir();
+        let source = dir.path().join("source");
+        std::fs::write(&source, b"first").unwrap();
+        let fd = pin_volume_source(&source).unwrap();
+        std::fs::rename(&source, dir.path().join("old")).unwrap();
+        std::fs::write(source, b"second").unwrap();
+        assert_eq!(std::fs::read(fd_path(&fd)).unwrap(), b"first");
     }
 
     #[test]
@@ -2257,21 +2159,19 @@ mod tests {
     }
 
     #[test]
-    fn test_procfs_hidepid_failure_fails_closed_even_best_effort() {
-        let err = handle_procfs_mount_failure(nix::errno::Errno::EINVAL, true, true).unwrap_err();
-
-        assert!(
-            err.to_string().contains("required hidepid=2"),
-            "hidepid=2 failures must remain fatal in production/rootless paths, got: {err}"
-        );
-    }
-
-    #[test]
-    fn test_procfs_best_effort_only_applies_without_hidepid() {
-        assert!(
-            !handle_procfs_mount_failure(nix::errno::Errno::EPERM, true, false).unwrap(),
-            "best-effort procfs mount failures may only continue when hidepid was not requested"
-        );
+    fn proc_masks_require_every_global_entry_to_be_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        verify_proc_masks(dir.path()).unwrap();
+        for name in PROC_NULL_MASKED
+            .iter()
+            .chain(PROC_TMPFS_MASKED)
+            .chain(PROC_READONLY_PATHS)
+        {
+            let path = dir.path().join(name);
+            std::fs::write(&path, []).unwrap();
+            assert!(verify_proc_masks(dir.path()).is_err(), "{name}");
+            std::fs::remove_file(path).unwrap();
+        }
     }
 
     #[test]
