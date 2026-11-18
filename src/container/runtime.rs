@@ -338,7 +338,22 @@ impl Container {
         let parent = path
             .parent()
             .ok_or_else(|| NucleusError::FilesystemError("Invalid bundle path".into()))?;
+        // trusted_directory creates missing ancestors as 0700 root-owned,
+        // which the mapped supervisor could never traverse. Widen exactly the
+        // components created here to search-only; pre-existing directories
+        // keep their ownership and mode untouched.
+        let created_ancestors = Self::missing_ancestors(parent);
         crate::filesystem::trusted_directory(parent, true)?;
+        for created in &created_ancestors {
+            std::fs::set_permissions(created, std::fs::Permissions::from_mode(0o711)).map_err(
+                |e| {
+                    NucleusError::FilesystemError(format!(
+                        "Failed to grant traversal on created bundle parent {:?}: {}",
+                        created, e
+                    ))
+                },
+            )?;
+        }
         let (dir, _) = crate::oci::open_empty_bundle(&path)?;
         nix::unistd::fchown(
             &dir,
@@ -346,6 +361,18 @@ impl Container {
             Some(Gid::from_raw(host_gid)),
         )?;
         Ok(())
+    }
+
+    /// Ancestor directories of `path` that do not exist yet.
+    ///
+    /// Used to widen exactly the components a trusted-directory creation
+    /// adds, so the mapped supervisor can traverse them without changing the
+    /// mode of pre-existing user directories.
+    fn missing_ancestors(path: &Path) -> Vec<PathBuf> {
+        path.ancestors()
+            .filter(|p| !p.as_os_str().is_empty() && !p.exists())
+            .map(Path::to_path_buf)
+            .collect()
     }
 
     fn ensure_runtime_parent_dir(path: &std::path::Path) -> Result<()> {
@@ -1331,6 +1358,7 @@ impl Container {
                 Some(base) => base.to_owned(),
                 None => GVisorRuntime::prepare_artifact_base()?,
             };
+            let mut handoff_bundle: Option<std::fs::File> = None;
             if mapped_base.is_none() {
                 if let Some(bundle) = &self.config.bundle_dir {
                     let path = std::env::current_dir()?.join(bundle);
@@ -1338,12 +1366,31 @@ impl Container {
                         NucleusError::FilesystemError("Invalid bundle path".into())
                     })?;
                     crate::filesystem::trusted_directory(parent, true)?;
+                    // keep-id handoffs demote the setup process to container
+                    // ID 0 while the caller's files keep their original host
+                    // identity, so the bundle ownership check inside
+                    // OciBundle::create would reject the launching user's own
+                    // directory. Validate the empty bundle now, while the
+                    // effective UID still matches its owner, and transfer it
+                    // to the mapped supervisor right after the handoff.
+                    if Self::gvisor_needs_precreated_userns(
+                        &self.config,
+                        Uid::effective().is_root(),
+                    ) {
+                        let (dir, _) = crate::oci::open_empty_bundle(&path)?;
+                        handoff_bundle = Some(dir);
+                    }
                 }
             }
             let gvisor_precreated_userns = self.prepare_gvisor_handoff_namespace(
                 userns_request_pipe.as_ref(),
                 userns_ack_pipe.as_ref(),
             )?;
+            if let (Some(dir), true) = (handoff_bundle, gvisor_precreated_userns) {
+                // Namespace-relative chown to container ID 0: the mapped
+                // supervisor owns the bundle for the upcoming create.
+                nix::unistd::fchown(&dir, Some(Uid::from_raw(0)), Some(Gid::from_raw(0)))?;
+            };
 
             if mapped_base.is_some() || Self::gvisor_needs_mount_staging(&self.config) {
                 // Staged bind mounts must be private to this launch.
@@ -3731,5 +3778,76 @@ mod tests {
             .with_user_namespace(crate::isolation::UserNamespaceConfig::rootless())
             .with_service_mode(ServiceMode::StrictAgent);
         assert!(!Container::gvisor_needs_precreated_userns(&plain, false));
+    }
+    #[test]
+    fn test_prepare_mapped_bundle_dir_grants_traversal_on_created_parents() {
+        let temp = tempfile::tempdir().unwrap();
+        let bundle = temp.path().join("deep/nested/parents/explicit-bundle");
+        let uid = Uid::effective();
+        let gid = Gid::effective();
+        use std::os::unix::fs::PermissionsExt;
+
+        Container::prepare_mapped_bundle_dir(&bundle, uid.as_raw(), gid.as_raw()).unwrap();
+
+        // Every ancestor created by the preparation must be traversable by
+        // the mapped supervisor (search-only), not just root.
+        for created in [temp.path().join("deep"), temp.path().join("deep/nested")] {
+            let mode = std::fs::metadata(created).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o711, "created ancestor must grant traversal");
+        }
+        // The bundle itself stays owner-only.
+        let mode = std::fs::metadata(&bundle).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    #[test]
+    fn test_prepare_mapped_bundle_dir_preserves_existing_parent_modes() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("pre-existing");
+        std::fs::create_dir(&parent).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o750)).unwrap();
+        let bundle = parent.join("explicit-bundle");
+        let uid = Uid::effective();
+        let gid = Gid::effective();
+
+        Container::prepare_mapped_bundle_dir(&bundle, uid.as_raw(), gid.as_raw()).unwrap();
+
+        let mode = std::fs::metadata(&parent).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o750, "pre-existing parent mode must be untouched");
+    }
+
+    #[test]
+    fn test_missing_ancestors_lists_only_absent_prefixes() {
+        let temp = tempfile::tempdir().unwrap();
+        let existing = temp.path().join("existing");
+        std::fs::create_dir(&existing).unwrap();
+        let missing = Container::missing_ancestors(&existing.join("a/b"));
+        assert_eq!(
+            missing,
+            vec![existing.join("a/b"), existing.join("a")],
+            "ancestors are reported deepest-first, excluding existing prefixes"
+        );
+    }
+
+    #[test]
+    fn test_keepid_handoff_transfers_caller_owned_bundle() {
+        // Structural regression: the child must validate the explicit bundle
+        // while still the launching user and transfer it to container ID 0
+        // right after the user namespace handoff.
+        let source = include_str!("runtime.rs");
+        let fn_body = extract_fn_body(source, "fn setup_and_exec");
+        let validate = fn_body.find("open_empty_bundle").unwrap();
+        let handoff = fn_body.find("prepare_gvisor_handoff_namespace").unwrap();
+        let transfer = fn_body.find("nix::unistd::fchown").unwrap();
+        assert!(
+            validate < handoff && handoff < transfer,
+            "keep-id launches must validate the caller-owned bundle before the handoff and transfer it after"
+        );
+        let segment = &fn_body[handoff..transfer];
+        assert!(
+            segment.contains("gvisor_precreated_userns"),
+            "the bundle transfer must be gated on the completed user namespace handoff"
+        );
     }
 }
