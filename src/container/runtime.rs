@@ -245,9 +245,7 @@ impl Container {
         config.use_gvisor
             && config.user_ns_config.is_some()
             && ((host_is_root && config.service_mode == ServiceMode::Agent)
-                || (!host_is_root
-                    && config.service_mode == ServiceMode::Agent
-                    && Self::gvisor_needs_mount_staging(config))
+                || (!host_is_root && Self::gvisor_needs_mount_staging(config))
                 || (!host_is_root
                     && matches!(
                         config.network,
@@ -3660,5 +3658,42 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("Refusing symlink"));
+    }
+    #[test]
+    fn test_gvisor_mount_staging_precreates_userns_in_all_service_modes() {
+        // Unprivileged strict/production launches with bind mounts need mount
+        // staging, whose CLONE_NEWNS requires CAP_SYS_ADMIN inside a
+        // pre-created user namespace. Regression: the staging arm of the
+        // predicate was once restricted to ServiceMode::Agent, which made
+        // StrictAgent/Production launches with NetworkMode::None exit EPERM
+        // at unshare before runsc could start.
+        for mode in [
+            ServiceMode::Agent,
+            ServiceMode::StrictAgent,
+            ServiceMode::Production,
+        ] {
+            let config = ContainerConfig::try_new(None, vec!["/bin/sh".into()])
+                .unwrap()
+                .with_gvisor(true)
+                .with_user_namespace(crate::isolation::UserNamespaceConfig::rootless())
+                .with_service_mode(mode)
+                .with_workspace(
+                    crate::container::WorkspaceConfig::default()
+                        .with_host_path(std::path::PathBuf::from("/tmp/ws")),
+                );
+            assert!(
+                Container::gvisor_needs_precreated_userns(&config, false),
+                "unprivileged {mode:?} gVisor launch with a bind workspace must pre-create the user namespace"
+            );
+        }
+
+        // Without staging needs and without bridge/host networking, the
+        // handoff stays opt-in: runsc creates its own user namespace.
+        let plain = ContainerConfig::try_new(None, vec!["/bin/sh".into()])
+            .unwrap()
+            .with_gvisor(true)
+            .with_user_namespace(crate::isolation::UserNamespaceConfig::rootless())
+            .with_service_mode(ServiceMode::StrictAgent);
+        assert!(!Container::gvisor_needs_precreated_userns(&plain, false));
     }
 }
