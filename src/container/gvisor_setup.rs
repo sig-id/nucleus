@@ -625,9 +625,6 @@ mod tests {
 
     #[test]
     fn test_root_remapped_production_gvisor_requires_supervisor_exec_policy() {
-        let user_ns_config = crate::isolation::UserNamespaceConfig::root_remapped();
-
-        assert!(!user_ns_config.uid_mappings.is_empty());
         assert!(require_gvisor_supervisor_exec_policy(
             ServiceMode::Production,
             false

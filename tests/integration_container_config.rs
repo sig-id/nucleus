@@ -138,7 +138,10 @@ mod tests {
             .with_rootless();
 
         assert!(config.namespaces.user);
-        assert!(config.user_ns_config.is_some());
+        assert_eq!(
+            config.user_ns_config.is_some(),
+            !nix::unistd::Uid::effective().is_root()
+        );
     }
 
     #[test]

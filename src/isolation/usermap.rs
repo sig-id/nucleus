@@ -156,7 +156,7 @@ fn parse_map_triplet(s: &str) -> Option<IdMapping> {
 /// UID/GID mapping configuration for user namespaces
 ///
 /// Maps a range of UIDs/GIDs inside the container to a range outside
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct IdMapping {
     /// ID inside the container
     pub container_id: u32,
@@ -250,7 +250,7 @@ impl IdMapping {
 }
 
 /// User namespace configuration
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UserNamespaceConfig {
     /// UID mappings
     pub uid_mappings: Vec<IdMapping>,
@@ -434,11 +434,8 @@ impl UserNamespaceConfig {
     ///
     /// When running as host root, maps container UID 0 to a high unprivileged
     /// UID range so a container escape does not yield real host root.
-    pub fn root_remapped() -> Self {
-        Self {
-            uid_mappings: vec![IdMapping::new(0, 100_000, 65_536)],
-            gid_mappings: vec![IdMapping::new(0, 100_000, 65_536)],
-        }
+    pub(crate) fn root_remapped(container_id: &str) -> Result<Self> {
+        super::root_remap::allocate(container_id)
     }
 
     /// Create config with custom mappings (validated)
@@ -731,9 +728,14 @@ mod tests {
         assert!(mapper.should_deny_setgroups());
     }
 
+    fn nontrivial_mapping() -> UserNamespaceConfig {
+        let map = IdMapping::new(0, 700_000, 65_536);
+        UserNamespaceConfig::custom(vec![map.clone()], vec![map]).unwrap()
+    }
+
     #[test]
     fn test_root_remapped_requires_external_writer() {
-        let mapper = UserNamespaceMapper::new(UserNamespaceConfig::root_remapped());
+        let mapper = UserNamespaceMapper::new(nontrivial_mapping());
         assert!(!mapper.can_self_map_current_process());
         assert!(!mapper.should_deny_setgroups());
         assert!(mapper.setup_mappings().is_err());
@@ -809,7 +811,7 @@ mod tests {
         assert!(!UserNamespaceConfig::rootless().needs_setuid_helper());
         // Any multi-entry mapping (keep-id, auto, root-remapped) needs the
         // setuid helper when the caller is unprivileged.
-        assert!(UserNamespaceConfig::root_remapped().needs_setuid_helper());
+        assert!(nontrivial_mapping().needs_setuid_helper());
     }
 
     #[test]

@@ -1071,7 +1071,9 @@ the CLI `nucleus image commit` workflow.
 
 **Protect the image signing key.** Keep the private seed on the signing host. Distribute only its public key to hosts that load, inspect, or run the images.
 
-**Workload identity.** When host root launches a default agent, Nucleus maps container UID/GID 0 to host UID/GID 100000. Host bind mounts use the mapped identity for permission checks. To run an agent with an existing unprivileged host identity, pass its nonzero `--user` and `--group`. With `--workspace-mode copy-in-out`, the workload edits a private copy owned by its mapped identity.
+**Workload identity.** When host root launches a default agent, Nucleus reserves a separate block of 65,536 host UIDs and GIDs for each launch. Container root maps to the first ID in that block. Nucleus excludes ranges delegated in `/etc/subuid` and `/etc/subgid` and IDs listed in the local password and group files. Automatic allocation requires readable policy files and file-based subordinate ID delegation. Host bind mounts use the mapped identity for permission checks. To run an agent with an existing unprivileged host identity, pass its nonzero `--user` and `--group`. With `--workspace-mode copy-in-out`, the workload edits a private copy owned by its mapped identity.
+
+Reservations live in `/var/lib/nucleus/userns-ranges` across all `--root` directories. The pool contains 4,094 blocks between `0x70000000` and `0x7ffdffff`. Each reservation filename is the first ID of a block. Preserve this directory across upgrades and exclude this pool from external account directories and other dynamic ID allocators. Keep reserved IDs out of future subordinate-ID assignments. Reservations persist after exit because files on bind mounts and overlays can retain those owners. Allocation fails when the pool is exhausted. An administrator can reclaim an individual reservation after verifying that all processes, checkpoints, and files using that block are gone. Recreate existing root-remapped containers to receive fresh mappings and review host files still owned by the old 100000–165535 range.
 
 **Agent mode is not hardened.** By design, agent mode applies several security mechanisms on a best-effort basis: seccomp and Landlock failures are warn-and-continue (with `--allow-degraded-security`), chroot fallback is available (with `--allow-chroot-fallback`), and cgroup creation failures are non-fatal. Operators requiring strict isolation for ephemeral workloads should use `--service-mode strict-agent`; operators deploying long-running NixOS services should use production mode.
 
@@ -1090,7 +1092,7 @@ the CLI `nucleus image commit` workflow.
 | Bridge egress policy | Deny-all by default | Deny-all by default | Deny-all by default |
 | Memory limit | Optional | Optional | Required |
 | PID 1 init | Direct exec | Direct exec | Mini-init with zombie reaping + signal forwarding |
-| Workload uid/gid | Container root maps to host UID/GID 100000 by default when launched as root | User namespace remapping required when running as host root | Configurable post-setup drop via `--user` / `--group` |
+| Workload uid/gid | Container root maps to a per-launch host UID/GID block when launched as root | User namespace remapping required when running as host root | Configurable post-setup drop via `--user` / `--group` |
 | Secrets | In-memory tmpfs | In-memory tmpfs | In-memory tmpfs with volatile zeroing |
 | Native /proc | `hidepid=2,subset=pid` | `hidepid=2,subset=pid` | `hidepid=2,subset=pid` |
 | Mount audit | Skipped | Skipped | Post-setup flag verification (fatal) |
@@ -1249,7 +1251,7 @@ Events include a container start record and a final summary record. The records 
 - `--caps-policy <path>` loads a TOML capability policy (replaces default drop-all).
 - `--caps-policy-sha256 <hex>` verifies the capability policy hash.
 - Native bind mounts require Linux 5.12 or later for recursive mount attributes.
-- Native attach and probes require the live supervisor’s original kernel Landlock ruleset and the saved seccomp policy. These helpers fail closed for legacy and restored containers without a live ruleset. Restore requires a signed checkpoint containing the original workload identity.
+- Native attach and probes require the live supervisor’s original kernel Landlock ruleset and the saved seccomp policy. These helpers fail closed for legacy and restored containers without a live ruleset. Restore requires a signed checkpoint containing the original workload identity. CRIU preserves kernel UID/GID mappings. Nucleus rejects checkpoint and restore for automatically root-remapped containers, and for legacy root-created namespaces whose mapping was never recorded.
 - `--landlock-policy <path>` loads a TOML Landlock filesystem policy (replaces default rules).
 - `--landlock-policy-sha256 <hex>` verifies the Landlock policy hash.
 - `--verify-context-integrity` hashes the source context tree before launch and verifies the populated `/context` tree matches.

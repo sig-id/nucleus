@@ -8,6 +8,7 @@ let
 
   runtimePath = types.addCheck types.str (s:
     lib.hasPrefix "/" s && !builtins.hasContext s && !lib.hasPrefix "/nix/store/" s);
+  rootRemapRegistry = "/var/lib/nucleus/userns-ranges";
   privilegedSupervisor = mkEnableOption "a capability-bounded root supervisor for host setup";
 
   supervisorConfig = unit: privileged: allowNet: timeNamespace: {
@@ -587,7 +588,7 @@ let
         SyslogIdentifier = "nucleus-${name}";
 
         LimitNOFILE = 65536;
-        ReadWritePaths = writableVolumeSources ++ lib.optional containerCfg.privilegedSupervisor "/run/nucleus";
+        ReadWritePaths = writableVolumeSources ++ lib.optionals containerCfg.privilegedSupervisor [ "/run/nucleus" rootRemapRegistry ];
       } // lib.optionalAttrs (containerCfg.environmentFile != null) {
         OpenFile = "${lib.replaceStrings [ "%" ":" ] [ "%%" "\\x3a" ] containerCfg.environmentFile}:environment:read-only";
       } // lib.optionalAttrs (loadCredentialEntries != [ ]) {
@@ -614,7 +615,7 @@ let
         StandardOutput = "journal";
         StandardError = "journal";
         SyslogIdentifier = "nucleus-topology-${name}";
-        ReadWritePaths = topoCfg.writablePaths ++ lib.optional topoCfg.privilegedSupervisor "/run/nucleus";
+        ReadWritePaths = topoCfg.writablePaths ++ lib.optionals topoCfg.privilegedSupervisor [ "/run/nucleus" rootRemapRegistry ];
       };
     };
 
@@ -662,10 +663,10 @@ in
   };
 
   config = mkIf cfg.enable {
-    systemd.tmpfiles.rules = lib.optional
+    systemd.tmpfiles.rules = lib.optionals
       (lib.any (service: service.enable && service.privilegedSupervisor)
         (lib.attrValues cfg.containers ++ lib.attrValues cfg.topologies))
-      "d /run/nucleus 0711 root root -" ++ lib.concatMap
+      [ "d /run/nucleus 0711 root root -" "d ${rootRemapRegistry} 0700 root root -" ] ++ lib.concatMap
       (containerCfg:
         map
           (v:

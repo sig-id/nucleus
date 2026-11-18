@@ -13,7 +13,7 @@ use crate::filesystem::{
     verify_rootfs_attestation, DeviceNodeSpec, FilesystemState, GpuDeviceSet, LazyContextPopulator,
     TmpfsMount,
 };
-use crate::isolation::{NamespaceManager, UserNamespaceMapper};
+use crate::isolation::{NamespaceManager, UserNamespaceConfig, UserNamespaceMapper};
 use crate::network::{BridgeDriver, BridgeNetwork, NatBackend, NetworkMode};
 use crate::resources::{Cgroup, ResourceStats};
 use crate::security::{
@@ -137,6 +137,53 @@ impl Container {
     /// Run the container (convenience wrapper: create + start)
     pub fn run(&self) -> Result<i32> {
         self.create_internal(false)?.start()
+    }
+
+    /// Stage a verified layer with the same namespace mapping used for execution.
+    pub fn run_image(mut self, image: crate::image::VerifiedImage) -> Result<i32> {
+        let is_root = Uid::effective().is_root();
+        self.config.namespaces.user = true;
+        Self::configure_user_namespace(
+            &mut self.config,
+            is_root,
+            UserNamespaceConfig::root_remapped,
+        )?;
+        let manager = ContainerStateManager::new_with_root(self.config.state_root.clone())?;
+        let path = manager.rootfs_overlay_dir_path(&self.config.id)?;
+        // The state manager returns a validated filename beneath its state root.
+        let overlay = Builder::new()
+            .prefix(path.file_name().expect("overlay filename"))
+            .rand_bytes(0)
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir_in(path.parent().expect("overlay state directory"))?;
+        let upper = overlay.path().join("upper");
+        let work = overlay.path().join("work");
+        std::fs::create_dir(&upper)?;
+        std::fs::create_dir(&work)?;
+        if is_root {
+            let map = self
+                .config
+                .user_ns_config
+                .as_ref()
+                .expect("image namespace configured");
+            let ([uid], [gid]) = (map.uid_mappings.as_slice(), map.gid_mappings.as_slice()) else {
+                return Err(NucleusError::ConfigError(
+                    "Root image staging requires one UID and GID range".into(),
+                ));
+            };
+            image.copy_remapped_diff_to_upper(&upper, uid, gid)?;
+            chown(
+                &work,
+                Some(Uid::from_raw(uid.host_id)),
+                Some(Gid::from_raw(gid.host_id)),
+            )?;
+            std::fs::set_permissions(overlay.path(), std::fs::Permissions::from_mode(0o711))?;
+        } else {
+            image.copy_diff_to_upper(&upper)?;
+        }
+        drop(image);
+        self.config = self.config.with_rootfs_overlay(upper, work);
+        self.run()
     }
 
     /// Create phase: fork the child, set up cgroup/bridge, leave child blocked
@@ -654,9 +701,11 @@ impl Container {
         ))
     }
 
-    fn configure_user_namespace(config: &mut ContainerConfig, host_is_root: bool) -> Result<()> {
-        use crate::isolation::UserNamespaceConfig;
-
+    fn configure_user_namespace(
+        config: &mut ContainerConfig,
+        host_is_root: bool,
+        allocate: impl FnOnce(&str) -> Result<UserNamespaceConfig>,
+    ) -> Result<()> {
         if config.user_ns_config.is_none() {
             let identity = &config.process_identity;
             if !host_is_root {
@@ -670,7 +719,8 @@ impl Container {
                 || identity.additional_gids.contains(&0)
             {
                 info!("Remapping workload IDs in a user namespace");
-                config.user_ns_config = Some(UserNamespaceConfig::root_remapped());
+                config.user_ns_config = Some(allocate(&config.id)?);
+                config.allocated_root_remap = true;
             }
         }
         if let Some(mapping) = &config.user_ns_config {
@@ -770,7 +820,7 @@ impl Container {
         }
         let is_root = nix::unistd::Uid::effective().is_root();
         let mut config = self.config.clone();
-        Self::configure_user_namespace(&mut config, is_root)?;
+        Self::configure_user_namespace(&mut config, is_root, UserNamespaceConfig::root_remapped)?;
 
         if matches!(config.network, NetworkMode::Bridge(_)) && config.egress_policy.is_none() {
             config.egress_policy = Some(crate::network::EgressPolicy::deny_all());
@@ -1115,6 +1165,8 @@ impl Container {
                         process_gid: config.process_identity.gid,
                         additional_gids: config.process_identity.additional_gids.clone(),
                     });
+                    state.allocated_root_remap = config.allocated_root_remap;
+                    state.user_ns_config = config.user_ns_config.clone();
                     state.pids_max = config.limits.pids_max;
                     state.native_seccomp = native_seccomp;
                     let landlock_handoff = if let Some((parent, child_end)) = landlock_channel {
@@ -2882,11 +2934,15 @@ mod tests {
         let mut config = ContainerConfig::try_new(None, vec!["/bin/sh".into()])
             .unwrap()
             .with_allow_degraded_security(true);
-        Container::configure_user_namespace(&mut config, true).unwrap();
+        Container::configure_user_namespace(&mut config, true, |_| {
+            let map = crate::isolation::IdMapping::new(0, 700_000, 65_536);
+            crate::isolation::UserNamespaceConfig::custom(vec![map.clone()], vec![map])
+        })
+        .unwrap();
         assert!(config.namespaces.user);
         assert_eq!(
             Container::host_workload_ids(&config).unwrap(),
-            (100_000, 100_000)
+            (700_000, 700_000)
         );
     }
 
@@ -2895,7 +2951,8 @@ mod tests {
         let mut config = ContainerConfig::try_new(None, vec!["/bin/sh".into()]).unwrap();
         config.process_identity.uid = 1234;
         config.process_identity.gid = 2345;
-        Container::configure_user_namespace(&mut config, true).unwrap();
+        Container::configure_user_namespace(&mut config, true, |_| panic!("unexpected root remap"))
+            .unwrap();
         assert!(!config.namespaces.user);
         assert_eq!(Container::host_workload_ids(&config).unwrap(), (1234, 2345));
     }
@@ -2908,7 +2965,12 @@ mod tests {
                 uid_mappings: vec![crate::isolation::IdMapping::new(0, uid, 1)],
                 gid_mappings: vec![crate::isolation::IdMapping::new(0, gid, 1)],
             });
-            assert!(Container::configure_user_namespace(&mut config, true).is_err());
+            assert!(
+                Container::configure_user_namespace(&mut config, true, |_| panic!(
+                    "unexpected root remap"
+                ))
+                .is_err()
+            );
         }
     }
 
@@ -3072,6 +3134,7 @@ mod tests {
             .with_egress_policy(broker.egress_policy())
             .with_rootless();
 
+        config.user_ns_config = Some(crate::isolation::UserNamespaceConfig::rootless());
         let err = Container::validate_credential_broker_resolved_nat(&config, false).unwrap_err();
         assert!(err.to_string().contains("auto resolves to userspace"));
 

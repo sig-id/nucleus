@@ -234,9 +234,9 @@ mod tests {
             config.namespaces.user,
             "User namespace should be enabled in rootless mode"
         );
-        assert!(
+        assert_eq!(
             config.user_ns_config.is_some(),
-            "User namespace config should be set in rootless mode"
+            !nix::unistd::Uid::effective().is_root()
         );
     }
 

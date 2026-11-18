@@ -63,7 +63,9 @@ mod tests {
             String::from_utf8_lossy(&result.stderr)
         );
         let created = fs::metadata(workspace.path().join("created")).unwrap();
-        assert_eq!((created.uid(), created.gid()), (100_000, 100_000));
+        assert_eq!(created.uid(), created.gid());
+        assert!((0x7000_0000..0x7ffe_0000).contains(&created.uid()));
+        assert_eq!(created.uid() % 65_536, 0);
     }
 
     #[test]

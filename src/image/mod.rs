@@ -4,6 +4,7 @@ use crate::filesystem::{
     is_immediate_nix_store_object_path, read_rootfs_attestation, DirectoryManifest,
     ROOTFS_ATTESTATION_FILE, ROOTFS_STORE_PATHS_FILE,
 };
+use crate::isolation::{IdMapping, UserNamespaceConfig};
 use crate::resources::Cgroup;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use nix::fcntl::{open, openat, readlinkat, OFlag};
@@ -50,6 +51,9 @@ pub struct ImageBase {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ImageDiff {
+    /// Host ownership recorded in the signed layer belongs to this namespace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_user_namespace: Option<UserNamespaceConfig>,
     pub path: String,
     pub manifest: BTreeMap<String, String>,
     pub deleted_paths: Vec<String>,
@@ -250,7 +254,18 @@ pub fn commit_container_image(
 
     let base = ImageBase::from_rootfs(Path::new(rootfs_path))?;
     copy_base_sidecars(Path::new(rootfs_path), output_dir)?;
-    let diff = export_diff(&upperdir, &diff_dir)?;
+    let mut diff = export_diff(&upperdir, &diff_dir)?;
+    diff.source_user_namespace = state.user_ns_config.clone().or_else(|| {
+        // Unshifted overlays already carry container IDs. Record their identity
+        // mapping explicitly to distinguish them from legacy root-remapped layers.
+        (!state.rootless).then(|| {
+            let ids = IdMapping::new(0, 0, 65_536);
+            UserNamespaceConfig {
+                uid_mappings: vec![ids.clone()],
+                gid_mappings: vec![ids],
+            }
+        })
+    });
     let config = ImageConfig::from_state(state);
     let manifest = NucleusImageManifest::new(base, Some(diff), config)?;
     manifest.save(output_dir)?;
@@ -362,6 +377,38 @@ impl VerifiedImage {
         })
     }
 
+    /// Import into a private staging directory. Only copied layer
+    /// entries carry source ownership. Replayed whiteouts and the new upperdir
+    /// start as host root and belong to container root.
+    pub fn copy_remapped_diff_to_upper(
+        &self,
+        upperdir: &Path,
+        uid: &IdMapping,
+        gid: &IdMapping,
+    ) -> Result<()> {
+        ensure_real_directory(upperdir, "target overlay upperdir")?;
+        if fs::read_dir(upperdir)?.next().is_some() {
+            return Err(image_error(
+                "Image import requires an empty overlay upperdir".into(),
+            ));
+        }
+        let source = self
+            .manifest
+            .diff
+            .as_ref()
+            .and_then(|diff| diff.source_user_namespace.as_ref());
+        self.copy_diff_to_upper(upperdir)?;
+        for entry in fs::read_dir(upperdir)? {
+            remap_imported_layer(&entry?.path(), source, uid, gid)?;
+        }
+        set_owner(
+            upperdir,
+            imported_host_id(0, None, uid)?,
+            imported_host_id(0, None, gid)?,
+            false,
+        )
+    }
+
     pub fn copy_diff_to_upper(&self, upperdir: &Path) -> Result<()> {
         let Some(diff) = &self.manifest.diff else {
             return Ok(());
@@ -392,22 +439,35 @@ pub fn copy_image_diff_to_upper(image_dir: &Path, upperdir: &Path) -> Result<()>
     VerifiedImage::open(image_dir)?.copy_diff_to_upper(upperdir)
 }
 
-/// Translate ownership of an imported layer tree into user-namespace host IDs.
-///
-/// The image diff carries container-relative numeric ownership: a directory
-/// owned by service uid 1000 must become host uid 100000+1000 once a root
-/// launch forces the `root_remapped` user namespace, or the remapped service
-/// (a different host identity) can no longer traverse its own 0700 data.
-/// Every mapped owner is chowned to its host counterpart; owners outside the
-/// mapping keep their numeric identity and surface as the overflow ID inside
-/// the namespace. Symlinks are skipped — their ownership is irrelevant and
-/// `chown(2)` would follow them. As a side effect of `chown(2)`, set-user-ID
-/// and set-group-ID bits on regular files are cleared, matching the posture
-/// of workspace copies.
-pub fn remap_layer_ownership(
+// Older signed layers contain either container-relative IDs or host IDs from
+// the previous fixed root mapping. Never leave a foreign host owner in an upperdir.
+fn imported_host_id(id: u32, source: Option<&[IdMapping]>, target: &IdMapping) -> Result<u32> {
+    let container_id = match source {
+        Some(maps) => maps.iter().find_map(|m| {
+            let offset = id.checked_sub(m.host_id)?;
+            if offset >= m.count {
+                return None;
+            }
+            m.container_id.checked_add(offset)
+        }),
+        None if (100_000..165_536).contains(&id) => Some(id - 100_000),
+        None => Some(id),
+    };
+    container_id
+        .and_then(|id| target.host_id_for(id))
+        .ok_or_else(|| image_error(format!("Image owner {id} is outside the namespace mapping")))
+}
+
+/// Translate container-relative ownership in a privately staged image layer.
+pub fn remap_layer_ownership(root: &Path, uid_map: &IdMapping, gid_map: &IdMapping) -> Result<()> {
+    remap_imported_layer(root, None, uid_map, gid_map)
+}
+
+fn remap_imported_layer(
     root: &Path,
-    uid_map: &crate::isolation::IdMapping,
-    gid_map: &crate::isolation::IdMapping,
+    source: Option<&UserNamespaceConfig>,
+    uid_map: &IdMapping,
+    gid_map: &IdMapping,
 ) -> Result<()> {
     let metadata = fs::symlink_metadata(root).map_err(|e| {
         NucleusError::FilesystemError(format!(
@@ -415,10 +475,6 @@ pub fn remap_layer_ownership(
             root, e
         ))
     })?;
-    if metadata.file_type().is_symlink() {
-        return Ok(());
-    }
-
     if metadata.is_dir() {
         for entry in fs::read_dir(root).map_err(|e| {
             NucleusError::FilesystemError(format!(
@@ -432,27 +488,22 @@ pub fn remap_layer_ownership(
                     root, e
                 ))
             })?;
-            remap_layer_ownership(&entry.path(), uid_map, gid_map)?;
+            remap_imported_layer(&entry.path(), source, uid_map, gid_map)?;
         }
     }
 
     use std::os::unix::fs::MetadataExt;
     let uid = metadata.uid();
     let gid = metadata.gid();
-    let new_uid = uid_map.host_id_for(uid).unwrap_or(uid);
-    let new_gid = gid_map.host_id_for(gid).unwrap_or(gid);
+    let source = if metadata.file_type().is_char_device() && metadata.rdev() == 0 {
+        None
+    } else {
+        source
+    };
+    let new_uid = imported_host_id(uid, source.map(|s| s.uid_mappings.as_slice()), uid_map)?;
+    let new_gid = imported_host_id(gid, source.map(|s| s.gid_mappings.as_slice()), gid_map)?;
     if new_uid != uid || new_gid != gid {
-        nix::unistd::chown(
-            root,
-            Some(nix::unistd::Uid::from_raw(new_uid)),
-            Some(nix::unistd::Gid::from_raw(new_gid)),
-        )
-        .map_err(|e| {
-            NucleusError::FilesystemError(format!(
-                "Failed to remap imported layer owner {:?} from {}:{} to {}:{}: {}",
-                root, uid, gid, new_uid, new_gid, e
-            ))
-        })?;
+        set_owner(root, new_uid, new_gid, false)?;
     }
     Ok(())
 }
@@ -488,6 +539,7 @@ fn export_diff(upperdir: &std::os::fd::OwnedFd, diff_dir: &Path) -> Result<Image
     copy_image_dir(upperdir, Path::new(""), diff_dir, Some(&mut entries))?;
     let digest = digest_diff_manifest(&entries.manifest, &entries.deleted_paths)?;
     Ok(ImageDiff {
+        source_user_namespace: None,
         path: IMAGE_DIFF_DIR.to_string(),
         manifest: entries.manifest,
         deleted_paths: entries.deleted_paths,
@@ -1387,6 +1439,7 @@ mod tests {
         let cfg = ImageConfig::from_state(&sample_state(&root, tmp.path()));
         for path in ["/outside", "../sibling", "diff/child"] {
             let diff = ImageDiff {
+                source_user_namespace: None,
                 path: path.into(),
                 digest: String::new(),
                 manifest: BTreeMap::new(),
@@ -1463,12 +1516,11 @@ mod tests {
         symlink("config", upper.join("etc/config-link")).unwrap();
 
         let image_dir = temp.path().join("image");
-        let manifest = commit_container_image(
-            &sample_state(&rootfs, &upper),
-            &image_dir,
-            &ImageCommitOptions::default(),
-        )
-        .unwrap();
+        let mut state = sample_state(&rootfs, &upper);
+        let map = UserNamespaceConfig::rootless();
+        state.user_ns_config = Some(map.clone());
+        let manifest =
+            commit_container_image(&state, &image_dir, &ImageCommitOptions::default()).unwrap();
 
         assert_eq!(manifest.schema_version, IMAGE_SCHEMA_VERSION);
         assert_eq!(manifest.config.env["APP_ENV"], "snapshot");
@@ -1510,7 +1562,19 @@ mod tests {
         .unwrap();
         let imported = temp.path().join("imported");
         fs::create_dir(&imported).unwrap();
-        verified.copy_diff_to_upper(&imported).unwrap();
+        assert_eq!(
+            verified
+                .manifest
+                .diff
+                .as_ref()
+                .unwrap()
+                .source_user_namespace
+                .as_ref(),
+            Some(&map)
+        );
+        verified
+            .copy_remapped_diff_to_upper(&imported, &map.uid_mappings[0], &map.gid_mappings[0])
+            .unwrap();
         assert_eq!(fs::read(imported.join("etc/config")).unwrap(), b"changed");
         let loaded = verified.manifest;
         assert_eq!(loaded.image_id, manifest.image_id);
@@ -1736,7 +1800,21 @@ mod tests {
         }
     }
     #[test]
-    fn remap_layer_ownership_keeps_unmapped_and_symlink_owners() {
+    fn import_rebases_previous_and_legacy_mappings_without_leaving_foreign_owners() {
+        let target = IdMapping::new(0, 700_000, 65_536);
+        let source = [IdMapping::new(0, 900_000, 65_536)];
+        assert_eq!(
+            imported_host_id(900_999, Some(&source), &target).unwrap(),
+            700_999
+        );
+        assert_eq!(imported_host_id(100_999, None, &target).unwrap(), 700_999);
+        assert_eq!(imported_host_id(999, None, &target).unwrap(), 700_999);
+        assert!(imported_host_id(999, Some(&source), &target).is_err());
+        assert!(imported_host_id(900_999, None, &target).is_err());
+    }
+
+    #[test]
+    fn remap_layer_ownership_preserves_identity_mapping() {
         use std::os::unix::fs::MetadataExt;
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("upper");
@@ -1749,8 +1827,8 @@ mod tests {
         // The current identity maps to itself; nothing else is mapped.
         let uid = nix::unistd::getuid().as_raw();
         let gid = nix::unistd::getgid().as_raw();
-        let uid_map = crate::isolation::IdMapping::new(0, uid, 1);
-        let gid_map = crate::isolation::IdMapping::new(0, gid, 1);
+        let uid_map = crate::isolation::IdMapping::new(uid, uid, 1);
+        let gid_map = crate::isolation::IdMapping::new(gid, gid, 1);
 
         remap_layer_ownership(&root, &uid_map, &gid_map).unwrap();
 
@@ -1788,11 +1866,11 @@ mod tests {
         )
         .unwrap();
 
-        let mapping = crate::isolation::UserNamespaceConfig::root_remapped();
-        remap_layer_ownership(&root, &mapping.uid_mappings[0], &mapping.gid_mappings[0]).unwrap();
+        let mapping = IdMapping::new(0, 700_000, 65_536);
+        remap_layer_ownership(&root, &mapping, &mapping).unwrap();
 
-        assert_eq!(std::fs::metadata(&service_dir).unwrap().uid(), 101_000);
-        assert_eq!(std::fs::metadata(&service_dir).unwrap().gid(), 101_000);
-        assert_eq!(std::fs::metadata(&file).unwrap().uid(), 101_000);
+        assert_eq!(std::fs::metadata(&service_dir).unwrap().uid(), 701_000);
+        assert_eq!(std::fs::metadata(&service_dir).unwrap().gid(), 701_000);
+        assert_eq!(std::fs::metadata(&file).unwrap().uid(), 701_000);
     }
 }

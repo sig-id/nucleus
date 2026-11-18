@@ -1,5 +1,6 @@
 mod attach;
 mod namespaces;
+mod root_remap;
 mod state;
 mod usermap;
 

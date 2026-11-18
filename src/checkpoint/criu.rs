@@ -126,6 +126,20 @@ impl CriuRuntime {
         ))
     }
 
+    // CRIU restores the original kernel uid_map/gid_map into a new container.
+    // A clone (including --leave-running) would therefore share the original
+    // container's host credentials. Older root-created state lacks the map.
+    fn check_restorable_mapping(state: &ContainerState) -> Result<()> {
+        let unknown_root_mapping =
+            state.creator_uid == 0 && state.rootless && state.user_ns_config.is_none();
+        if state.allocated_root_remap || unknown_root_mapping {
+            return Err(NucleusError::CheckpointError(
+                "CRIU cannot assign a fresh UID/GID range to a root-remapped restore".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Checkpoint a running container
     ///
     /// State transitions: None -> Dumping -> Dumped (or Dumping -> None on failure)
@@ -142,6 +156,7 @@ impl CriuRuntime {
             ));
         }
 
+        Self::check_restorable_mapping(state)?;
         if !state.is_running() {
             return Err(NucleusError::CheckpointError(format!(
                 "Container {} is not running",
@@ -261,6 +276,7 @@ impl CriuRuntime {
         let launch = metadata.launch_state.ok_or_else(|| NucleusError::CheckpointError(
             "This checkpoint lacks the original workload identity. Create a new checkpoint before restoring.".into()
         ))?;
+        Self::check_restorable_mapping(&launch)?;
         if metadata.cgroup_path.is_some() && metadata.resource_limits.is_none() {
             return Err(NucleusError::CheckpointError(
                 "Missing original cgroup limits".into(),
@@ -363,6 +379,7 @@ impl CriuRuntime {
             process_gid: launch.process_gid,
             additional_gids: launch.additional_gids,
         });
+        state.user_ns_config = launch.user_ns_config;
         state.creator_uid = launch.creator_uid;
         state.environment = launch.environment;
         state.workdir = launch.workdir;
@@ -897,6 +914,31 @@ mod tests {
         fs::create_dir(&key_dir).unwrap();
         fs::set_permissions(&key_dir, fs::Permissions::from_mode(0o700)).unwrap();
         key_dir
+    }
+
+    #[test]
+    fn criu_rejects_automatic_and_unknown_root_mappings_before_dump_or_restore() {
+        use crate::container::{ContainerState, ContainerStateParams};
+        let mut state = ContainerState::new(ContainerStateParams {
+            id: "test".into(),
+            name: "test".into(),
+            pid: std::process::id(),
+            command: vec![],
+            memory_limit: None,
+            cpu_limit: None,
+            using_gvisor: false,
+            rootless: true,
+            cgroup_path: None,
+            process_uid: 0,
+            process_gid: 0,
+            additional_gids: vec![],
+        });
+        state.creator_uid = 0;
+        assert!(CriuRuntime::check_restorable_mapping(&state).is_err());
+        state.user_ns_config = Some(crate::isolation::UserNamespaceConfig::rootless());
+        CriuRuntime::check_restorable_mapping(&state).unwrap();
+        state.allocated_root_remap = true;
+        assert!(CriuRuntime::check_restorable_mapping(&state).is_err());
     }
 
     #[test]
