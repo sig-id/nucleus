@@ -622,6 +622,8 @@ nucleus run \
 }
 ```
 
+The native enforcing filter permits ordinary futex waits, wakes and requeues. Mutexes configured with `PTHREAD_PRIO_INHERIT` require futex operations that this filter blocks. Unix-domain sockets and socket pairs are available in every network mode. Enabling networking also permits IPv4 and IPv6 TCP streams and UDP datagrams, with either the default or explicit protocol. The filter blocks `setsockopt(IPPROTO_TCP, TCP_ULP)`.
+
 **Capability policy** (TOML):
 ```toml
 # config/my-service.caps.toml

@@ -209,7 +209,6 @@ impl SeccompManager {
             // Misc
             libc::SYS_uname,
             libc::SYS_getrandom,
-            libc::SYS_futex,
             libc::SYS_set_tid_address,
             libc::SYS_set_robust_list,
             libc::SYS_get_robust_list,
@@ -257,10 +256,9 @@ impl SeccompManager {
             libc::SYS_landlock_create_ruleset,
             libc::SYS_landlock_add_rule,
             libc::SYS_landlock_restrict_self,
-            // Socket/Network (safe introspection + local socketpair)
+            // Socket/Network (safe introspection)
             libc::SYS_getsockname,
             libc::SYS_getpeername,
-            libc::SYS_socketpair,
             libc::SYS_getsockopt,
             // Safe with network mode disabled because socket(AF_INET/AF_INET6)
             // remains blocked; this permits AF_UNIX probes such as nscd.
@@ -313,12 +311,23 @@ impl SeccompManager {
         syscalls
     }
 
-    fn allowed_socket_domains(allow_network: bool) -> Vec<i32> {
-        if allow_network {
-            vec![libc::AF_UNIX, libc::AF_INET, libc::AF_INET6]
-        } else {
-            vec![libc::AF_UNIX]
+    // Linux takes these syscall arguments as int, including when a caller
+    // supplies nonzero upper bits in the 64-bit seccomp argument slots.
+    fn int_rule(conditions: &[(u8, seccompiler::SeccompCmpOp, i32)]) -> Result<SeccompRule> {
+        let invalid = |e: seccompiler::BackendError| NucleusError::SeccompError(e.to_string());
+        let mut comparisons = Vec::with_capacity(conditions.len());
+        for (index, op, value) in conditions {
+            comparisons.push(
+                SeccompCondition::new(
+                    *index,
+                    seccompiler::SeccompCmpArgLen::Dword,
+                    op.clone(),
+                    *value as u32 as u64,
+                )
+                .map_err(invalid)?,
+            );
         }
+        SeccompRule::new(comparisons).map_err(invalid)
     }
 
     fn network_mode_syscalls(allow_network: bool) -> Vec<i64> {
@@ -333,7 +342,6 @@ impl SeccompManager {
                 libc::SYS_listen,
                 libc::SYS_accept,
                 libc::SYS_accept4,
-                libc::SYS_setsockopt,
             ]
         } else {
             Vec::new()
@@ -376,7 +384,7 @@ impl SeccompManager {
         // - Known but not opt-in: WARN and blocked (defense-in-depth).
         // - Unknown name: WARN and blocked.
         for name in extra_syscalls {
-            if Self::ARG_FILTERED_SYSCALLS.contains(&name.as_str()) {
+            if Self::arg_filtered_in_mode(name, allow_network) {
                 continue;
             }
 
@@ -401,26 +409,56 @@ impl SeccompManager {
             }
         }
 
-        // Restrict socket() domains by network mode.
-        // none: AF_UNIX only; network-enabled: AF_UNIX/AF_INET/AF_INET6.
-        let mut socket_rules = Vec::new();
-        for domain in Self::allowed_socket_domains(allow_network) {
-            let condition = SeccompCondition::new(
-                0, // arg0 is socket(domain, type, protocol)
-                seccompiler::SeccompCmpArgLen::Dword,
-                seccompiler::SeccompCmpOp::Eq,
-                domain as u64,
-            )
-            .map_err(|e| {
-                NucleusError::SeccompError(format!(
-                    "Failed to create socket domain condition: {}",
-                    e
-                ))
-            })?;
-            let rule = SeccompRule::new(vec![condition]).map_err(|e| {
-                NucleusError::SeccompError(format!("Failed to create socket rule: {}", e))
-            })?;
-            socket_rules.push(rule);
+        use seccompiler::SeccompCmpOp::{Eq, MaskedEq, Ne};
+
+        // Permit ordinary synchronization, including private and realtime
+        // variants. PI operations and unknown commands fall through to deny.
+        let cmd_mask = libc::FUTEX_CMD_MASK as u32 as u64;
+        let mut futex_rules = Vec::new();
+        for op in [
+            libc::FUTEX_WAIT,
+            libc::FUTEX_WAKE,
+            libc::FUTEX_REQUEUE,
+            libc::FUTEX_CMP_REQUEUE,
+            libc::FUTEX_WAKE_OP,
+            libc::FUTEX_WAIT_BITSET,
+            libc::FUTEX_WAKE_BITSET,
+        ] {
+            futex_rules.push(Self::int_rule(&[(1, MaskedEq(cmd_mask), op)])?);
+        }
+        rules.insert(libc::SYS_futex, futex_rules);
+
+        // Both socket creation paths perform protocol lookup. Local IPC is
+        // available in every mode, including Unix sequenced-packet sockets.
+        let unix = Self::int_rule(&[(0, Eq, libc::AF_UNIX)])?;
+        rules.insert(libc::SYS_socketpair, vec![unix.clone()]);
+        let mut socket_rules = vec![unix];
+        if allow_network {
+            let type_mask = !(libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC) as u32 as u64;
+            for domain in [libc::AF_INET, libc::AF_INET6] {
+                for (kind, protocol) in [
+                    (libc::SOCK_STREAM, libc::IPPROTO_TCP),
+                    (libc::SOCK_DGRAM, libc::IPPROTO_UDP),
+                ] {
+                    // Protocol zero selects the default for this socket type.
+                    for proto in [0, protocol] {
+                        socket_rules.push(Self::int_rule(&[
+                            (0, Eq, domain),
+                            (1, MaskedEq(type_mask), kind),
+                            (2, Eq, proto),
+                        ])?);
+                    }
+                }
+            }
+            // Deny attaching a TCP upper-layer protocol to an existing socket.
+            // Option numbers at other levels have independent meanings.
+            rules.insert(
+                libc::SYS_setsockopt,
+                vec![
+                    Self::int_rule(&[(1, Ne, libc::IPPROTO_TCP)])?,
+                    Self::int_rule(&[(2, Ne, libc::TCP_ULP)])?,
+                ],
+            );
         }
         rules.insert(libc::SYS_socket, socket_rules);
 
@@ -652,7 +690,7 @@ impl SeccompManager {
 
             if base_syscalls.contains(&nr)
                 || network_syscalls.contains(&nr)
-                || Self::ARG_FILTERED_SYSCALLS.contains(&name.as_str())
+                || Self::arg_filtered_in_mode(name, allow_network)
             {
                 continue;
             }
@@ -728,7 +766,7 @@ impl SeccompManager {
     ///
     /// When `allow_network` is false, `SYS_socket` is restricted to AF_UNIX only,
     /// preventing creation of network sockets (AF_INET, AF_INET6, etc.).
-    /// When `allow_network` is true, all socket domains are permitted.
+    /// With networking enabled, IPv4 and IPv6 TCP and UDP sockets are also permitted.
     ///
     /// When `best_effort` is true, failures are logged and execution continues.
     /// When false, seccomp setup is fail-closed.
@@ -1037,8 +1075,22 @@ impl SeccompManager {
     /// Syscalls that the built-in filter restricts at the argument level.
     /// Custom profiles allowing these without argument filters weaken security.
     const ARG_FILTERED_SYSCALLS: &'static [&'static str] = &[
-        "clone", "execveat", "ioctl", "mprotect", "preadv2", "prctl", "pwritev2", "socket",
+        "clone",
+        "execveat",
+        "futex",
+        "ioctl",
+        "mprotect",
+        "preadv2",
+        "prctl",
+        "pwritev2",
+        "setsockopt",
+        "socket",
+        "socketpair",
     ];
+
+    fn arg_filtered_in_mode(name: &str, allow_network: bool) -> bool {
+        Self::ARG_FILTERED_SYSCALLS.contains(&name) && (allow_network || name != "setsockopt")
+    }
 
     /// Security-critical syscalls that must not be re-enabled by the
     /// convenience `--seccomp-allow` fragment mechanism.
@@ -1819,21 +1871,6 @@ mod tests {
     }
 
     #[test]
-    fn test_network_none_socket_domains_are_unix_only() {
-        let domains = SeccompManager::allowed_socket_domains(false);
-        assert_eq!(domains, vec![libc::AF_UNIX]);
-    }
-
-    #[test]
-    fn test_network_enabled_socket_domains_exclude_netlink() {
-        let domains = SeccompManager::allowed_socket_domains(true);
-        assert!(domains.contains(&libc::AF_UNIX));
-        assert!(domains.contains(&libc::AF_INET));
-        assert!(domains.contains(&libc::AF_INET6));
-        assert!(!domains.contains(&libc::AF_NETLINK));
-    }
-
-    #[test]
     fn test_network_mode_syscalls_only_enabled_when_network_allowed() {
         let none = SeccompManager::network_mode_syscalls(false);
         assert!(none.is_empty());
@@ -1842,7 +1879,7 @@ mod tests {
         assert!(enabled.contains(&libc::SYS_bind));
         assert!(enabled.contains(&libc::SYS_listen));
         assert!(enabled.contains(&libc::SYS_accept));
-        assert!(enabled.contains(&libc::SYS_setsockopt));
+        assert!(!enabled.contains(&libc::SYS_setsockopt));
         assert!(
             SeccompManager::base_allowed_syscalls().contains(&libc::SYS_connect),
             "connect is allowed for AF_UNIX probes; network sockets are blocked by socket() domain filtering"
@@ -1930,17 +1967,17 @@ mod tests {
         let base = SeccompManager::base_allowed_syscalls();
         let net = SeccompManager::network_mode_syscalls(true);
 
-        // Snapshot counts to catch unintended policy drift.
-        // +9 accounts for conditional rules inserted in minimal_filter():
-        // socket/ioctl/prctl/prlimit64/mprotect/preadv2/pwritev2/clone/execveat.
-        // fork removed (forces through filtered clone path).
-        // execveat removed from base (arg-filtered separately).
-        // sysinfo removed (L8: leaks host info).
-        // prlimit64 moved to arg-filtered (M3).
-        assert_eq!(base.len(), 174);
-        assert_eq!(net.len(), 10);
-        assert_eq!(base.len() + 9, 183);
-        assert_eq!(base.len() + net.len() + 9, 193);
+        // Include argument-filtered syscalls in the complete policy counts.
+        assert_eq!(base.len(), 172);
+        assert_eq!(net.len(), 9);
+        assert_eq!(
+            SeccompManager::minimal_filter(false, &[]).unwrap().len(),
+            182
+        );
+        assert_eq!(
+            SeccompManager::minimal_filter(true, &[]).unwrap().len(),
+            192
+        );
     }
 
     #[test]
@@ -1953,7 +1990,16 @@ mod tests {
         // These syscalls must be in the arg-filtered list so custom profiles
         // get warnings when they allow them without filters.
         for name in &[
-            "clone", "execveat", "ioctl", "preadv2", "prctl", "pwritev2", "socket",
+            "clone",
+            "execveat",
+            "futex",
+            "ioctl",
+            "preadv2",
+            "prctl",
+            "pwritev2",
+            "setsockopt",
+            "socket",
+            "socketpair",
         ] {
             assert!(
                 SeccompManager::ARG_FILTERED_SYSCALLS.contains(name),
