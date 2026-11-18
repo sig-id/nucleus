@@ -1022,7 +1022,7 @@ enum Commands {
         #[arg(long)]
         allow_host_network: bool,
 
-        /// Allow degraded security if seccomp/Landlock cannot be applied
+        /// Allow a launch to continue if seccomp, Landlock, or the GPU device filter is unavailable
         #[arg(long)]
         allow_degraded_security: bool,
 

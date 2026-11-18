@@ -50,9 +50,7 @@ impl GpuDeviceSet {
 
     /// Major/minor/device-kind for every node, for the cgroup device BPF.
     ///
-    /// Nodes that cannot be stat'd are skipped (with a debug log); the cgroup
-    /// allowlist is best-effort and the filesystem layer remains the primary
-    /// gate.
+    /// Nodes that have disappeared since discovery receive no allowlist entry.
     pub fn device_specs(&self) -> Vec<DeviceNodeSpec> {
         self.node_specs_with_paths()
             .iter()

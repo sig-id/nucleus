@@ -2,7 +2,7 @@ use crate::error::{NucleusError, Result};
 use crate::filesystem::{
     create_dev_nodes, create_minimal_fs, read_regular_file_nofollow, resolve_container_destination,
     snapshot_context_dir, validate_production_rootfs_path, verify_context_manifest,
-    verify_rootfs_attestation, ContextPopulator,
+    verify_rootfs_attestation, ContextPopulator, GpuDeviceSet,
 };
 use crate::network::{BridgeNetwork, NetworkMode};
 use crate::security::{
@@ -37,7 +37,11 @@ fn gvisor_network_mode(network: &NetworkMode) -> Result<GVisorNetworkMode> {
 
 impl Container {
     /// Set up container with gVisor and exec.
-    pub(super) fn setup_and_exec_gvisor(&self, precreated_userns: bool) -> Result<()> {
+    pub(super) fn setup_and_exec_gvisor(
+        &self,
+        precreated_userns: bool,
+        gpu_device_set: Option<&GpuDeviceSet>,
+    ) -> Result<()> {
         info!("Using gVisor runtime");
 
         let gvisor = if let Some(ref path) = self.runsc_path {
@@ -48,7 +52,7 @@ impl Container {
             })?
         };
 
-        self.setup_and_exec_gvisor_oci(&gvisor, precreated_userns)
+        self.setup_and_exec_gvisor_oci(&gvisor, precreated_userns, gpu_device_set)
     }
 
     /// Set up container with gVisor using OCI bundle format.
@@ -56,6 +60,7 @@ impl Container {
         &self,
         gvisor: &GVisorRuntime,
         precreated_userns: bool,
+        gpu_device_set: Option<&GpuDeviceSet>,
     ) -> Result<()> {
         info!("Using gVisor with OCI bundle format");
 
@@ -229,27 +234,9 @@ impl Container {
         // GPU passthrough (gVisor): emit OCI device entries + driver support
         // binds + NVIDIA env. runsc owns device node creation and the cgroup
         // device rules inside its sandbox.
-        if let Some(ref gpu_config) = self.config.gpu {
-            match crate::filesystem::resolve_gpu_devices(gpu_config) {
-                Ok(Some(set)) => {
-                    oci_config = oci_config.with_gpu_passthrough(
-                        gpu_config,
-                        &set,
-                        &self.config.process_identity,
-                    )?;
-                }
-                Ok(None) => {
-                    tracing::warn!(
-                        "--gpu requested but no GPU devices discovered; gVisor launch continues without GPU"
-                    );
-                }
-                Err(e) => {
-                    return Err(crate::error::NucleusError::FilesystemError(format!(
-                        "GPU device resolution failed: {}",
-                        e
-                    )))
-                }
-            }
+        if let (Some(set), Some(gpu_config)) = (gpu_device_set, &self.config.gpu) {
+            oci_config =
+                oci_config.with_gpu_passthrough(gpu_config, set, &self.config.process_identity)?;
         }
 
         // Use --bundle path if provided, otherwise default

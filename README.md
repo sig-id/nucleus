@@ -329,7 +329,7 @@ mounts are intended only for tools that must refresh local tokens.
 ### Agent Toolchain Rootfs
 
 Mitos-style provider launchers can avoid depending on mutable host `/bin`,
-`/usr`, `/lib`, or `/nix` binds by passing a pinned agent toolchain rootfs:
+`/usr`, `/lib`, or `/nix/store` binds by passing a pinned agent toolchain rootfs:
 
 ```bash
 nucleus run \
@@ -400,9 +400,8 @@ What happens when `--gpu` is set:
   permission to create device nodes and fails if this is unavailable.
 - **cgroup device allowlist** — a `BPF_PROG_TYPE_CGROUP_DEVICE` program is
   attached to the container cgroup, allow-listing only the base `/dev` nodes
-  plus the bound GPU devices (deny-by-default). This is best-effort: rootless
-  launches and kernels without `bpf(2)` degrade to a warning, leaving the
-  filesystem layer (only bound device nodes exist in `/dev`) as the gate.
+  plus the bound GPU devices. If the cgroup or filter is unavailable, GPU
+  setup fails unless the caller explicitly sets `--allow-degraded-security`.
 - **Seccomp** — the restrictive terminal-only `ioctl` rule is replaced with an
   unconditional allow, since vendor driver ioctl request codes cannot be
   enumerated. All other seccomp restrictions remain.

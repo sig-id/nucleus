@@ -53,6 +53,11 @@ const PRODUCTION_MOUNT_EXPECTATIONS: &[ExpectedMount] = &[
         critical: false, // only present on NixOS-based rootfs
     },
     ExpectedMount {
+        path: "/nix/store",
+        required_flags: &["ro", "nosuid", "nodev"],
+        critical: false,
+    },
+    ExpectedMount {
         path: "/sbin",
         required_flags: &["ro", "nosuid", "nodev"],
         critical: false, // not all rootfs layouts have /sbin
@@ -718,6 +723,9 @@ fn bind_mount_rootfs_store_paths(root: &Path, rootfs_path: &Path) -> Result<()> 
     Ok(())
 }
 
+// Nix binaries refer to store paths. The sibling /nix/var holds host daemon state.
+const AGENT_HOST_PATHS: &[&str] = &["/bin", "/usr", "/lib", "/lib64", "/nix/store"];
+
 /// Bind mount essential host directories into container
 ///
 /// This allows host binaries to be accessible inside the container.
@@ -725,12 +733,7 @@ fn bind_mount_rootfs_store_paths(root: &Path, rootfs_path: &Path) -> Result<()> 
 pub fn bind_mount_host_paths(root: &Path, best_effort: bool) -> Result<()> {
     info!("Bind mounting host paths into container");
 
-    // Essential paths to bind mount (read-only)
-    let host_paths = vec![
-        "/bin", "/usr", "/lib", "/lib64", "/nix", // For NixOS
-    ];
-
-    for host_path in host_paths {
+    for &host_path in AGENT_HOST_PATHS {
         let host = Path::new(host_path);
 
         // Only mount if the path exists on the host
@@ -2171,6 +2174,17 @@ fn mount_secrets_inmemory_inner(
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn agent_host_binds_only_the_store_under_nix() {
+        assert!(AGENT_HOST_PATHS.contains(&"/nix/store"));
+        for path in AGENT_HOST_PATHS {
+            assert!(!Path::new("/nix/var").starts_with(path));
+            if Path::new(path).starts_with("/nix") {
+                assert_eq!(*path, "/nix/store");
+            }
+        }
+    }
 
     #[test]
     fn test_validate_bind_mount_source_rejects_sensitive_subtrees() {

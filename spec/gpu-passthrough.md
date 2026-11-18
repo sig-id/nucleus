@@ -36,7 +36,7 @@ A container process needs all of the following to use a GPU:
 | Concern | Mechanism |
 |---|---|
 | Device node | `/dev/nvidia0`, `/dev/dri/renderD128`, `/dev/kfd`, … recreated in the container `/dev` with the host device numbers and workload ownership. |
-| Device cgroup allow | cgroup v2 has no `devices` controller file; access is gated by a `BPF_PROG_TYPE_CGROUP_DEVICE` classic-BPF program attached to the cgroup. Without one, the default is allow-all (today's Nucleus behavior). |
+| Device cgroup allow | cgroup v2 has no `devices` controller file; access is gated by a `BPF_PROG_TYPE_CGROUP_DEVICE` eBPF program attached to the cgroup. |
 | `ioctl` syscall | GPU drivers issue dozens of vendor-specific `ioctl` request codes (DRM, NVOS/NV_ESC_RM, KFD). Nucleus's default seccomp allowlist permits only terminal ioctls — **must be relaxed**. |
 | Driver userspace | The CUDA/ROCm/Mesa userspace libraries, Vulkan/ICD JSON, and `/proc/driver/nvidia`. Either shipped in the rootfs or bind-mounted from the host. |
 | Env vars | `NVIDIA_VISIBLE_DEVICES`, `NVIDIA_DRIVER_CAPABILITIES`, etc. |
@@ -100,15 +100,14 @@ CLI surface:
 ## Execution flow (native)
 
 1. **Parent, before fork:** resolve the GPU device set
-   (`GpuDeviceSet::resolve`) while still unprivileged so missing-device errors
+   (`resolve_gpu_devices`) while still unprivileged so missing-device errors
    surface early. Build the cgroup device allowlist spec (base devices + GPU
    nodes).
 2. **Cgroup setup:** after `Cgroup::create` + `set_limits`, call
-   `Cgroup::install_device_allowlist(spec)`. This loads a
+   `Cgroup::install_gpu_device_allowlist`. This loads a
    `BPF_PROG_TYPE_CGROUP_DEVICE` program and attaches it to the container
-   cgroup. On kernels without `CAP_BPF`/bpf() it degrades to a warning
-   (matching `--allow-degraded-security` semantics) because the *file-system*
-   layer (only the bound device nodes exist in `/dev`) still gates access.
+   cgroup before the workload starts. If the cgroup or filter is unavailable,
+   GPU setup fails unless the caller explicitly sets `--allow-degraded-security`.
 3. **Child, after `create_dev_nodes`:** `mount_gpu_passthrough` creates
    independent character device nodes in the container `/dev`, preserving the
    host path and device numbers. It assigns the workload UID/GID and mode
@@ -119,8 +118,8 @@ CLI surface:
 4. **Seccomp:** built-in filter is built with `gpu_mode = true`, which replaces
    the restrictive terminal-only `ioctl` rule with an unconditional allow.
    Custom `--seccomp-profile` users own their ioctl policy.
-5. **Landlock:** the bound `/dev/*` GPU nodes and support dirs are added as
-   read/write paths so Landlock does not block the workload from opening them.
+5. **Landlock:** each selected GPU character node receives read, write and
+   device-ioctl permissions.
 
 ## Execution flow (gVisor)
 
@@ -141,31 +140,14 @@ needed for the gVisor path.
 
 ## cgroup device allowlist (BPF)
 
-`BPF_PROG_TYPE_CGROUP_DEVICE` accepts classic BPF (cBPF). The context is:
+`BPF_PROG_TYPE_CGROUP_DEVICE` programs receive a `bpf_cgroup_dev_ctx` with
+three 32-bit fields. The low 16 bits of `access_type` hold the device kind
+(1 for block, 2 for character). The high 16 bits hold the requested access
+(mknod, read, write). The following fields hold the major and minor numbers.
 
-```c
-struct bpf_cgroup_dev_ctx { __u32 access; __u32 type; __u32 major; __u32 minor; };
-```
-
-`access` is `DEV_READ|DEV_WRITE|DEV_MKNOD`; `type` is 1 (char) or 2 (block).
-
-The generated program is deny-by-default with one allow block per device:
-
-```
-load type  -> if != expected, jump to next block
-load major -> if != expected, jump to next block   (0xffffffff = any)
-load minor -> if != expected, jump to next block   (0xffffffff = any)
-load access-> and with allowed mask -> if 0, jump to next block
-return ALLOW
-...
-return DENY
-```
-
-Base devices (null/zero/full/random/urandom/tty) are always allowed so the
-existing `/dev` nodes keep working. The program is loaded with `bpf(2)` and
-attached with `BPF_PROG_ATTACH` to the cgroup fd. Failure is non-fatal when
-`allow_degraded_security` is set; the filesystem layer remains the primary
-gate. The cBPF bytecode is pure and unit-tested without root.
+The program grants all three operations for an exact match on kind, major and
+minor. It denies every other device. The allowlist includes null, zero, full,
+random, urandom, tty when requested, and the selected GPUs.
 
 ## Production mode
 
@@ -180,8 +162,7 @@ fail-closed contract intact. `agent` and `strict-agent` modes allow `--gpu`.
   Intel, none, mixed.
 - Device-set resolution with explicit overrides and validation (reject
   non-device paths, reject escapes).
-- cgroup device cBPF bytecode generation: deterministic instruction stream,
-  deny-by-default, correct major/minor/mask encoding.
+- Kernel loading, attachment and enforcement of the cgroup device eBPF program.
 - `GpuPassthroughConfig` serde round-trip (kebab-case) and CLI mapping.
 - Validation: production rejection, gvisor-host + gpu interactions, missing
   device errors.
