@@ -1,23 +1,10 @@
-diff --git a/runsc/specutils/specutils.go b/runsc/specutils/specutils.go
-index 00cd5fc47..efb1ab160 100644
 --- a/runsc/specutils/specutils.go
 +++ b/runsc/specutils/specutils.go
-@@ -78,8 +78,34 @@ const (
- )
+@@ -93,7 +93,25 @@
  
--// ExePath must point to runsc binary, which is normally the same binary. It's
--// changed in tests that aren't linked in the same binary.
+ // ExePath must point to runsc binary, which is normally the same binary. It's
+ // changed in tests that aren't linked in the same binary.
 -var ExePath = "/proc/self/exe"
-+// ExePath must point to runsc binary, which is normally the same binary. It is
-+// changed in tests that aren't linked in the same binary.
-+//
-+// Upstream defaults this to /proc/self/exe. Nucleus runs runsc below a
-+// host-side execute allowlist, and Landlock cannot authorize procfs magic-link
-+// execution narrowly enough for that path. Resolve the real executable path so
-+// runsc helper processes and user-namespace re-execs stay on a concrete
-+// executable path. The environment fallback remains only for emergency
-+// compatibility; production Nucleus paths keep it unset so helpers do not
-+// depend on procfs magic-link execution.
 +var ExePath = resolvedExePath()
 +
 +func resolvedExePath() string {
@@ -40,11 +27,9 @@ index 00cd5fc47..efb1ab160 100644
  
  // Version is the supported spec version.
  var Version = specs.Version
-diff --git a/runsc/specutils/namespace.go b/runsc/specutils/namespace.go
-index ce5a97326..2fdf35f0d 100644
 --- a/runsc/specutils/namespace.go
 +++ b/runsc/specutils/namespace.go
-@@ -246,7 +246,7 @@ func MaybeRunAsRoot() error {
+@@ -262,7 +262,7 @@
  	// and run as root inside the namespace to acquire capabilities.
  	log.Infof("*** Re-running as root in new user namespace ***")
  
@@ -53,26 +38,15 @@ index ce5a97326..2fdf35f0d 100644
  
  	cmd.SysProcAttr = &unix.SysProcAttr{
  		Cloneflags: unix.CLONE_NEWUSER | unix.CLONE_NEWNS,
-diff --git a/runsc/sandbox/sandbox.go b/runsc/sandbox/sandbox.go
-index 0124180ec..8148c6e1f 100644
 --- a/runsc/sandbox/sandbox.go
 +++ b/runsc/sandbox/sandbox.go
-@@ -929,6 +929,9 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args Args, startSync
- 	if !conf.TestOnlyAllowRunAsCurrentUserWithoutChroot {
- 		// Setting cmd.Env = nil causes cmd to inherit the current process's env.
- 		cmd.Env = []string{}
-+		if value := os.Getenv("NUCLEUS_RUNSC_REEXEC_VIA_PROC_SELF_EXE"); value != "" {
-+			cmd.Env = append(cmd.Env, "NUCLEUS_RUNSC_REEXEC_VIA_PROC_SELF_EXE="+value)
+@@ -1082,6 +1082,9 @@
+ 		// Clear it, except for TMPDIR which must match the parent runsc process
+ 		// because the sandbox uses os.TempDir() to set up its chroot.
+ 		env = []string{}
++		if os.Getenv("NUCLEUS_RUNSC_REEXEC_VIA_PROC_SELF_EXE") == "1" {
++			env = append(env, "NUCLEUS_RUNSC_REEXEC_VIA_PROC_SELF_EXE=1")
 +		}
- 	}
- 	if config.CgoEnabled {
- 		// Platforms that use stub processes are not compatible with
-@@ -2150,6 +2153,8 @@ func ConfigureCmdForRootless(cmd *exec.Cmd, donations *donation.Agency) (*os.Fil
- 		unix.CAP_DAC_READ_SEARCH,
- 		unix.CAP_FOWNER,
- 		unix.CAP_FSETID,
-+		// Needed by the ptrace platform when runsc starts rootless with host networking.
-+		unix.CAP_SYS_PTRACE,
- 		unix.CAP_SYS_CHROOT,
- 		// Needed for setuid(2)/setgid(2).
- 		unix.CAP_SETUID,
+ 		if tmpDir := os.Getenv("TMPDIR"); tmpDir != "" {
+ 			env = append(env, "TMPDIR="+tmpDir)
+ 		}

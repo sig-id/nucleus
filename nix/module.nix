@@ -2,6 +2,7 @@
 
 let
   cfg = config.services.nucleus;
+  gvisor = pkgs.callPackage ./gvisor.nix { };
   inherit (lib) mkEnableOption mkOption types mkIf mapAttrs' nameValuePair
     concatStringsSep optional optionalString;
 
@@ -531,7 +532,7 @@ let
       wants = [ "network-online.target" ];
       wantedBy = [ "multi-user.target" ];
 
-      path = lib.optionals (containerCfg.runtime == "gvisor") [ pkgs.gvisor ]
+      path = lib.optionals (containerCfg.runtime == "gvisor") [ gvisor ]
         ++ lib.optionals (containerCfg.network == "bridge") [ pkgs.iptables pkgs.slirp4netns ];
 
       serviceConfig = {
@@ -573,7 +574,7 @@ let
       wants = [ "network-online.target" ];
       wantedBy = [ "multi-user.target" ];
 
-      path = [ pkgs.iptables pkgs.slirp4netns ] ++ lib.optionals (pkgs ? gvisor) [ pkgs.gvisor ];
+      path = [ pkgs.iptables pkgs.slirp4netns ] ++ lib.optionals (pkgs ? gvisor) [ gvisor ];
 
       serviceConfig = {
         Type = "oneshot";

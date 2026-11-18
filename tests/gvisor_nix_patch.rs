@@ -54,28 +54,16 @@ fn gvisor_patch_uses_resolved_exe_path_for_rootless_namespace_reexec() {
 }
 
 #[test]
-fn gvisor_patch_preserves_ptrace_capability_for_rootless_sandbox_helpers() {
-    let patch = read_gvisor_patch();
-
-    assert_patch_contains(&patch, "diff --git a/runsc/sandbox/sandbox.go");
-    assert_patch_contains(
-        &patch,
-        r#"+		// Needed by the ptrace platform when runsc starts rootless with host networking."#,
-    );
-    assert_patch_contains(&patch, r#"+		unix.CAP_SYS_PTRACE,"#);
-}
-
-#[test]
 fn gvisor_patch_preserves_proc_self_reexec_env_for_sandbox_boot() {
     let patch = read_gvisor_patch();
 
     assert_patch_contains(&patch, "NUCLEUS_RUNSC_REEXEC_VIA_PROC_SELF_EXE");
     assert_patch_contains(
         &patch,
-        r#"+		if value := os.Getenv("NUCLEUS_RUNSC_REEXEC_VIA_PROC_SELF_EXE"); value != "" {"#,
+        r#"+		if os.Getenv("NUCLEUS_RUNSC_REEXEC_VIA_PROC_SELF_EXE") == "1" {"#,
     );
     assert_patch_contains(
         &patch,
-        r#"+			cmd.Env = append(cmd.Env, "NUCLEUS_RUNSC_REEXEC_VIA_PROC_SELF_EXE="+value)"#,
+        r#"+			env = append(env, "NUCLEUS_RUNSC_REEXEC_VIA_PROC_SELF_EXE=1")"#,
     );
 }

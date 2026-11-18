@@ -25,7 +25,7 @@
           runtimeInputs = [
             pg18
             nucleusPkg
-            pkgs.gvisor
+            nucleus.packages.${system}.gvisor
             pkgs.coreutils
             pkgs.gnugrep
             pkgs.gawk

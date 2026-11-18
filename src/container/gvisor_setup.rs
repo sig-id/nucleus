@@ -22,6 +22,19 @@ fn require_gvisor_supervisor_exec_policy(
     service_mode == ServiceMode::Production && !precreated_userns
 }
 
+fn gvisor_network_mode(network: &NetworkMode) -> Result<GVisorNetworkMode> {
+    Ok(match network {
+        NetworkMode::None => GVisorNetworkMode::None,
+        NetworkMode::Host => {
+            return Err(NucleusError::ConfigError(
+                "gVisor host networking requires --network gvisor-host".into(),
+            ));
+        }
+        NetworkMode::GVisorHost => GVisorNetworkMode::Host,
+        NetworkMode::Bridge(_) => GVisorNetworkMode::Sandbox,
+    })
+}
+
 impl Container {
     /// Set up container with gVisor and exec.
     pub(super) fn setup_and_exec_gvisor(&self, precreated_userns: bool) -> Result<()> {
@@ -83,16 +96,6 @@ impl Container {
         oci_config = oci_config.with_process_identity(&self.config.process_identity);
         oci_config =
             oci_config.with_home_tmpfs(&self.config.home, &self.config.process_identity)?;
-        if matches!(
-            self.config.network,
-            NetworkMode::Bridge(_) | NetworkMode::GVisorHost
-        ) {
-            // Bridge: Nucleus configures userspace NAT against the child
-            // process' network namespace before exec, then runsc inherits it.
-            // gvisor-host: runsc hostinet only reaches the host namespace when
-            // no OCI network namespace entry is present.
-            oci_config = oci_config.without_network_namespace();
-        }
         oci_config = oci_config.with_rlimits(&self.config.limits);
 
         if let Some(profile_path) = self.config.seccomp_profile.as_ref() {
@@ -206,6 +209,18 @@ impl Container {
             }
         }
 
+        // Apply this after user namespace configuration, which may remove the
+        // default network entry. An empty or absent entry gives netstack a new,
+        // unconfigured namespace. Join the one prepared before the parent gate.
+        let gvisor_net = gvisor_network_mode(&self.config.network)?;
+        oci_config = match gvisor_net {
+            GVisorNetworkMode::Sandbox => {
+                oci_config.with_bridge_network_namespace(std::process::id())
+            }
+            GVisorNetworkMode::Host => oci_config.without_network_namespace(),
+            GVisorNetworkMode::None => oci_config,
+        };
+
         // Pass OCI hooks into the gVisor config.json so gVisor executes them
         if let Some(ref hooks) = self.config.hooks {
             oci_config = oci_config.with_hooks(hooks.clone());
@@ -271,26 +286,16 @@ impl Container {
             BridgeNetwork::write_resolv_conf(&rootfs, &bridge_config.dns)?;
         }
 
-        // Select gVisor network mode based on container network config
-        let gvisor_net = match &self.config.network {
-            NetworkMode::None => GVisorNetworkMode::None,
-            NetworkMode::Host => {
-                return Err(NucleusError::ConfigError(
-                    "gVisor runtime requires --network gvisor-host for host networking; --network host is native host networking"
-                        .to_string(),
-                ));
-            }
-            NetworkMode::GVisorHost => GVisorNetworkMode::Host,
-            NetworkMode::Bridge(_) => GVisorNetworkMode::Host,
-        };
-
         let rootless_gvisor = self.config.user_ns_config.is_some() || !Uid::effective().is_root();
         let ignore_cgroups = rootless_gvisor;
-        // Tell runsc whenever the launch is rootless. Pre-created gVisor
-        // handoff namespaces need this so helper handoff keeps mapped
-        // privileges; OCI user namespace launches need it because runsc itself
-        // starts as the non-root service user.
-        let runsc_rootless = rootless_gvisor;
+        // runsc rejects --rootless with netstack. For bridge, Nucleus has
+        // already entered its mapped user namespace and switched to UID 0.
+        // With explicit OCI ID mappings an unprivileged runsc sets up the
+        // mappings itself. --rootless would first remap the caller to UID 0
+        // in a single-ID namespace where the configured host IDs are invalid.
+        let runsc_rootless = rootless_gvisor
+            && gvisor_net != GVisorNetworkMode::Sandbox
+            && (precreated_userns || self.config.user_ns_config.is_none());
         let platform = self.config.gvisor_platform;
         // Production gVisor launches fail closed under the host-side
         // supervisor execute policy except for the pre-created gVisor userns
@@ -654,6 +659,36 @@ impl Container {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bridge_uses_netstack_in_the_prepared_namespace() {
+        let network = NetworkMode::Bridge(crate::network::BridgeConfig::default());
+        assert_eq!(
+            gvisor_network_mode(&network).unwrap(),
+            GVisorNetworkMode::Sandbox
+        );
+        assert_eq!(
+            gvisor_network_mode(&NetworkMode::GVisorHost).unwrap(),
+            GVisorNetworkMode::Host
+        );
+        assert_eq!(
+            gvisor_network_mode(&NetworkMode::None).unwrap(),
+            GVisorNetworkMode::None
+        );
+        assert!(gvisor_network_mode(&NetworkMode::Host).is_err());
+        let config =
+            OciConfig::new(vec!["/bin/true".into()], None).with_bridge_network_namespace(123);
+        let namespaces = config.linux.unwrap().namespaces.unwrap();
+        let network: Vec<_> = namespaces
+            .iter()
+            .filter(|ns| ns.namespace_type == "network")
+            .collect();
+        assert_eq!(network.len(), 1);
+        assert_eq!(
+            network[0].path.as_deref(),
+            Some(std::path::Path::new("/proc/123/ns/net"))
+        );
+    }
 
     #[test]
     fn test_root_remapped_production_gvisor_requires_supervisor_exec_policy() {

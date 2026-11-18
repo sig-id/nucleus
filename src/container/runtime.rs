@@ -1170,15 +1170,10 @@ impl Container {
         // launch context. Bridge also pre-creates a netns for slirp/NAT setup;
         // gvisor-host intentionally keeps the host netns for runsc hostinet.
         if self.config.use_gvisor {
-            let gvisor_precreated_userns =
-                if Self::gvisor_needs_precreated_userns(&self.config, Uid::effective().is_root()) {
-                    self.prepare_gvisor_handoff_namespace(
-                        userns_request_pipe.as_ref(),
-                        userns_ack_pipe.as_ref(),
-                    )?
-                } else {
-                    false
-                };
+            let gvisor_precreated_userns = self.prepare_gvisor_handoff_namespace(
+                userns_request_pipe.as_ref(),
+                userns_ack_pipe.as_ref(),
+            )?;
 
             if let Some(fd) = ready_pipe {
                 Self::notify_namespace_ready(&fd, std::process::id())?;
@@ -1217,7 +1212,7 @@ impl Container {
                 "Parent closed user namespace ack pipe before mappings were written",
                 "Failed waiting for parent to finish user namespace mappings",
             )?;
-            Self::become_userns_root_for_setup()?;
+            Self::become_userns_root_for_setup(false)?;
         }
 
         // CLONE_NEWPID only applies to children created after unshare().
@@ -1993,7 +1988,7 @@ impl Container {
         }
     }
 
-    fn become_userns_root_for_setup() -> Result<()> {
+    fn become_userns_root_for_setup(bridge_netstack: bool) -> Result<()> {
         setresgid(Gid::from_raw(0), Gid::from_raw(0), Gid::from_raw(0)).map_err(|e| {
             NucleusError::NamespaceError(format!(
                 "Failed to become gid 0 inside mapped user namespace: {}",
@@ -2006,7 +2001,7 @@ impl Container {
                 e
             ))
         })?;
-        Self::restore_gvisor_handoff_capabilities()?;
+        Self::restore_gvisor_handoff_capabilities(bridge_netstack)?;
         debug!("Switched setup process to uid/gid 0 inside mapped user namespace");
         Ok(())
     }
@@ -2029,8 +2024,19 @@ impl Container {
         .collect()
     }
 
-    fn restore_gvisor_handoff_capabilities() -> Result<()> {
-        let caps = Self::gvisor_handoff_capabilities();
+    fn restore_gvisor_handoff_capabilities(bridge_netstack: bool) -> Result<()> {
+        let mut caps = Self::gvisor_handoff_capabilities();
+        if bridge_netstack {
+            // Scoped to the new user namespace: runsc moves interface addresses
+            // into netstack and opens its AF_PACKET link in the private netns.
+            // DirectFS creates a nested identity mapping of UID 0. Linux
+            // requires SETFCAP in this parent user namespace to write it.
+            caps.extend([
+                Capability::CAP_NET_ADMIN,
+                Capability::CAP_NET_RAW,
+                Capability::CAP_SETFCAP,
+            ]);
+        }
         let permitted = caps::read(None, CapSet::Permitted).map_err(|e| {
             NucleusError::CapabilityError(format!(
                 "Failed to read gVisor handoff permitted capabilities: {}",
@@ -2108,7 +2114,7 @@ impl Container {
         userns_ack_pipe: Option<&OwnedFd>,
     ) -> Result<bool> {
         let mut precreated_userns = false;
-        if self.config.user_ns_config.is_some() && !Uid::effective().is_root() {
+        if Self::gvisor_needs_precreated_userns(&self.config, Uid::effective().is_root()) {
             nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWUSER).map_err(|e| {
                 NucleusError::NamespaceError(format!(
                     "Failed to unshare gVisor handoff user namespace: {}",
@@ -2137,7 +2143,10 @@ impl Container {
                 "Parent closed user namespace ack pipe before gVisor handoff mappings were written",
                 "Failed waiting for parent to finish gVisor handoff user namespace mappings",
             )?;
-            Self::become_userns_root_for_setup()?;
+            Self::become_userns_root_for_setup(matches!(
+                self.config.network,
+                NetworkMode::Bridge(_)
+            ))?;
             precreated_userns = true;
         }
 
@@ -2885,12 +2894,13 @@ mod tests {
     }
 
     #[test]
-    fn test_gvisor_rootless_passes_runsc_rootless() {
+    fn test_gvisor_rootless_flag_respects_netstack() {
         let source = include_str!("gvisor_setup.rs");
         let fn_body = extract_fn_body(source, "fn setup_and_exec_gvisor_oci");
         assert!(
-            fn_body.contains("let runsc_rootless = rootless_gvisor"),
-            "rootless gVisor must tell runsc to keep rootless supervisor semantics"
+            fn_body.contains("gvisor_net != GVisorNetworkMode::Sandbox")
+                && fn_body.contains("precreated_userns || self.config.user_ns_config.is_none()"),
+            "runsc accepts its rootless flag only for none and host networking"
         );
     }
 
