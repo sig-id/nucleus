@@ -45,7 +45,6 @@ mod tests {
                 "none",
                 "--pids",
                 "0",
-                "--seccomp-log-denied",
                 "--allow-degraded-security",
                 "--workspace",
             ])
@@ -83,7 +82,6 @@ mod tests {
                 "none",
                 "--pids",
                 "0",
-                "--seccomp-log-denied",
                 "--allow-degraded-security",
                 "--",
                 "/bin/sh",
@@ -99,8 +97,7 @@ mod tests {
             .unwrap();
         assert!(
             output.status.success(),
-            "stdout: {}\nstderr: {}",
-            String::from_utf8_lossy(&output.stdout),
+            "{}",
             String::from_utf8_lossy(&output.stderr)
         );
     }
