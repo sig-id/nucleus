@@ -315,3 +315,25 @@ fn vendor_includes_predicates() {
     assert!(!GpuVendor::Amd.includes_nvidia());
     assert!(!GpuVendor::Intel.includes_amd());
 }
+
+#[test]
+fn device_node_spec_reports_existing_char_devices() {
+    // /dev/null is a character device (1,3) present on every Linux host.
+    assert_eq!(
+        device_node_spec(Path::new("/dev/null")),
+        Some(DeviceNodeSpec {
+            is_block: false,
+            major: 1,
+            minor: 3,
+        })
+    );
+}
+
+#[test]
+fn device_node_spec_rejects_missing_or_non_device_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("regular-file");
+    fs::write(&file, b"x").unwrap();
+    assert_eq!(device_node_spec(&file), None);
+    assert_eq!(device_node_spec(&dir.path().join("missing")), None);
+}

@@ -50,9 +50,7 @@ impl GpuDeviceSet {
 
     /// Major/minor/device-kind for every node, for the cgroup device BPF.
     ///
-    /// Nodes that cannot be stat'd are skipped (with a debug log); the cgroup
-    /// allowlist is best-effort and the filesystem layer remains the primary
-    /// gate.
+    /// Nodes that have disappeared since discovery receive no allowlist entry.
     pub fn device_specs(&self) -> Vec<DeviceNodeSpec> {
         self.node_specs_with_paths()
             .iter()
@@ -90,6 +88,26 @@ pub struct DeviceNodeSpec {
     pub is_block: bool,
     pub major: u32,
     pub minor: u32,
+}
+
+/// Identity of an existing host device node, or `None` when the path is
+/// absent or not a character/block device.
+///
+/// Used for supervisor-required host devices (e.g. `/dev/kvm` for the gVisor
+/// KVM backend), whose major/minor numbers must be discovered on the host
+/// rather than assumed.
+pub fn device_node_spec(path: &Path) -> Option<DeviceNodeSpec> {
+    let meta = fs::metadata(path).ok()?;
+    let file_type = meta.file_type();
+    if !file_type.is_char_device() && !file_type.is_block_device() {
+        return None;
+    }
+    let rdev = meta.rdev();
+    Some(DeviceNodeSpec {
+        is_block: file_type.is_block_device(),
+        major: major_of(rdev),
+        minor: minor_of(rdev),
+    })
 }
 
 /// Extract the major number from a `st_rdev` value (Linux `MAJOR` macro).

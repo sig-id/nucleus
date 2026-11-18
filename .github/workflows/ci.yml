@@ -36,6 +36,12 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: sudo
         run: cargo test --locked --lib filesystem::gpu::tests::gpu_node_ownership_preserves_host_and_allows_non_root_access -- --ignored --exact
 
+      - name: Verify cgroup device filter enforcement as root
+        env:
+          RUSTC_WRAPPER: ""
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: sudo
+        run: cargo test --locked --lib resources::cgroup_device::tests::kernel_enforces_device_allowlist -- --ignored --exact
+
   supply-chain:
     runs-on: ubuntu-latest
 

@@ -24,6 +24,7 @@ enum PathAccessMode {
     ReadExecute,
     ReadWrite,
     ReadWriteExecute,
+    Device,
 }
 
 /// Landlock filesystem access-control manager
@@ -75,6 +76,12 @@ impl LandlockManager {
     pub fn add_rw_exec_path(&mut self, path: &str) {
         self.extra_paths
             .push((path.to_string(), PathAccessMode::ReadWriteExecute));
+    }
+
+    /// Grant file access and driver ioctls on a selected GPU character device.
+    pub(crate) fn add_gpu_device(&mut self, path: &str) {
+        self.extra_paths
+            .push((path.to_string(), PathAccessMode::Device));
     }
 
     /// Configure Landlock access for `/workspace`.
@@ -421,6 +428,7 @@ impl LandlockManager {
         access_read_write_exec: landlock::BitFlags<AccessFs>,
     ) -> landlock::BitFlags<AccessFs> {
         match mode {
+            PathAccessMode::Device => AccessFs::ReadFile | AccessFs::WriteFile | AccessFs::IoctlDev,
             PathAccessMode::ReadOnly => access_read,
             PathAccessMode::ReadExecute => access_read_exec,
             PathAccessMode::ReadWrite => access_read_write,

@@ -6,11 +6,12 @@ use crate::container::{
 use crate::error::{NucleusError, Result, StateTransition};
 use crate::filesystem::{
     audit_mounts, bind_mount_host_paths, bind_mount_rootfs, copy_workspace_in, create_dev_nodes,
-    create_minimal_fs, mask_proc_paths, mount_gpu_passthrough, mount_home_tmpfs, mount_procfs,
-    mount_provider_configs, mount_secrets_inmemory, mount_volumes, mount_workspace,
+    create_minimal_fs, device_node_spec, mask_proc_paths, mount_gpu_passthrough, mount_home_tmpfs,
+    mount_procfs, mount_provider_configs, mount_secrets_inmemory, mount_volumes, mount_workspace,
     overlay_mount_rootfs, resolve_gpu_devices, snapshot_context_dir, switch_root,
     sync_workspace_out, validate_production_rootfs_path, verify_context_manifest,
-    verify_rootfs_attestation, FilesystemState, GpuDeviceSet, LazyContextPopulator, TmpfsMount,
+    verify_rootfs_attestation, DeviceNodeSpec, FilesystemState, GpuDeviceSet, LazyContextPopulator,
+    TmpfsMount,
 };
 use crate::isolation::{NamespaceManager, UserNamespaceMapper};
 use crate::network::{BridgeDriver, BridgeNetwork, NatBackend, NetworkMode, UserspaceNetwork};
@@ -231,6 +232,26 @@ impl Container {
                 config.network,
                 NetworkMode::Bridge(_) | NetworkMode::GVisorHost
             )
+    }
+
+    /// Host device nodes the gVisor supervisor must be allowed to open, for
+    /// the cgroup device allowlist installed on GPU launches.
+    ///
+    /// The allowlist is deny-by-default and applies to the runsc process that
+    /// the parent attaches to the container cgroup before acknowledging
+    /// setup, so without these entries a KVM-backend sandbox could never open
+    /// `/dev/kvm` to start. The workload inside the sandbox still cannot reach
+    /// these host devices.
+    fn gvisor_supervisor_device_specs(config: &ContainerConfig) -> Vec<DeviceNodeSpec> {
+        if !config.use_gvisor {
+            return Vec::new();
+        }
+        config
+            .gvisor_platform
+            .supervisor_host_devices()
+            .iter()
+            .filter_map(|path| device_node_spec(Path::new(path)))
+            .collect()
     }
 
     fn prepare_runtime_base_override(
@@ -663,6 +684,18 @@ impl Container {
             }
         }
 
+        // Use the parent's discovery result for both the filter and the child.
+        let gpu_device_set = if let Some(gpu_config) = &config.gpu {
+            let devices = resolve_gpu_devices(gpu_config)?;
+            if devices.is_none() {
+                warn!("--gpu requested but no GPU devices were discovered; continuing without GPU");
+                config.gpu = None;
+            }
+            devices
+        } else {
+            None
+        };
+
         // Compile once in the host filesystem before the parent and workload diverge.
         let native_seccomp = (!config.use_gvisor)
             .then(|| NativeSeccomp::from_config(&config))
@@ -693,7 +726,7 @@ impl Container {
                     exec_fifo, e
                 ))
             })?;
-            Some(exec_fifo)
+            Some(tempfile::TempPath::try_from_path(exec_fifo)?)
         } else {
             None
         };
@@ -757,31 +790,26 @@ impl Container {
             }
         };
 
-        // GPU passthrough (parent side): resolve devices while still
-        // unprivileged and install a cgroup device allowlist so the workload
-        // can only reach the base + GPU devices. Best-effort: the filesystem
-        // layer (only bound device nodes exist in /dev) remains the primary
-        // gate, and rootless launches cannot load BPF.
-        if let Some(gpu_config) = config.gpu.as_ref() {
-            match resolve_gpu_devices(gpu_config) {
-                Ok(Some(set)) => {
-                    if let Some(ref cgroup) = cgroup_opt {
-                        let specs = set.device_specs();
-                        if let Err(e) = cgroup.install_gpu_device_allowlist(
-                            &specs,
-                            config.terminal,
-                            /* best_effort */ true,
-                        ) {
-                            warn!("Failed to install GPU cgroup device allowlist: {}", e);
-                        }
-                    }
-                }
-                Ok(None) => {
-                    warn!(
-                        "--gpu requested but no GPU devices were discovered; continuing without GPU"
-                    );
-                }
-                Err(e) => return Err(e),
+        if let Some(set) = &gpu_device_set {
+            if let Some(cgroup) = &cgroup_opt {
+                // The deny-by-default filter also governs the runsc supervisor,
+                // which the parent attaches to this cgroup before the sandbox
+                // starts. Allow the selected platform backend's required host
+                // devices (e.g. /dev/kvm for KVM) so the sandbox can boot; the
+                // workload inside the sandbox still cannot reach them.
+                let supervisor_specs = Self::gvisor_supervisor_device_specs(&config);
+                cgroup.install_gpu_device_allowlist(
+                    &set.device_specs(),
+                    &supervisor_specs,
+                    config.terminal,
+                    config.allow_degraded_security,
+                )?;
+            } else if config.allow_degraded_security {
+                warn!("Continuing without GPU cgroup device allowlist: no container cgroup");
+            } else {
+                return Err(NucleusError::CgroupError(
+                    "GPU passthrough requires a container cgroup for the device allowlist".into(),
+                ));
             }
         }
 
@@ -845,6 +873,12 @@ impl Container {
         // by other threads (tracing, allocator). The Tokio runtime is not yet
         // started at this point, so async thread contention is not a concern.
         Self::assert_single_threaded_for_fork("container create fork")?;
+        // From the fork onward the container lifecycle owns the FIFO. Setup
+        // failures before this point (including GPU enforcement) remove it.
+        let exec_fifo = exec_fifo
+            .map(tempfile::TempPath::keep)
+            .transpose()
+            .map_err(std::io::Error::from)?;
         // SAFETY: fork() is called before any Tokio runtime is created.
         // Only the main thread should be active at this point.
         match unsafe { fork() }? {
@@ -1084,6 +1118,7 @@ impl Container {
                     event_sink: None,
                 };
                 match temp_container.setup_and_exec(
+                    gpu_device_set.as_ref(),
                     native_seccomp.as_ref(),
                     Some(ready_write),
                     userns_request_write,
@@ -1140,6 +1175,7 @@ impl Container {
     #[allow(clippy::too_many_arguments)]
     fn setup_and_exec(
         &self,
+        gpu_device_set: Option<&GpuDeviceSet>,
         native_seccomp: Option<&NativeSeccomp>,
         ready_pipe: Option<OwnedFd>,
         userns_request_pipe: Option<OwnedFd>,
@@ -1185,7 +1221,7 @@ impl Container {
                     "Failed waiting for parent setup acknowledgement",
                 )?;
             }
-            return self.setup_and_exec_gvisor(gvisor_precreated_userns);
+            return self.setup_and_exec_gvisor(gvisor_precreated_userns, gpu_device_set);
         }
 
         // 1. Create namespaces in child and optionally configure user mapping.
@@ -1327,28 +1363,7 @@ impl Container {
         create_dev_nodes(&dev_path, self.config.terminal)?;
 
         // 5a. GPU passthrough: create private device nodes + bind driver support files.
-        // Resolved again in the child (idempotent host /dev scan) so the same
-        // device set drives both the parent cgroup allowlist and these nodes.
-        let gpu_device_set: Option<GpuDeviceSet> = match self.config.gpu.as_ref() {
-            Some(gpu_config) => match resolve_gpu_devices(gpu_config) {
-                Ok(Some(set)) => Some(set),
-                Ok(None) => {
-                    warn!(
-                        "--gpu requested but no GPU devices discovered in child; skipping mounts"
-                    );
-                    None
-                }
-                Err(e) => {
-                    return Err(NucleusError::FilesystemError(format!(
-                        "GPU device resolution failed: {}",
-                        e
-                    )))
-                }
-            },
-            None => None,
-        };
-        if let Some(ref set) = gpu_device_set {
-            let gpu_config = self.config.gpu.as_ref().expect("gpu config present");
+        if let (Some(set), Some(gpu_config)) = (gpu_device_set, &self.config.gpu) {
             mount_gpu_passthrough(
                 &container_root,
                 set,
@@ -1734,9 +1749,9 @@ impl Container {
             }
             // GPU device nodes must be reachable (read+write) by the workload.
             // Driver support files are read-only inputs.
-            if let Some(ref set) = gpu_device_set {
+            if let Some(set) = gpu_device_set {
                 for node in &set.nodes {
-                    landlock_mgr.add_rw_path(&node.to_string_lossy());
+                    landlock_mgr.add_gpu_device(&node.to_string_lossy());
                 }
             }
             landlock_mgr.apply_container_policy_with_mode(allow_degraded_security)?
