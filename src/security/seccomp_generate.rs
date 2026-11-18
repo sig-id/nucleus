@@ -57,6 +57,9 @@ pub struct SeccompArgFilter {
     pub op: String,
     /// Comparison value.
     pub value: u64,
+    /// Expected masked value for SCMP_CMP_MASKED_EQ.
+    #[serde(default, rename = "valueTwo")]
+    pub value_two: u64,
 }
 
 /// Return the OCI seccomp architecture constant for the current target.

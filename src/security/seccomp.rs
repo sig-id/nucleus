@@ -1,5 +1,6 @@
+use crate::container::{ContainerConfig, SeccompMode};
 use crate::error::{NucleusError, Result};
-use crate::security::policy::sha256_hex;
+use crate::network::NetworkMode;
 #[cfg(any(
     target_arch = "x86_64",
     target_arch = "aarch64",
@@ -7,9 +8,54 @@ use crate::security::policy::sha256_hex;
 ))]
 use crate::security::syscall_numbers::{SYS_FADVISE64, SYS_SENDFILE};
 use seccompiler::{BpfProgram, SeccompAction, SeccompCondition, SeccompFilter, SeccompRule};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
 use tracing::{debug, info, warn};
+
+/// Immutable native filter shared by the workload and subsequent helpers.
+/// Persist cBPF fields explicitly so attach uses the launch program even
+/// after a profile file or the installed binary changes.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NativeSeccomp {
+    instructions: Vec<(u16, u8, u8, u32)>,
+    log: bool,
+}
+
+impl NativeSeccomp {
+    pub(crate) fn from_config(config: &ContainerConfig) -> Result<Self> {
+        let trace = config.seccomp_mode == SeccompMode::Trace;
+        let program = if trace {
+            SeccompManager::compile_trace_filter()?
+        } else if let Some(path) = &config.seccomp_profile {
+            SeccompManager::compile_profile(path, config.seccomp_profile_sha256.as_deref())?
+        } else {
+            SeccompManager::compile_builtin(
+                !matches!(config.network, NetworkMode::None),
+                &config.seccomp_allow_syscalls,
+                config.gpu.is_some(),
+            )?
+        };
+        Ok(Self {
+            instructions: program.iter().map(|i| (i.code, i.jt, i.jf, i.k)).collect(),
+            log: trace || config.seccomp_log_denied,
+        })
+    }
+
+    pub(crate) fn apply(&self) -> Result<()> {
+        if self.instructions.is_empty() || self.instructions.len() > 4096 {
+            return Err(NucleusError::SeccompError(
+                "Invalid saved seccomp program length".into(),
+            ));
+        }
+        let program = self
+            .instructions
+            .iter()
+            .map(|&(code, jt, jf, k)| seccompiler::sock_filter { code, jt, jf, k })
+            .collect();
+        SeccompManager::apply_bpf_program(&program, self.log)
+    }
+}
 
 /// Seccomp filter manager
 ///
@@ -559,19 +605,7 @@ impl SeccompManager {
         // exact-match ENOSYS deny for clone3 so libc falls back to filtered clone.
 
         // clone: allow but deny namespace-creating flags to prevent nested namespace creation
-        let clone_condition = SeccompCondition::new(
-            0, // arg0 = flags
-            seccompiler::SeccompCmpArgLen::Qword,
-            seccompiler::SeccompCmpOp::MaskedEq(DENIED_CLONE_NAMESPACE_FLAGS),
-            0, // (flags & ns_flags) == 0: none of the namespace flags set
-        )
-        .map_err(|e| {
-            NucleusError::SeccompError(format!("Failed to create clone condition: {}", e))
-        })?;
-        let clone_rule = SeccompRule::new(vec![clone_condition]).map_err(|e| {
-            NucleusError::SeccompError(format!("Failed to create clone rule: {}", e))
-        })?;
-        rules.insert(libc::SYS_clone, vec![clone_rule]);
+        rules.insert(libc::SYS_clone, vec![Self::clone_rule(&[])?]);
 
         // execveat: allow but block AT_EMPTY_PATH (0x1000) to prevent fileless
         // execution. With AT_EMPTY_PATH, execveat can execute code from any open
@@ -650,17 +684,7 @@ impl SeccompManager {
     ///
     /// Uses bitmap-based BPF compilation for O(1) syscall dispatch.
     pub fn compile_minimal_filter() -> Result<BpfProgram> {
-        let rules = Self::minimal_filter(true, &[])?;
-        let target_arch = std::env::consts::ARCH.try_into().map_err(|e| {
-            NucleusError::SeccompError(format!("Unsupported architecture: {:?}", e))
-        })?;
-        super::seccomp_bpf::compile_bitmap_bpf_with_errno_syscalls(
-            rules,
-            Self::errno_denied_syscalls(),
-            SeccompAction::KillProcess,
-            SeccompAction::Allow,
-            target_arch,
-        )
+        Self::compile_builtin(true, &[], false)
     }
 
     /// Expose minimal_filter for tests in sibling modules.
@@ -746,58 +770,16 @@ impl SeccompManager {
 
         info!(allow_network, gpu_mode, "Applying seccomp filter");
 
-        let mut rules = match Self::minimal_filter(allow_network, extra_syscalls) {
-            Ok(r) => r,
-            Err(e) => {
-                if best_effort {
-                    warn!(
-                        "Failed to create seccomp rules: {} (continuing without seccomp)",
-                        e
-                    );
-                    return Ok(false);
-                }
-                return Err(e);
+        let bpf_prog = match Self::compile_builtin(allow_network, extra_syscalls, gpu_mode) {
+            Ok(program) => program,
+            Err(e) if best_effort => {
+                warn!(
+                    "Failed to compile seccomp filter: {} (continuing without seccomp)",
+                    e
+                );
+                return Ok(false);
             }
-        };
-
-        // GPU relaxation: replace the terminal-only ioctl allowlist with an
-        // unconditional allow. Vendor driver ioctl request codes are not
-        // enumerable, so the narrow filter would kill GPU workloads.
-        if gpu_mode {
-            rules.insert(libc::SYS_ioctl, Vec::new());
-            info!("GPU mode: relaxing seccomp ioctl filter to allow-all");
-        }
-
-        let target_arch = match std::env::consts::ARCH.try_into() {
-            Ok(a) => a,
-            Err(e) => {
-                let msg = format!("Unsupported architecture: {:?}", e);
-                if best_effort {
-                    warn!("{} (continuing without seccomp)", msg);
-                    return Ok(false);
-                }
-                return Err(NucleusError::SeccompError(msg));
-            }
-        };
-
-        let bpf_prog: BpfProgram = match super::seccomp_bpf::compile_bitmap_bpf_with_errno_syscalls(
-            rules,
-            Self::errno_denied_syscalls(),
-            SeccompAction::KillProcess,
-            SeccompAction::Allow,
-            target_arch,
-        ) {
-            Ok(p) => p,
-            Err(e) => {
-                if best_effort {
-                    warn!(
-                        "Failed to compile BPF program: {} (continuing without seccomp)",
-                        e
-                    );
-                    return Ok(false);
-                }
-                return Err(e);
-            }
+            Err(e) => return Err(e),
         };
 
         // Apply the filter
@@ -824,6 +806,19 @@ impl SeccompManager {
         }
     }
 
+    fn compile_builtin(
+        allow_network: bool,
+        extra_syscalls: &[String],
+        gpu_mode: bool,
+    ) -> Result<BpfProgram> {
+        let mut rules = Self::minimal_filter(allow_network, extra_syscalls)?;
+        if gpu_mode {
+            rules.insert(libc::SYS_ioctl, Vec::new());
+            info!("GPU mode: relaxing seccomp ioctl filter to allow-all");
+        }
+        Self::compile_rules(rules)
+    }
+
     /// Apply a seccomp profile loaded from a JSON file.
     ///
     /// The profile format is a JSON object with:
@@ -836,9 +831,9 @@ impl SeccompManager {
     /// }
     /// ```
     ///
-    /// This is a subset of the OCI seccomp profile format. Only the syscall name
-    /// allowlist is used; argument-level filtering from the built-in profile is
-    /// not applied when using a custom profile.
+    /// The native OCI subset supports syscall allowlists and clone predicates.
+    /// Built-in argument restrictions still apply, including the namespace mask.
+    /// Unsupported argument predicates are rejected.
     ///
     /// If `expected_sha256` is provided, the file's SHA-256 hash is verified
     /// against it before loading. This prevents silent profile tampering.
@@ -853,45 +848,76 @@ impl SeccompManager {
             return Ok(true);
         }
 
-        info!("Loading seccomp profile from {:?}", profile_path);
+        let program = Self::compile_profile(profile_path, expected_sha256)?;
+        Self::apply_bpf_program(&program, audit_mode)?;
+        self.applied = true;
+        Ok(true)
+    }
 
-        // Read profile file
-        let content = std::fs::read(profile_path).map_err(|e| {
-            NucleusError::SeccompError(format!(
-                "Failed to read seccomp profile {:?}: {}",
-                profile_path, e
-            ))
-        })?;
-
-        // Verify SHA-256 hash if expected
-        if let Some(expected) = expected_sha256 {
-            let actual = sha256_hex(&content);
-            if actual != expected {
-                return Err(NucleusError::SeccompError(format!(
-                    "Seccomp profile hash mismatch: expected {}, got {}",
-                    expected, actual
-                )));
-            }
-            info!("Seccomp profile hash verified: {}", actual);
+    fn clone_rule(args: &[SeccompArgFilter]) -> Result<SeccompRule> {
+        use seccompiler::{SeccompCmpArgLen::Qword, SeccompCmpOp};
+        let invalid = |e: seccompiler::BackendError| NucleusError::SeccompError(e.to_string());
+        let mut conditions = vec![SeccompCondition::new(
+            0,
+            Qword,
+            SeccompCmpOp::MaskedEq(DENIED_CLONE_NAMESPACE_FLAGS),
+            0,
+        )
+        .map_err(invalid)?];
+        for arg in args {
+            let (op, value) = match arg.op.as_str() {
+                "SCMP_CMP_EQ" => (SeccompCmpOp::Eq, arg.value),
+                "SCMP_CMP_NE" => (SeccompCmpOp::Ne, arg.value),
+                "SCMP_CMP_LT" => (SeccompCmpOp::Lt, arg.value),
+                "SCMP_CMP_LE" => (SeccompCmpOp::Le, arg.value),
+                "SCMP_CMP_GT" => (SeccompCmpOp::Gt, arg.value),
+                "SCMP_CMP_GE" => (SeccompCmpOp::Ge, arg.value),
+                "SCMP_CMP_MASKED_EQ" if arg.value_two & !arg.value == 0 => {
+                    (SeccompCmpOp::MaskedEq(arg.value), arg.value_two)
+                }
+                _ => {
+                    return Err(NucleusError::SeccompError(format!(
+                        "Invalid clone argument comparison {}",
+                        arg.op
+                    )))
+                }
+            };
+            let index = u8::try_from(arg.index).map_err(|_| {
+                NucleusError::SeccompError(format!("Invalid argument index {}", arg.index))
+            })?;
+            conditions.push(SeccompCondition::new(index, Qword, op, value).map_err(invalid)?);
         }
+        SeccompRule::new(conditions).map_err(invalid)
+    }
 
-        // Parse profile
-        let profile: SeccompProfile = serde_json::from_slice(&content).map_err(|e| {
-            NucleusError::SeccompError(format!("Failed to parse seccomp profile: {}", e))
-        })?;
-
-        // Warn when custom profile allows security-critical syscalls without
-        // argument-level filtering. The built-in filter restricts clone, ioctl,
-        // prctl, and socket at the argument level; a custom profile that allows
-        // them by name only silently removes all of that hardening.
-        Self::warn_missing_arg_filters(&profile);
-
+    pub(super) fn compile_profile(
+        profile_path: &Path,
+        expected_sha256: Option<&str>,
+    ) -> Result<BpfProgram> {
+        let profile: SeccompProfile = super::load_json_policy(profile_path, expected_sha256)?;
         // Build filter from profile
         let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
 
         for syscall_group in &profile.syscalls {
+            if (!syscall_group.args.is_empty()
+                && syscall_group.names.iter().any(|name| name != "clone"))
+                || (syscall_group.action != "SCMP_ACT_ALLOW"
+                    && syscall_group.names.iter().any(|name| name == "clone"))
+            {
+                return Err(NucleusError::SeccompError(format!(
+                    "Unsupported native seccomp rule for {}",
+                    syscall_group.names.join(", ")
+                )));
+            }
             if syscall_group.action == "SCMP_ACT_ALLOW" {
                 for name in &syscall_group.names {
+                    if name == "clone" {
+                        rules
+                            .entry(libc::SYS_clone)
+                            .or_default()
+                            .push(Self::clone_rule(&syscall_group.args)?);
+                        continue;
+                    }
                     if name == "clone3" {
                         warn!(
                             "Custom seccomp profile requested clone3; ignoring it and returning \
@@ -917,7 +943,7 @@ impl SeccompManager {
             if let Some(nr) = syscall_name_to_number(syscall_name) {
                 if let std::collections::btree_map::Entry::Occupied(mut entry) = rules.entry(nr) {
                     if let Some(builtin) = builtin_rules.get(&nr) {
-                        if !builtin.is_empty() {
+                        if entry.get().is_empty() && !builtin.is_empty() {
                             info!(
                                 "Merging built-in argument filters for '{}' into custom profile",
                                 syscall_name
@@ -928,29 +954,44 @@ impl SeccompManager {
                 }
             }
         }
-        let target_arch = std::env::consts::ARCH.try_into().map_err(|e| {
+        Self::compile_rules(rules)
+    }
+
+    fn compile_rules(rules: BTreeMap<i64, Vec<SeccompRule>>) -> Result<BpfProgram> {
+        let arch = std::env::consts::ARCH.try_into().map_err(|e| {
             NucleusError::SeccompError(format!("Unsupported architecture: {:?}", e))
         })?;
-
-        let bpf_prog: BpfProgram = super::seccomp_bpf::compile_bitmap_bpf_with_errno_syscalls(
+        super::seccomp_bpf::compile_bitmap_bpf_with_errno_syscalls(
             rules,
             Self::errno_denied_syscalls(),
             SeccompAction::KillProcess,
             SeccompAction::Allow,
-            target_arch,
-        )?;
+            arch,
+        )
+    }
 
-        match Self::apply_bpf_program(&bpf_prog, audit_mode) {
-            Ok(_) => {
-                self.applied = true;
-                info!(
-                    "Seccomp profile applied from {:?} (log_denied={})",
-                    profile_path, audit_mode
-                );
-                Ok(true)
-            }
-            Err(e) => Err(e),
+    /// Keep descendants of a timed probe in the private process group that
+    /// the host signals. Install before the workload's seccomp program.
+    pub(crate) fn confine_probe_process_group() -> Result<()> {
+        let mut rules = BTreeMap::new();
+        for nr in [libc::SYS_setpgid, libc::SYS_setsid] {
+            rules.insert(nr, Vec::new());
+            #[cfg(target_arch = "x86_64")]
+            rules.insert(nr | 0x4000_0000, Vec::new()); // x32 ABI
         }
+        let filter = SeccompFilter::new(
+            rules,
+            SeccompAction::Allow,
+            SeccompAction::Errno(libc::EPERM as u32),
+            std::env::consts::ARCH.try_into().map_err(|e| {
+                NucleusError::SeccompError(format!("Unsupported architecture: {:?}", e))
+            })?,
+        )
+        .map_err(|e| NucleusError::SeccompError(e.to_string()))?;
+        let program = filter
+            .try_into()
+            .map_err(|e: seccompiler::BackendError| NucleusError::SeccompError(e.to_string()))?;
+        Self::apply_bpf_program(&program, false)
     }
 
     /// Install an allow-all seccomp filter with SECCOMP_FILTER_FLAG_LOG.
@@ -1161,26 +1202,6 @@ impl SeccompManager {
         "seccomp",
     ];
 
-    /// Warn when a custom seccomp profile allows security-critical syscalls
-    /// without argument-level filtering.
-    fn warn_missing_arg_filters(profile: &SeccompProfile) {
-        for group in &profile.syscalls {
-            if group.action != "SCMP_ACT_ALLOW" {
-                continue;
-            }
-            for name in &group.names {
-                if Self::ARG_FILTERED_SYSCALLS.contains(&name.as_str()) && group.args.is_empty() {
-                    warn!(
-                        "Custom seccomp profile allows '{}' without argument filters. \
-                         The built-in filter restricts this syscall at the argument level. \
-                         This profile weakens security compared to the default.",
-                        name
-                    );
-                }
-            }
-        }
-    }
-
     /// Check if seccomp filter has been applied
     pub fn is_applied(&self) -> bool {
         self.applied
@@ -1249,7 +1270,7 @@ impl SeccompManager {
 }
 
 // SeccompProfile and SeccompSyscallGroup are defined in seccomp_generate.rs
-use crate::security::seccomp_generate::SeccompProfile;
+use crate::security::seccomp_generate::{SeccompArgFilter, SeccompProfile};
 
 /// Map a syscall name (e.g. "read", "write") to its Linux syscall number.
 ///
@@ -1718,6 +1739,52 @@ impl Default for SeccompManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saved_filter_survives_profile_replacement_and_rejects_invalid_instructions() {
+        use std::os::unix::process::ExitStatusExt;
+        const FIXTURE: &str = "NUCLEUS_TEST_SAVED_SECCOMP";
+        if let Some(snapshot) = std::env::var_os(FIXTURE) {
+            let saved: NativeSeccomp =
+                serde_json::from_reader(std::fs::File::open(snapshot).unwrap()).unwrap();
+            saved.apply().unwrap();
+            // SAFETY: getpid takes no arguments. Exit immediately if the filter permits it.
+            unsafe {
+                libc::syscall(libc::SYS_getpid);
+                libc::_exit(0);
+            }
+        }
+        let profile = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(profile.path(), r#"{"defaultAction":"SCMP_ACT_KILL_PROCESS","syscalls":[{"names":["exit_group"],"action":"SCMP_ACT_ALLOW"}]}"#).unwrap();
+        let config = ContainerConfig::try_new(None, vec![])
+            .unwrap()
+            .with_seccomp_profile(profile.path().into());
+        let snapshot = tempfile::NamedTempFile::new().unwrap();
+        serde_json::to_writer(&snapshot, &NativeSeccomp::from_config(&config).unwrap()).unwrap();
+        drop(profile);
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "security::seccomp::tests::saved_filter_survives_profile_replacement_and_rejects_invalid_instructions"])
+            .env(FIXTURE, snapshot.path()).status().unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGSYS));
+        assert!(NativeSeccomp {
+            instructions: Vec::new(),
+            log: false
+        }
+        .apply()
+        .is_err());
+    }
+
+    #[test]
+    fn native_profile_rejects_unsupported_argument_rules() {
+        let profile = tempfile::NamedTempFile::new().unwrap();
+        for (name, op) in [("unshare", "SCMP_CMP_EQ"), ("clone", "unsupported")] {
+            let value = serde_json::json!({"defaultAction":"SCMP_ACT_ERRNO","syscalls":[{
+                "names":[name],"action":"SCMP_ACT_ALLOW","args":[{"index":0,"op":op,"value":1}]
+            }]});
+            std::fs::write(profile.path(), value.to_string()).unwrap();
+            assert!(SeccompManager::compile_profile(profile.path(), None).is_err());
+        }
+    }
 
     #[test]
     fn test_seccomp_manager_initial_state() {

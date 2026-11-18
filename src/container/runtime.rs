@@ -16,8 +16,8 @@ use crate::isolation::{NamespaceManager, UserNamespaceMapper};
 use crate::network::{BridgeDriver, BridgeNetwork, NatBackend, NetworkMode, UserspaceNetwork};
 use crate::resources::{Cgroup, ResourceStats};
 use crate::security::{
-    CapabilityManager, GVisorRuntime, LandlockManager, OciContainerState, OciHooks,
-    SeccompDenyLogger, SeccompManager, SeccompTraceReader, SecurityState,
+    CapabilityManager, GVisorRuntime, LandlockManager, NativeSeccomp, OciContainerState, OciHooks,
+    SeccompDenyLogger, SeccompTraceReader, SecurityState,
 };
 use crate::telemetry::{CleanupEvent, ContainerControlEvent, EventSink, ExitStatusEvent};
 use caps::{CapSet, Capability, CapsHashSet};
@@ -663,6 +663,11 @@ impl Container {
             }
         }
 
+        // Compile once in the host filesystem before the parent and workload diverge.
+        let native_seccomp = (!config.use_gvisor)
+            .then(|| NativeSeccomp::from_config(&config))
+            .transpose()?;
+
         // Create state manager, honoring --root override if set
         let state_mgr = ContainerStateManager::new_with_root(config.state_root.clone())?;
 
@@ -940,6 +945,8 @@ impl Container {
                         process_gid: config.process_identity.gid,
                         additional_gids: config.process_identity.additional_gids.clone(),
                     });
+                    state.pids_max = config.limits.pids_max;
+                    state.native_seccomp = native_seccomp;
                     state.environment = config.environment.iter().cloned().collect();
                     state.workdir = config.workdir.display().to_string();
                     state.config_hash = config.config_hash;
@@ -1077,6 +1084,7 @@ impl Container {
                     event_sink: None,
                 };
                 match temp_container.setup_and_exec(
+                    native_seccomp.as_ref(),
                     Some(ready_write),
                     userns_request_write,
                     userns_ack_read,
@@ -1132,6 +1140,7 @@ impl Container {
     #[allow(clippy::too_many_arguments)]
     fn setup_and_exec(
         &self,
+        native_seccomp: Option<&NativeSeccomp>,
         ready_pipe: Option<OwnedFd>,
         userns_request_pipe: Option<OwnedFd>,
         userns_ack_pipe: Option<OwnedFd>,
@@ -1638,50 +1647,49 @@ impl Container {
         // 13. Apply seccomp filter (trace, profile-from-file, or built-in allowlist)
         // Security: CapabilitiesDropped -> SeccompApplied
         use crate::container::config::SeccompMode;
-        let mut seccomp_mgr = SeccompManager::new();
         let allow_network = !matches!(self.config.network, NetworkMode::None);
-        let seccomp_applied = match self.config.seccomp_mode {
-            SeccompMode::Trace => {
-                audit(
-                    &self.config.id,
-                    &self.config.name,
-                    AuditEventType::SeccompApplied,
-                    "seccomp trace mode: allow-all + LOG",
+        if let Some(path) = self
+            .config
+            .seccomp_profile
+            .as_ref()
+            .filter(|_| self.config.seccomp_mode == SeccompMode::Enforce)
+        {
+            audit(
+                &self.config.id,
+                &self.config.name,
+                AuditEventType::SeccompProfileLoaded,
+                format!("path={:?}", path),
+            );
+        }
+        let install = native_seccomp
+            .ok_or_else(|| NucleusError::SeccompError("Missing native launch filter".into()))?
+            .apply();
+        let seccomp_applied = match install {
+            Ok(()) => true,
+            Err(e)
+                if allow_degraded_security
+                    && self.config.seccomp_profile.is_none()
+                    && self.config.seccomp_mode == SeccompMode::Enforce =>
+            {
+                warn!(
+                    "Failed to install seccomp filter: {} (degraded security)",
+                    e
                 );
-                seccomp_mgr.apply_trace_filter()?
+                false
             }
-            SeccompMode::Enforce => {
-                if let Some(ref profile_path) = self.config.seccomp_profile {
-                    audit(
-                        &self.config.id,
-                        &self.config.name,
-                        AuditEventType::SeccompProfileLoaded,
-                        format!("path={:?}", profile_path),
-                    );
-                    seccomp_mgr.apply_profile_from_file(
-                        profile_path,
-                        self.config.seccomp_profile_sha256.as_deref(),
-                        self.config.seccomp_log_denied,
-                    )?
-                } else {
-                    let gpu_mode = self.config.gpu.is_some();
-                    seccomp_mgr.apply_filter_with_options(
-                        allow_network,
-                        allow_degraded_security,
-                        self.config.seccomp_log_denied,
-                        &self.config.seccomp_allow_syscalls,
-                        gpu_mode,
-                    )?
-                }
-            }
+            Err(e) => return Err(e),
         };
+
         if seccomp_applied {
             sec_state = sec_state.transition(SecurityState::SeccompApplied)?;
             audit(
                 &self.config.id,
                 &self.config.name,
                 AuditEventType::SeccompApplied,
-                format!("network={}", allow_network),
+                format!(
+                    "mode={:?} network={}",
+                    self.config.seccomp_mode, allow_network
+                ),
             );
         } else if !allow_degraded_security {
             return Err(NucleusError::SeccompError(
@@ -2238,15 +2246,7 @@ impl CreatedContainer {
             } else {
                 None
             };
-            Container::run_readiness_probe(
-                target_pid,
-                &config.name,
-                probe,
-                config.user_ns_config.is_some(),
-                config.use_gvisor,
-                &config.process_identity,
-                notify_socket.as_deref(),
-            )?;
+            Container::run_readiness_probe(&self.state, probe, notify_socket.as_deref())?;
         }
 
         // Start health check thread if configured
@@ -2254,22 +2254,10 @@ impl CreatedContainer {
         let health_handle = if let Some(ref hc) = config.health_check {
             if !hc.command.is_empty() {
                 let hc = hc.clone();
-                let pid = target_pid;
-                let container_name = config.name.clone();
-                let rootless = config.user_ns_config.is_some();
-                let using_gvisor = config.use_gvisor;
-                let process_identity = config.process_identity.clone();
+                let state = self.state.clone();
                 let cancel = cancel_flag.clone();
                 Some(std::thread::spawn(move || {
-                    Container::health_check_loop(
-                        pid,
-                        &container_name,
-                        rootless,
-                        using_gvisor,
-                        &hc,
-                        &process_identity,
-                        &cancel,
-                    );
+                    Container::health_check_loop(&state, &hc, &cancel);
                 }))
             } else {
                 None

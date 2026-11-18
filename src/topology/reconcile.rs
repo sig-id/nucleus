@@ -6,7 +6,7 @@
 //! 3. Starts new/changed containers in dependency order
 //! 4. Leaves unchanged containers running
 
-use crate::container::{ContainerLifecycle, ContainerStateManager, ProcessIdentity};
+use crate::container::{ContainerLifecycle, ContainerState, ContainerStateManager};
 use crate::error::{NucleusError, Result};
 use crate::isolation::{NamespaceCommandRunner, NamespaceProbe};
 use crate::topology::config::{
@@ -726,17 +726,7 @@ fn wait_for_healthy(
             )));
         }
 
-        if health_check_passes(
-            state.pid,
-            state.rootless,
-            state.using_gvisor,
-            &ProcessIdentity {
-                uid: state.process_uid,
-                gid: state.process_gid,
-                additional_gids: state.additional_gids.clone(),
-            },
-            health_cmd,
-        )? {
+        if health_check_passes(&state, health_cmd)? {
             info!("Service {} is healthy", container_name);
             return Ok(());
         }
@@ -783,25 +773,16 @@ fn validate_health_check_command(command: &str) -> Result<()> {
     Ok(())
 }
 
-fn health_check_passes(
-    pid: u32,
-    rootless: bool,
-    using_gvisor: bool,
-    process_identity: &ProcessIdentity,
-    command: &str,
-) -> Result<bool> {
+fn health_check_passes(state: &ContainerState, command: &str) -> Result<bool> {
     validate_health_check_command(command)?;
 
-    NamespaceCommandRunner::run(
-        pid,
-        rootless,
-        using_gvisor,
+    NamespaceCommandRunner::run_in_container(
+        state,
         NamespaceProbe::Exec(vec![
             "/bin/sh".to_string(),
             "-c".to_string(),
             command.to_string(),
         ]),
-        Some(process_identity),
         Some(Duration::from_secs(5)),
     )
 }

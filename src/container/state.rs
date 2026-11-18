@@ -77,6 +77,14 @@ pub struct ContainerState {
     /// cgroup path
     pub cgroup_path: Option<String>,
 
+    /// Workload process-count backstop, including launches without a delegated cgroup.
+    #[serde(default)]
+    pub pids_max: Option<u64>,
+
+    /// Absent in state written before native helper confinement was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_seccomp: Option<crate::security::NativeSeccomp>,
+
     /// Desired topology config hash associated with this container, if any.
     #[serde(default)]
     pub config_hash: Option<u64>,
@@ -178,6 +186,8 @@ impl ContainerState {
             using_gvisor: params.using_gvisor,
             rootless: params.rootless,
             cgroup_path: params.cgroup_path,
+            pids_max: None,
+            native_seccomp: None,
             config_hash: None,
             creator_uid: nix::unistd::Uid::effective().as_raw(),
             process_uid: params.process_uid,

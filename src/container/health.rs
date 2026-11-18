@@ -78,16 +78,14 @@ fn read_start_ticks(pid: u32) -> u64 {
 impl Container {
     /// Run a readiness probe and, if sd_notify is active, send READY=1.
     pub(super) fn run_readiness_probe(
-        pid: u32,
-        container_name: &str,
+        state: &crate::container::ContainerState,
         probe: &crate::container::ReadinessProbe,
-        rootless: bool,
-        using_gvisor: bool,
-        process_identity: &crate::container::ProcessIdentity,
         notify_socket: Option<&str>,
     ) -> Result<()> {
         use crate::container::ReadinessProbe;
 
+        let pid = state.pid;
+        let container_name = &state.name;
         info!("Running readiness probe for {}", container_name);
 
         let max_attempts = 60u32; // ~60s total with 1s sleep
@@ -108,20 +106,14 @@ impl Container {
             }
 
             let ready = match probe {
-                ReadinessProbe::Exec { command } => NamespaceCommandRunner::run(
-                    pid,
-                    rootless,
-                    using_gvisor,
+                ReadinessProbe::Exec { command } => NamespaceCommandRunner::run_in_container(
+                    state,
                     NamespaceProbe::Exec(command.clone()),
-                    Some(process_identity),
                     Some(std::time::Duration::from_secs(5)),
                 )?,
-                ReadinessProbe::TcpPort(port) => NamespaceCommandRunner::run(
-                    pid,
-                    rootless,
-                    using_gvisor,
+                ReadinessProbe::TcpPort(port) => NamespaceCommandRunner::run_in_container(
+                    state,
                     NamespaceProbe::TcpConnect(*port),
-                    None,
                     Some(std::time::Duration::from_secs(3)),
                 )?,
                 ReadinessProbe::SdNotify => {
@@ -289,14 +281,12 @@ impl Container {
 
     /// Run periodic health checks against the container via nsenter.
     pub(super) fn health_check_loop(
-        pid: u32,
-        container_name: &str,
-        rootless: bool,
-        using_gvisor: bool,
+        state: &crate::container::ContainerState,
         hc: &crate::container::HealthCheck,
-        process_identity: &crate::container::ProcessIdentity,
         cancel: &std::sync::atomic::AtomicBool,
     ) {
+        let pid = state.pid;
+        let container_name = &state.name;
         // BUG-18: Use cancellable sleep so we exit promptly on container stop.
         let cancellable_sleep = |dur: std::time::Duration| -> bool {
             let step = std::time::Duration::from_millis(100);
@@ -358,12 +348,9 @@ impl Container {
                 return;
             }
 
-            match NamespaceCommandRunner::run(
-                pid,
-                rootless,
-                using_gvisor,
+            match NamespaceCommandRunner::run_in_container(
+                state,
                 NamespaceProbe::Exec(hc.command.clone()),
-                Some(process_identity),
                 Some(hc.timeout),
             ) {
                 Ok(true) => {
