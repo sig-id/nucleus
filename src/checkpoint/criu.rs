@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -151,7 +152,14 @@ impl CriuRuntime {
         // State transition: None -> Dumping
         self.state = self.state.transition(CheckpointState::Dumping)?;
 
-        let images_dir = Self::prepare_checkpoint_dir(output_dir)?;
+        let directory = Self::prepare_checkpoint_dir(output_dir)?;
+        let output_dir = Self::pinned_path(&directory);
+        let images_dir = output_dir.join("images");
+        if fs::read_dir(&images_dir)?.next().is_some() {
+            return Err(NucleusError::CheckpointError(
+                "Checkpoint images directory must be empty".into(),
+            ));
+        }
 
         // A successful dump may terminate the original tree and trigger cgroup cleanup.
         let metadata = CheckpointMetadata::from_state(state)?;
@@ -162,7 +170,8 @@ impl CriuRuntime {
             .arg("--tree")
             .arg(state.pid.to_string())
             .arg("--images-dir")
-            .arg(&images_dir)
+            .arg(".")
+            .current_dir(&images_dir)
             .arg("--shell-job");
 
         if leave_running {
@@ -197,8 +206,8 @@ impl CriuRuntime {
         }
 
         // Publish metadata for this completed dump.
-        metadata.save(output_dir)?;
-        Self::write_checkpoint_hmac(output_dir)?;
+        metadata.save(&output_dir)?;
+        Self::write_checkpoint_hmac(&output_dir)?;
 
         // State transition: Dumping -> Dumped
         self.state = self.state.transition(CheckpointState::Dumped)?;
@@ -228,9 +237,14 @@ impl CriuRuntime {
             ));
         }
 
-        Self::verify_checkpoint_hmac(input_dir)?;
+        // Keep the same directory inode through authentication, parsing and CRIU startup,
+        // including when the caller can rename an ancestor of the supplied path.
+        let directory = Self::open_checkpoint_directory(input_dir)?;
+        directory.lock()?;
+        let input_dir = Self::pinned_path(&directory);
+        Self::verify_checkpoint_hmac(&input_dir)?;
         // Load and validate metadata
-        let metadata = CheckpointMetadata::load(input_dir)?;
+        let metadata = CheckpointMetadata::load(&input_dir)?;
         info!(
             "Restoring container {} from checkpoint (originally PID {})",
             metadata.container_id, metadata.original_pid
@@ -290,9 +304,12 @@ impl CriuRuntime {
         let output = cmd
             .arg("restore")
             .arg("--manage-cgroups=ignore")
+            .arg("--work-dir")
+            .arg(pid_dir.path())
             .arg("--restore-detached")
             .arg("--images-dir")
-            .arg(&images_dir)
+            .arg(".")
+            .current_dir(&images_dir)
             .arg("--shell-job")
             .arg("--pidfile")
             .arg(&pidfile_path)
@@ -369,11 +386,54 @@ impl CriuRuntime {
         trimmed.parse::<u32>().ok()
     }
 
-    fn prepare_checkpoint_dir(output_dir: &Path) -> Result<PathBuf> {
-        Self::ensure_secure_dir(output_dir, "checkpoint directory")?;
-        let images_dir = output_dir.join("images");
-        Self::ensure_secure_dir(&images_dir, "checkpoint images directory")?;
-        Ok(images_dir)
+    fn pinned_path(directory: &fs::File) -> PathBuf {
+        PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()))
+    }
+
+    fn check_checkpoint_owner(path: &Path, metadata: &fs::Metadata) -> Result<()> {
+        if metadata.uid() != Uid::effective().as_raw() || metadata.mode() & 0o022 != 0 {
+            return Err(NucleusError::CheckpointError(format!(
+                "Checkpoint entry {path:?} must be owned by the supervisor and writable only by its owner"
+            )));
+        }
+        Ok(())
+    }
+
+    fn open_checkpoint_directory(path: &Path) -> Result<fs::File> {
+        let directory = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(|e| {
+                NucleusError::CheckpointError(format!(
+                    "Checkpoint path {path:?} is inaccessible, a symlink or not a directory: {e}"
+                ))
+            })?;
+        Self::check_checkpoint_owner(path, &directory.metadata()?)?;
+        Ok(directory)
+    }
+
+    fn prepare_checkpoint_dir(output_dir: &Path) -> Result<fs::File> {
+        use std::os::unix::fs::DirBuilderExt;
+        match fs::DirBuilder::new()
+            .mode(0o700)
+            .recursive(true)
+            .create(output_dir)
+        {
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            result => result?,
+        }
+        let directory = Self::open_checkpoint_directory(output_dir)?;
+        directory.lock()?;
+        directory.set_permissions(fs::Permissions::from_mode(0o700))?;
+        let images = Self::pinned_path(&directory).join("images");
+        match fs::DirBuilder::new().mode(0o700).create(&images) {
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            result => result?,
+        }
+        Self::open_checkpoint_directory(&images)?
+            .set_permissions(fs::Permissions::from_mode(0o700))?;
+        Ok(directory)
     }
 
     fn write_checkpoint_hmac(dir: &Path) -> Result<()> {
@@ -437,6 +497,13 @@ impl CriuRuntime {
 
     fn verify_checkpoint_hmac(dir: &Path) -> Result<()> {
         let hmac_path = dir.join(CHECKPOINT_HMAC_FILE);
+        let signature = fs::symlink_metadata(&hmac_path)?;
+        Self::check_checkpoint_owner(&hmac_path, &signature)?;
+        if !signature.is_file() || signature.len() > 128 {
+            return Err(NucleusError::CheckpointError(
+                "Invalid checkpoint HMAC file".into(),
+            ));
+        }
         let expected = Self::read_file_nofollow_bytes(&hmac_path).map_err(|e| {
             NucleusError::CheckpointError(format!(
                 "Failed to read checkpoint HMAC {:?}: {}",
@@ -726,6 +793,8 @@ impl CriuRuntime {
                 )));
             }
 
+            Self::check_checkpoint_owner(&path, &metadata)?;
+
             let relative = relative.to_str().ok_or_else(|| {
                 NucleusError::CheckpointError(format!(
                     "Checkpoint path {:?} is not valid UTF-8",
@@ -773,36 +842,6 @@ impl CriuRuntime {
                 )));
             }
         }
-
-        Ok(())
-    }
-
-    fn ensure_secure_dir(path: &Path, label: &str) -> Result<()> {
-        Self::reject_symlink_path(path, label)?;
-
-        if path.exists() {
-            if !path.is_dir() {
-                return Err(NucleusError::CheckpointError(format!(
-                    "{} {:?} is not a directory",
-                    label, path
-                )));
-            }
-        } else {
-            fs::create_dir_all(path).map_err(|e| {
-                NucleusError::CheckpointError(format!(
-                    "Failed to create {} {:?}: {}",
-                    label, path, e
-                ))
-            })?;
-        }
-
-        Self::reject_symlink_path(path, label)?;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|e| {
-            NucleusError::CheckpointError(format!(
-                "Failed to set {} permissions {:?}: {}",
-                label, path, e
-            ))
-        })?;
 
         Ok(())
     }
@@ -1058,8 +1097,8 @@ echo "$!" > "$2"
     #[test]
     fn test_prepare_checkpoint_dir_creates_images_subdir() {
         let tmp = TempDir::new().unwrap();
-        let images = CriuRuntime::prepare_checkpoint_dir(tmp.path()).unwrap();
-        assert_eq!(images, tmp.path().join("images"));
+        let dir = CriuRuntime::prepare_checkpoint_dir(tmp.path()).unwrap();
+        let images = CriuRuntime::pinned_path(&dir).join("images");
         assert!(images.is_dir());
 
         // Verify permissions are 0o700
@@ -1200,6 +1239,38 @@ echo "$!" > "$2"
             & 0o777;
         assert_eq!(output_mode, 0o700);
         assert_eq!(images_mode, 0o700);
+    }
+
+    #[test]
+    fn checkpoint_directory_rejects_a_foreign_owner_even_at_mode_0700() {
+        use nix::unistd::{chown, Uid};
+        let tmp = TempDir::new().unwrap();
+        if Uid::effective().is_root() {
+            chown(tmp.path(), Some(Uid::from_raw(65534)), None).unwrap();
+            assert!(CriuRuntime::open_checkpoint_directory(tmp.path()).is_err());
+        } else {
+            // / is root-owned and not group/world-writable on the test host.
+            assert!(CriuRuntime::open_checkpoint_directory(std::path::Path::new("/")).is_err());
+        }
+    }
+
+    #[test]
+    fn checkpoint_handle_survives_rename_and_rejects_writable_entries() {
+        let tmp = TempDir::new().unwrap();
+        let original = tmp.path().join("checkpoint");
+        let pinned = CriuRuntime::prepare_checkpoint_dir(&original).unwrap();
+        let path = CriuRuntime::pinned_path(&pinned);
+        fs::rename(&original, tmp.path().join("old")).unwrap();
+        fs::create_dir(&original).unwrap();
+        fs::write(original.join("metadata.json"), "replacement").unwrap();
+        assert!(!path.join("metadata.json").exists());
+
+        let image = path.join("images/pages.img");
+        fs::write(&image, b"data").unwrap();
+        fs::set_permissions(&image, fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(CriuRuntime::compute_checkpoint_hmac(&path, b"key").is_err());
+        fs::set_permissions(&original, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(CriuRuntime::open_checkpoint_directory(&original).is_err());
     }
 
     #[test]

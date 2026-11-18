@@ -179,6 +179,7 @@ impl Container {
     pub(super) fn maybe_start_seccomp_trace_reader(
         config: &ContainerConfig,
         target_pid: u32,
+        cgroup_path: Option<&Path>,
     ) -> Result<Option<SeccompTraceReader>> {
         if config.seccomp_mode != crate::container::config::SeccompMode::Trace {
             return Ok(None);
@@ -191,7 +192,7 @@ impl Container {
         })?;
 
         let mut reader = SeccompTraceReader::new(target_pid, log_path);
-        reader.start_recording()?;
+        reader.start_scoped(cgroup_path.map(Path::to_owned))?;
         Ok(Some(reader))
     }
 

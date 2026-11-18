@@ -163,56 +163,27 @@ impl AuditEvent {
     }
 }
 
-/// Redact command-line arguments that may contain secrets.
-///
-/// Replaces values following flags whose names suggest sensitive content
-/// (e.g. `--password`, `--token`, `--secret`, `--key`, `--auth`) with
-/// `[REDACTED]`, and redacts arguments that look like inline `KEY=VALUE`
-/// assignments for those same patterns.
+/// Retain only the executable. Every argument, including positional values and
+/// shell programs, can contain credentials.
 pub fn redact_command(args: &[String]) -> Vec<String> {
-    const SENSITIVE: &[&str] = &[
-        "password",
-        "passwd",
-        "token",
-        "secret",
-        "key",
-        "auth",
-        "credential",
-        "api-key",
-        "apikey",
-        "api_key",
-        "access-token",
-        "private-key",
-    ];
-
-    fn is_sensitive_flag(s: &str) -> bool {
-        let lower = s.to_ascii_lowercase();
-        let name = lower.trim_start_matches('-');
-        SENSITIVE.iter().any(|pat| name.contains(pat))
+    let mut display: Vec<_> = args.first().cloned().into_iter().collect();
+    if args.len() > 1 {
+        display.push("[REDACTED]".into());
     }
+    display
+}
 
-    let mut out = Vec::with_capacity(args.len());
-    let mut redact_next = false;
-    for arg in args {
-        if redact_next {
-            out.push("[REDACTED]".to_string());
-            redact_next = false;
-            continue;
-        }
-        if is_sensitive_flag(arg) {
-            out.push(arg.clone());
-            redact_next = true;
-        } else if let Some((k, _)) = arg.split_once('=') {
-            if is_sensitive_flag(k) {
-                out.push(format!("{}=[REDACTED]", k));
-            } else {
-                out.push(arg.clone());
-            }
-        } else {
-            out.push(arg.clone());
-        }
-    }
-    out
+#[cfg(test)]
+#[test]
+fn command_redaction_covers_positional_values_and_inline_options() {
+    let args = [
+        "tool",
+        "username",
+        "positional-value",
+        "--auth=inline-value",
+    ]
+    .map(String::from);
+    assert_eq!(redact_command(&args), ["tool", "[REDACTED]"]);
 }
 
 /// Convenience function to emit an audit event.

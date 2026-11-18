@@ -13,18 +13,18 @@ use crate::topology::config::{
     parse_service_volume_mount, parse_volume_owner, ServiceDef, TopologyConfig, VolumeDef,
 };
 use crate::topology::dag::DependencyGraph;
-use nix::fcntl::{fcntl, FcntlArg, FdFlag};
 use std::collections::BTreeMap;
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Seek, Write};
+use std::io::Seek;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
-use tracing::{info, warn};
+use tracing::info;
 
 /// Reconciliation action for a single service.
 #[derive(Debug, Clone, PartialEq)]
@@ -56,51 +56,32 @@ enum PostStartWait {
 
 struct ServiceRunCommand {
     args: Vec<String>,
-    secrets_file: Option<File>,
+    inherited_files: Vec<File>,
 }
 
 impl ServiceRunCommand {
-    fn prepare_secret_fd_for_spawn(&self) -> Result<Option<FdCloexecGuard<'_>>> {
-        self.secrets_file
-            .as_ref()
-            .map(prepare_inherited_fd)
-            .transpose()
+    fn spawn(&self, executable: &Path) -> std::io::Result<std::process::Child> {
+        let mut cmd = Command::new(executable);
+        cmd.args(&self.args[1..]).stdin(Stdio::null());
+        // Change descriptor flags only in the fork child. Concurrent spawns
+        // in the supervisor must never inherit the service's private data.
+        let descriptors: Vec<_> = self
+            .inherited_files
+            .iter()
+            .map(AsRawFd::as_raw_fd)
+            .collect();
+        unsafe {
+            cmd.pre_exec(move || {
+                for &fd in &descriptors {
+                    if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
+        cmd.spawn()
     }
-}
-
-struct FdCloexecGuard<'a> {
-    file: &'a File,
-    original_flags: FdFlag,
-}
-
-impl Drop for FdCloexecGuard<'_> {
-    fn drop(&mut self) {
-        let _ = fcntl(self.file, FcntlArg::F_SETFD(self.original_flags));
-    }
-}
-
-fn prepare_inherited_fd(file: &File) -> Result<FdCloexecGuard<'_>> {
-    let flags = fcntl(file, FcntlArg::F_GETFD).map_err(|e| {
-        NucleusError::ExecError(format!(
-            "Failed to inspect inherited secrets fd {}: {}",
-            file.as_raw_fd(),
-            e
-        ))
-    })?;
-    let original_flags = FdFlag::from_bits_truncate(flags);
-    let inherited_flags = original_flags & !FdFlag::FD_CLOEXEC;
-    fcntl(file, FcntlArg::F_SETFD(inherited_flags)).map_err(|e| {
-        NucleusError::ExecError(format!(
-            "Failed to prepare inherited secrets fd {}: {}",
-            file.as_raw_fd(),
-            e
-        ))
-    })?;
-
-    Ok(FdCloexecGuard {
-        file,
-        original_flags,
-    })
 }
 
 fn path_component_cstring(component: &std::ffi::OsStr, path: &Path) -> Result<CString> {
@@ -216,6 +197,40 @@ fn fchown_persistent_volume(dir: &File, owner: &str, volume_name: &str, path: &P
     }
 }
 
+/// Resolve only live services with an explicit owner. Legacy states have no
+/// owner, so a conflicting live name requires an explicit stop by ID.
+pub fn running_topology_services(
+    config: &TopologyConfig,
+    manager: &ContainerStateManager,
+) -> Result<BTreeMap<String, ContainerState>> {
+    let mut running = BTreeMap::new();
+    let prefix = format!("{}-", config.name);
+    for state in manager.read_states(true)? {
+        let Some(service) = state.name.strip_prefix(&prefix) else {
+            continue;
+        };
+        if !state.check_running()? {
+            continue;
+        }
+        if state.topology_name.as_deref() != Some(&config.name) {
+            if config.services.contains_key(service) {
+                return Err(NucleusError::ConfigError(format!(
+                    "Container {} ({}) occupies a required name but has a different or unknown topology owner",
+                    state.id, state.name
+                )));
+            }
+            continue;
+        }
+        if running.insert(service.to_owned(), state).is_some() {
+            return Err(NucleusError::ConfigError(format!(
+                "Duplicate live service in topology {}",
+                config.name
+            )));
+        }
+    }
+    Ok(running)
+}
+
 /// Diff the desired topology against running containers.
 ///
 /// Returns a plan of actions to reconcile the two states.
@@ -224,22 +239,7 @@ pub fn plan_reconcile(
     state_mgr: &ContainerStateManager,
 ) -> Result<ReconcilePlan> {
     let graph = DependencyGraph::resolve(config)?;
-    let running_states = state_mgr.list_running().unwrap_or_default();
-
-    // Build a map of running containers by name prefix
-    let mut running_by_name: BTreeMap<String, Option<u64>> = BTreeMap::new();
-    for state in &running_states {
-        // Topology containers are named "topology-service" (e.g., "myapp-postgres")
-        if state.name.starts_with(&format!("{}-", config.name)) {
-            let service_name = state
-                .name
-                .strip_prefix(&format!("{}-", config.name))
-                .unwrap_or(&state.name)
-                .to_string();
-
-            running_by_name.insert(service_name, state.config_hash);
-        }
-    }
+    let running_by_name = running_topology_services(config, state_mgr)?;
 
     let mut actions = Vec::new();
 
@@ -247,8 +247,8 @@ pub fn plan_reconcile(
     for service_name in &graph.startup_order {
         let desired_hash = config.service_config_hash(service_name).unwrap_or(0);
 
-        if let Some(&running_hash) = running_by_name.get(service_name) {
-            if running_hash == Some(desired_hash) {
+        if let Some(running) = running_by_name.get(service_name) {
+            if running.config_hash == Some(desired_hash) {
                 actions.push((service_name.clone(), ReconcileAction::NoChange));
             } else {
                 actions.push((service_name.clone(), ReconcileAction::Restart));
@@ -282,52 +282,33 @@ pub fn execute_reconcile(
     stop_timeout: u64,
     state_root: Option<&std::path::Path>,
 ) -> Result<()> {
+    config.validate()?;
     let graph = DependencyGraph::resolve(config)?;
 
-    // Phase 1: Stop services that need stopping (in reverse dependency order)
-    let shutdown_order = graph.shutdown_order();
-    for service_name in &shutdown_order {
-        let action = plan.actions.iter().find(|(n, _)| n == service_name);
-        match action {
-            Some((_, ReconcileAction::Restart)) | Some((_, ReconcileAction::Stop)) => {
-                let container_name = format!("{}-{}", config.name, service_name);
-                info!("Stopping service: {}", container_name);
-                match state_mgr.resolve_container(&container_name) {
-                    Ok(state) => {
-                        if let Err(e) = ContainerLifecycle::stop(&state, stop_timeout) {
-                            warn!("Failed to stop {}: {} (continuing)", container_name, e);
-                        }
+    let running = running_topology_services(config, state_mgr)?;
+    let removed = plan
+        .actions
+        .iter()
+        .filter(|(_, action)| *action == ReconcileAction::Stop)
+        .map(|(name, _)| name.clone());
+    for name in graph.shutdown_order().into_iter().chain(removed) {
+        if plan.actions.iter().any(|(service, action)| {
+            service == &name && matches!(action, ReconcileAction::Restart | ReconcileAction::Stop)
+        }) {
+            if let Some(state) = running.get(&name) {
+                info!("Stopping service: {}", state.name);
+                ContainerLifecycle::stop(state, stop_timeout)?;
+                // stop() can return immediately after sending SIGKILL.
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while state.check_running()? {
+                    if Instant::now() >= deadline {
+                        return Err(NucleusError::ExecError(format!(
+                            "Service {} is still running after stop",
+                            state.name
+                        )));
                     }
-                    Err(_) => {
-                        // Container not found – already stopped
-                    }
+                    std::thread::sleep(Duration::from_millis(100));
                 }
-            }
-            _ => {}
-        }
-    }
-
-    // Phase 1b: Stop removed services that are NOT in shutdown_order.
-    // shutdown_order only contains services from the desired topology, so
-    // services that were removed from config won't appear there at all.
-    for (service_name, action) in &plan.actions {
-        if *action != ReconcileAction::Stop {
-            continue;
-        }
-        // Already handled above if it happened to be in shutdown_order
-        if shutdown_order.contains(service_name) {
-            continue;
-        }
-        let container_name = format!("{}-{}", config.name, service_name);
-        info!("Stopping removed service: {}", container_name);
-        match state_mgr.resolve_container(&container_name) {
-            Ok(state) => {
-                if let Err(e) = ContainerLifecycle::stop(&state, stop_timeout) {
-                    warn!("Failed to stop {}: {} (continuing)", container_name, e);
-                }
-            }
-            Err(_) => {
-                // Container not found – already stopped
             }
         }
     }
@@ -374,16 +355,7 @@ pub fn execute_reconcile(
                     ))
                 })?;
 
-                let spawn_result = {
-                    let _secrets_fd_guard = run_command.prepare_secret_fd_for_spawn()?;
-                    Command::new(&nucleus_bin)
-                        .args(&run_command.args[1..]) // skip "nucleus" since we're using current_exe
-                        .stdin(Stdio::null())
-                        .stdout(Stdio::inherit())
-                        .stderr(Stdio::inherit())
-                        .spawn()
-                };
-                match spawn_result {
+                match run_command.spawn(&nucleus_bin) {
                     Ok(child) => {
                         info!("Started service {} (PID {})", container_name, child.id());
                     }
@@ -395,9 +367,9 @@ pub fn execute_reconcile(
                     }
                 }
                 drop(run_command);
-                wait_for_started(state_mgr, &container_name, Duration::from_secs(10))?;
+                wait_for_started(state_mgr, config, service_name, Duration::from_secs(10))?;
                 if post_start_wait(&graph, service_name) == PostStartWait::Healthy {
-                    wait_for_healthy(state_mgr, &container_name, service_name, svc)?;
+                    wait_for_healthy(state_mgr, config, service_name, svc)?;
                 }
             }
             _ => {
@@ -451,7 +423,7 @@ fn build_service_run_command(
     state_root: Option<&std::path::Path>,
 ) -> Result<ServiceRunCommand> {
     let mut args = vec!["nucleus".to_string()];
-    let mut secrets_file = None;
+    let mut inherited_files = Vec::new();
 
     // Propagate --root so the child uses the same state directory
     if let Some(root) = state_root {
@@ -464,6 +436,9 @@ fn build_service_run_command(
         "--service-mode".to_string(),
         "production".to_string(),
         "--quiet-id".to_string(),
+        "--verify-rootfs-attestation".to_string(),
+        "--topology-name".to_string(),
+        config.name.clone(),
         "--topology-config-hash".to_string(),
         desired_hash.to_string(),
         "--name".to_string(),
@@ -580,15 +555,14 @@ fn build_service_run_command(
     }
 
     if !svc.secrets.is_empty() {
-        let file = write_secrets_fd(container_name, &svc.secrets)?;
-        args.push("--secrets-fd".to_string());
-        args.push(file.as_raw_fd().to_string());
-        secrets_file = Some(file);
+        let file = write_json_fd(&svc.secrets)?;
+        args.extend(["--secrets-fd".into(), file.as_raw_fd().to_string()]);
+        inherited_files.push(file);
     }
-
-    for (key, value) in &svc.environment {
-        args.push("-e".to_string());
-        args.push(format!("{}={}", key, value));
+    if !svc.environment.is_empty() {
+        let file = write_json_fd(&svc.environment)?;
+        args.extend(["--env-fd".into(), file.as_raw_fd().to_string()]);
+        inherited_files.push(file);
     }
 
     if let Some(user) = &svc.user {
@@ -613,57 +587,24 @@ fn build_service_run_command(
         args.push(svc.health_interval.to_string());
     }
 
-    if svc.runtime == "gvisor" {
-        args.push("--runtime".to_string());
-        args.push("gvisor".to_string());
+    args.extend(["--runtime".into(), svc.runtime.clone()]);
+    if svc.runtime == "native" {
+        args.extend(["--trust-level".into(), "trusted".into()]);
     }
 
     args.push("--sd-notify".to_string());
     args.push("--".to_string());
     args.extend(svc.command.clone());
-    Ok(ServiceRunCommand { args, secrets_file })
+    Ok(ServiceRunCommand {
+        args,
+        inherited_files,
+    })
 }
 
-fn write_secrets_fd(container_name: &str, secrets: &[String]) -> Result<File> {
-    let mut file = tempfile::tempfile().map_err(|e| {
-        NucleusError::ConfigError(format!(
-            "Failed to create anonymous secrets file for {}: {}",
-            container_name, e
-        ))
-    })?;
-    file.set_permissions(std::fs::Permissions::from_mode(0o600))
-        .map_err(|e| {
-            NucleusError::ConfigError(format!(
-                "Failed to secure anonymous secrets file for {}: {}",
-                container_name, e
-            ))
-        })?;
-
-    serde_json::to_writer(&mut file, secrets).map_err(|e| {
-        NucleusError::ConfigError(format!(
-            "Failed to write anonymous secrets file for {}: {}",
-            container_name, e
-        ))
-    })?;
-    file.write_all(b"\n").map_err(|e| {
-        NucleusError::ConfigError(format!(
-            "Failed to terminate anonymous secrets file for {}: {}",
-            container_name, e
-        ))
-    })?;
-    file.flush().map_err(|e| {
-        NucleusError::ConfigError(format!(
-            "Failed to flush anonymous secrets file for {}: {}",
-            container_name, e
-        ))
-    })?;
-    file.rewind().map_err(|e| {
-        NucleusError::ConfigError(format!(
-            "Failed to rewind anonymous secrets file for {}: {}",
-            container_name, e
-        ))
-    })?;
-
+fn write_json_fd(value: &impl serde::Serialize) -> Result<File> {
+    let mut file = tempfile::tempfile()?;
+    serde_json::to_writer(&mut file, value)?;
+    file.rewind()?;
     Ok(file)
 }
 
@@ -683,35 +624,27 @@ fn post_start_wait(graph: &DependencyGraph, service_name: &str) -> PostStartWait
 
 fn wait_for_started(
     state_mgr: &ContainerStateManager,
-    container_name: &str,
+    config: &TopologyConfig,
+    service_name: &str,
     timeout: Duration,
 ) -> Result<u32> {
     let start = Instant::now();
     loop {
-        match state_mgr.resolve_container(container_name) {
-            Ok(state) if state.is_running() => return Ok(state.pid),
-            Ok(_) | Err(_) if start.elapsed() < timeout => {
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            Ok(_) => {
-                return Err(NucleusError::ExecError(format!(
-                    "Service {} did not enter running state within {:?}",
-                    container_name, timeout
-                )));
-            }
-            Err(e) => {
-                return Err(NucleusError::ExecError(format!(
-                    "Service {} failed to register state within {:?}: {}",
-                    container_name, timeout, e
-                )));
-            }
+        if let Some(state) = running_topology_services(config, state_mgr)?.get(service_name) {
+            return Ok(state.pid);
         }
+        if start.elapsed() >= timeout {
+            return Err(NucleusError::ExecError(format!(
+                "Service {service_name} did not start within {timeout:?}"
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
 fn wait_for_healthy(
     state_mgr: &ContainerStateManager,
-    container_name: &str,
+    config: &TopologyConfig,
     service_name: &str,
     svc: &ServiceDef,
 ) -> Result<()> {
@@ -729,23 +662,22 @@ fn wait_for_healthy(
     let start = Instant::now();
 
     loop {
-        let state = state_mgr.resolve_container(container_name)?;
-        if !state.is_running() {
+        let Some(state) = running_topology_services(config, state_mgr)?.remove(service_name) else {
             return Err(NucleusError::ExecError(format!(
                 "Service {} exited before becoming healthy",
-                container_name
+                service_name
             )));
-        }
+        };
 
         if health_check_passes(&state, health_cmd)? {
-            info!("Service {} is healthy", container_name);
+            info!("Service {} is healthy", service_name);
             return Ok(());
         }
 
         if start.elapsed() >= timeout {
             return Err(NucleusError::ExecError(format!(
                 "Service {} did not become healthy within {:?}",
-                container_name, timeout
+                service_name, timeout
             )));
         }
 
@@ -866,6 +798,7 @@ memory = "256M"
             process_gid: 0,
             additional_gids: Vec::new(),
         });
+        state.topology_name = Some(config.name.clone());
         state.config_hash = config.service_config_hash("web");
         state_mgr.save_state(&state).unwrap();
 
@@ -874,6 +807,24 @@ memory = "256M"
             plan.actions,
             vec![("web".to_string(), ReconcileAction::NoChange)]
         );
+
+        state.topology_name = None;
+        state_mgr.save_state(&state).unwrap();
+        assert!(plan_reconcile(&config, &state_mgr)
+            .unwrap_err()
+            .to_string()
+            .contains("unknown topology owner"));
+
+        state.name = "test-db-postgres".into();
+        state.topology_name = Some("test-db".into());
+        state_mgr.save_state(&state).unwrap();
+        assert_eq!(
+            plan_reconcile(&config, &state_mgr).unwrap().actions,
+            vec![("web".into(), ReconcileAction::Start)]
+        );
+
+        fs::write(temp.path().join("nucleus/unreadable.json"), b"{").unwrap();
+        assert!(plan_reconcile(&config, &state_mgr).is_err());
     }
 
     #[test]
@@ -1005,7 +956,7 @@ secrets = ["{}"]
         let run_command =
             build_service_run_command(&config, "web", svc, "test-web", 42, None).unwrap();
 
-        assert!(run_command.secrets_file.is_some());
+        assert_eq!(run_command.inherited_files.len(), 1);
         assert!(!run_command.args.iter().any(|arg| arg == "--secret"));
         assert!(!run_command.args.iter().any(|arg| arg == &secret_spec));
         assert!(!run_command
@@ -1015,14 +966,47 @@ secrets = ["{}"]
                 || arg.contains("/run/secrets/cloud_api_key")));
         assert!(run_command.args.windows(2).any(|pair| {
             pair[0] == "--secrets-fd"
-                && pair[1]
-                    == run_command
-                        .secrets_file
-                        .as_ref()
-                        .unwrap()
-                        .as_raw_fd()
-                        .to_string()
+                && pair[1] == run_command.inherited_files[0].as_raw_fd().to_string()
         }));
+    }
+
+    #[test]
+    fn service_environment_round_trips_through_the_spawned_child_fd() {
+        let config = TopologyConfig::from_toml(
+            r#"
+name = "stack"
+[services.job]
+rootfs = "/nix/store/job"
+command = ["true"]
+memory = "256M"
+environment = { PRIVATE = "several words" }
+"#,
+        )
+        .unwrap();
+        let mut command = build_service_run_command(
+            &config,
+            "job",
+            &config.services["job"],
+            "stack-job",
+            1,
+            None,
+        )
+        .unwrap();
+        assert!(!command.args.iter().any(|arg| arg.contains("several words")));
+        let fd = command
+            .args
+            .windows(2)
+            .find(|pair| pair[0] == "--env-fd")
+            .unwrap()[1]
+            .clone();
+        command.args = vec!["sh".into(), "-c".into(),
+            format!("IFS= read -r payload < /proc/self/fd/{fd}; test \"$payload\" = '{{\"PRIVATE\":\"several words\"}}'")];
+        assert!(command
+            .spawn(Path::new("/bin/sh"))
+            .unwrap()
+            .wait()
+            .unwrap()
+            .success());
     }
 
     #[test]
@@ -1219,7 +1203,7 @@ memory = "256M"
         let state_mgr = ContainerStateManager::with_state_dir(temp.path().join("nucleus")).unwrap();
 
         // Simulate a previously-running service "db" that is no longer in config
-        let state = ContainerState::new(ContainerStateParams {
+        let mut state = ContainerState::new(ContainerStateParams {
             id: "old-db-id".to_string(),
             name: "test-db".to_string(),
             pid: std::process::id(), // use our own PID so is_running() returns true
@@ -1233,6 +1217,7 @@ memory = "256M"
             process_gid: 0,
             additional_gids: Vec::new(),
         });
+        state.topology_name = Some(config.name.clone());
         state_mgr.save_state(&state).unwrap();
 
         let plan = plan_reconcile(&config, &state_mgr).unwrap();

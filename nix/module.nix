@@ -1,4 +1,4 @@
-{ config, lib, pkgs, ... }:
+{ config, lib, pkgs, utils, ... }:
 
 let
   cfg = config.services.nucleus;
@@ -6,9 +6,48 @@ let
   inherit (lib) mkEnableOption mkOption types mkIf mapAttrs' nameValuePair
     concatStringsSep optional optionalString;
 
-  containerOpts = { name, ... }: {
+  runtimePath = types.addCheck types.str (s:
+    lib.hasPrefix "/" s && !builtins.hasContext s && !lib.hasPrefix "/nix/store/" s);
+  privilegedSupervisor = mkEnableOption "a capability-bounded root supervisor for host setup";
+
+  supervisorConfig = unit: privileged: allowNet: timeNamespace: {
+    User = if privileged then "root" else "nx-${builtins.substring 0 16 (builtins.hashString "sha256" unit)}";
+    DynamicUser = !privileged;
+    CapabilityBoundingSet = if !privileged then "" else
+      "CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_FOWNER CAP_FSETID CAP_KILL CAP_MKNOD CAP_SETFCAP CAP_SETGID CAP_SETPCAP CAP_SETUID CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SYS_PTRACE CAP_SYS_RESOURCE CAP_SYSLOG"
+      + optionalString allowNet " CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW";
+    SystemCallFilter = "~@module @raw-io @reboot @swap";
+    RestrictNamespaces = "cgroup ipc mnt net pid user uts" + optionalString timeNamespace " time";
+    NoNewPrivileges = true;
+    ProtectSystem = "strict";
+    ProtectHome = true;
+    PrivateTmp = true;
+    UMask = "0077";
+    RuntimeDirectory = unit;
+    RuntimeDirectoryMode = "0700";
+    Environment = [
+      "XDG_RUNTIME_DIR=/run/${unit}"
+      "NUCLEUS_STATE_DIR=/run/${unit}/state"
+      "NUCLEUS_CGROUP_ROOT=/sys/fs/cgroup/system.slice/%n"
+    ];
+    Slice = "system.slice";
+    Delegate = "cpu io memory pids";
+    DelegateSubgroup = "supervisor";
+    ExecStartPre = pkgs.writeShellScript "nucleus-delegate-controllers" ''
+      read -r controllers < "$NUCLEUS_CGROUP_ROOT/cgroup.controllers"
+      for controller in $controllers; do
+        case "$controller" in
+          cpu|io|memory|pids) echo "+$controller" > "$NUCLEUS_CGROUP_ROOT/cgroup.subtree_control" || exit 1 ;;
+        esac
+      done
+    '';
+  };
+
+  containerOpts = { config, ... }: {
     options = {
       enable = mkEnableOption "this Nucleus container";
+
+      inherit privilegedSupervisor;
 
       command = mkOption {
         type = types.listOf types.str;
@@ -68,8 +107,8 @@ let
       };
 
       cpus = mkOption {
-        type = types.nullOr types.float;
-        default = null;
+        type = types.float;
+        default = 1.0;
         description = "CPU core limit.";
       };
 
@@ -81,7 +120,7 @@ let
 
       network = mkOption {
         type = types.enum [ "none" "bridge" ];
-        default = "bridge";
+        default = "none";
         description = "Network mode. Production mode forbids 'host'.";
       };
 
@@ -163,13 +202,13 @@ let
 
       trustLevel = mkOption {
         type = types.enum [ "trusted" "untrusted" ];
-        default = "trusted";
+        default = "untrusted";
         description = "Workload trust level. 'untrusted' requires gVisor.";
       };
 
       runtime = mkOption {
         type = types.enum [ "native" "gvisor" ];
-        default = "native";
+        default = "gvisor";
         description = "Container runtime.";
       };
 
@@ -199,7 +238,7 @@ let
 
       seccompLogDenied = mkOption {
         type = types.bool;
-        default = true;
+        default = config.runtime == "native" && config.privilegedSupervisor;
         description = "Request kernel logging for denied seccomp decisions when supported.";
       };
 
@@ -244,8 +283,8 @@ let
         type = types.listOf (types.submodule {
           options = {
             source = mkOption {
-              type = types.path;
-              description = "Source path (host or Nix store) for the secret.";
+              type = runtimePath;
+              description = "Absolute runtime secret path, supplied as a quoted string.";
             };
             dest = mkOption {
               type = types.str;
@@ -265,7 +304,7 @@ let
               description = "Systemd credential name exposed to the unit.";
             };
             source = mkOption {
-              type = types.either types.path types.str;
+              type = runtimePath;
               description = "Credential source passed to LoadCredential or LoadCredentialEncrypted.";
             };
             dest = mkOption {
@@ -331,10 +370,10 @@ let
         description = "Host bind volumes to mount into the container.";
       };
 
-      environment = mkOption {
-        type = types.attrsOf types.str;
-        default = { };
-        description = "Environment variables to set in the container.";
+      environmentFile = mkOption {
+        type = types.nullOr runtimePath;
+        default = null;
+        description = "Absolute runtime path to a private JSON object of environment variables, opened by systemd.";
       };
 
       readinessExec = mkOption {
@@ -419,17 +458,12 @@ let
         description = "Expected SHA-256 hash of the Landlock policy file.";
       };
 
-      extraArgs = mkOption {
-        type = types.listOf types.str;
-        default = [ ];
-        description = "Extra arguments to pass to the nucleus run command.";
-      };
     };
   };
 
   mkContainerService = name: containerCfg:
     let
-      e = lib.escapeShellArg;
+      e = utils.escapeSystemdExecArg;
       writableVolumeSources = lib.unique (map (v: v.source) (lib.filter (v: !v.readOnly) containerCfg.volumes));
       loadCredentialEntries =
         map (c: "${c.name}:${toString c.source}") (lib.filter (c: !c.encrypted) containerCfg.credentials);
@@ -462,8 +496,8 @@ let
         ++ lib.optionals (containerCfg.user != null) [ "--user" (e containerCfg.user) ]
         ++ lib.optionals (containerCfg.group != null) [ "--group" (e containerCfg.group) ]
         ++ (lib.concatMap (g: [ "--additional-group" (e g) ]) containerCfg.supplementaryGroups)
-        ++ lib.optionals (containerCfg.cpus != null) [ "--cpus" (e (toString containerCfg.cpus)) ]
-        ++ optional (containerCfg.runtime == "gvisor") "--runtime gvisor"
+        ++ [ "--cpus" (e containerCfg.cpus) ]
+        ++ [ "--runtime" (e containerCfg.runtime) ]
         ++ optional (containerCfg.runtime == "gvisor") "--gvisor-platform"
         ++ optional (containerCfg.runtime == "gvisor") (e containerCfg.gvisorPlatform)
         ++ optional containerCfg.sdNotify "--sd-notify"
@@ -489,7 +523,7 @@ let
         ++ (lib.concatMap (s: [ "--secret" (e "${toString s.source}:${s.dest}") ]) containerCfg.secrets)
         ++ (lib.concatMap (c: [ "--systemd-credential" (e "${c.name}:${c.dest}") ]) containerCfg.credentials)
         ++ (lib.concatMap (v: [ "--volume" (e "${v.source}:${v.dest}:${if v.readOnly then "ro" else "rw"}") ]) containerCfg.volumes)
-        ++ (lib.concatLists (lib.mapAttrsToList (k: v: [ "-e" (e "${k}=${v}") ]) containerCfg.environment))
+        ++ lib.optionals (containerCfg.environmentFile != null) [ "--env-fd" "3" ]
         ++ lib.optionals (containerCfg.readinessExec != null) [ "--readiness-exec" (e containerCfg.readinessExec) ]
         ++ lib.optionals (containerCfg.readinessTcp != null) [ "--readiness-tcp" (e (toString containerCfg.readinessTcp)) ]
         ++ optional containerCfg.readinessSdNotify "--readiness-sd-notify"
@@ -518,9 +552,8 @@ let
         ++ lib.optionals (containerCfg.landlockPolicySha256 != null) [
           "--landlock-policy-sha256" (e containerCfg.landlockPolicySha256)
         ]
-        ++ containerCfg.extraArgs
       );
-      commandStr = lib.concatStringsSep " " (map lib.escapeShellArg effectiveCommand);
+      commandStr = utils.escapeSystemdExecArgs effectiveCommand;
     in
     assert lib.assertMsg (containerCfg.rootfs != null || containerCfg.image != null)
       "services.nucleus.containers.${name}: set either rootfs or image";
@@ -530,6 +563,8 @@ let
       "services.nucleus.containers.${name}: command is required when image manifest command is empty";
     assert lib.assertMsg (imageManifest == null || imageManifest.diff == null)
       "services.nucleus.containers.${name}: image diffs are not yet supported by the NixOS production launcher";
+    assert lib.assertMsg (containerCfg.runtime != "native" || containerCfg.trustLevel == "trusted")
+      "Native Nucleus services require an explicit trusted workload";
     nameValuePair "nucleus-${name}" {
       description = "Nucleus container: ${name}";
       after = [ "network-online.target" ];
@@ -539,7 +574,7 @@ let
       path = lib.optionals (containerCfg.runtime == "gvisor") [ gvisor ]
         ++ lib.optionals (containerCfg.network == "bridge") [ pkgs.nftables pkgs.iptables pkgs.slirp4netns ];
 
-      serviceConfig = {
+      serviceConfig = supervisorConfig "nucleus-${name}" containerCfg.privilegedSupervisor (containerCfg.network == "bridge") containerCfg.timeNamespace // {
         Type = if containerCfg.sdNotify then "notify" else "simple";
         ExecStart = "${cfg.package}/bin/nucleus run ${nucleusArgs} -- ${commandStr}";
         Restart = "on-failure";
@@ -551,19 +586,10 @@ let
         StandardError = "journal";
         SyslogIdentifier = "nucleus-${name}";
 
-        # Cgroup delegation: nucleus creates child cgroups for resource limits.
-        # Without Delegate=yes, systemd owns the cgroup tree and the runtime's
-        # cgroup operations conflict with systemd's controller model.
-        # See https://systemd.io/CONTROL_GROUP_INTERFACE/
-        Delegate = true;
-
-        # Hardening at the systemd level (defense-in-depth)
-        ProtectSystem = "strict";
-        ProtectHome = true;
-        NoNewPrivileges = false; # nucleus needs to set up namespaces
         LimitNOFILE = 65536;
-      } // lib.optionalAttrs (writableVolumeSources != [ ]) {
-        ReadWritePaths = writableVolumeSources;
+        ReadWritePaths = writableVolumeSources ++ lib.optional containerCfg.privilegedSupervisor "/run/nucleus";
+      } // lib.optionalAttrs (containerCfg.environmentFile != null) {
+        OpenFile = "${lib.replaceStrings [ "%" ":" ] [ "%%" "\\x3a" ] containerCfg.environmentFile}:environment:read-only";
       } // lib.optionalAttrs (loadCredentialEntries != [ ]) {
         LoadCredential = loadCredentialEntries;
       } // lib.optionalAttrs (loadCredentialEncryptedEntries != [ ]) {
@@ -580,15 +606,15 @@ let
 
       path = [ pkgs.nftables pkgs.iptables pkgs.slirp4netns ] ++ lib.optionals (pkgs ? gvisor) [ gvisor ];
 
-      serviceConfig = {
+      serviceConfig = supervisorConfig "nucleus-topology-${name}" topoCfg.privilegedSupervisor true false // {
         Type = "oneshot";
         RemainAfterExit = true;
-        ExecStart = "${cfg.package}/bin/nucleus compose up ${lib.escapeShellArg (toString topoCfg.configFile)}";
-        ExecStop = "${cfg.package}/bin/nucleus compose down ${lib.escapeShellArg (toString topoCfg.configFile)}";
+        ExecStart = "${cfg.package}/bin/nucleus compose up ${utils.escapeSystemdExecArg (toString topoCfg.configFile)}";
+        ExecStop = "${cfg.package}/bin/nucleus compose down ${utils.escapeSystemdExecArg (toString topoCfg.configFile)}";
         StandardOutput = "journal";
         StandardError = "journal";
         SyslogIdentifier = "nucleus-topology-${name}";
-        Delegate = true;
+        ReadWritePaths = topoCfg.writablePaths ++ lib.optional topoCfg.privilegedSupervisor "/run/nucleus";
       };
     };
 
@@ -613,9 +639,17 @@ in
         options = {
           enable = mkEnableOption "this Nucleus topology";
 
+          inherit privilegedSupervisor;
+
+          writablePaths = mkOption {
+            type = types.listOf types.str;
+            default = [ ];
+            description = "Host volume directories the topology may write under ProtectSystem=strict.";
+          };
+
           configFile = mkOption {
             type = types.path;
-            description = "Path to the topology TOML file (nucleus compose format).";
+            description = "Path to the topology TOML file. Use a quoted runtime path for files containing sensitive environment values.";
           };
         };
       });
@@ -628,7 +662,10 @@ in
   };
 
   config = mkIf cfg.enable {
-    systemd.tmpfiles.rules = lib.concatMap
+    systemd.tmpfiles.rules = lib.optional
+      (lib.any (service: service.enable && service.privilegedSupervisor)
+        (lib.attrValues cfg.containers ++ lib.attrValues cfg.topologies))
+      "d /run/nucleus 0711 root root -" ++ lib.concatMap
       (containerCfg:
         map
           (v:

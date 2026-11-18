@@ -809,6 +809,9 @@ pub struct ContainerConfig {
     /// Desired topology config hash for reconciliation change detection.
     pub config_hash: Option<u64>,
 
+    /// Owning topology, recorded by compose at launch.
+    pub topology_name: Option<String>,
+
     /// Enable sd_notify integration (pass NOTIFY_SOCKET into container).
     pub sd_notify: bool,
 
@@ -978,6 +981,7 @@ impl ContainerConfig {
             derived_environment: Vec::new(),
             process_identity: ProcessIdentity::default(),
             config_hash: None,
+            topology_name: None,
             sd_notify: false,
             required_kernel_lockdown: None,
             verify_context_integrity: false,

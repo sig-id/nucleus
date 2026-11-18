@@ -21,7 +21,9 @@ use crate::security::{
     NativeSeccomp, OciContainerState, OciHooks, SeccompDenyLogger, SeccompTraceReader,
     SecurityState,
 };
-use crate::telemetry::{CleanupEvent, ContainerControlEvent, EventSink, ExitStatusEvent};
+use crate::telemetry::{
+    CleanupEvent, ContainerControlEvent, EventSink, ExitStatusEvent, NativeSecurityOutcome,
+};
 use caps::{CapSet, Capability, CapsHashSet};
 use nix::sys::signal::{kill, Signal};
 use nix::sys::signal::{pthread_sigmask, SigSet, SigmaskHow};
@@ -72,6 +74,7 @@ pub struct CreatedContainer {
     pub(super) trace_reader: Option<SeccompTraceReader>,
     pub(super) deny_logger: Option<SeccompDenyLogger>,
     pub(super) exec_fifo_path: Option<PathBuf>,
+    outcome_reader: Option<OwnedFd>,
     mapped_gvisor_base: Option<PathBuf>,
     _landlock_handoff: Option<crate::security::landlock_handoff::LandlockHandoff>,
     pub(super) native_console_master: Option<OwnedFd>,
@@ -980,6 +983,9 @@ impl Container {
         Self::prepare_workspace_staging(&mut config, runtime_base_override.as_deref(), is_root)?;
 
         let event_sink = self.event_sink.clone();
+        let outcome_pipe = (event_sink.is_some() && !config.use_gvisor)
+            .then(pipe)
+            .transpose()?;
         let mut native_pty = if config.terminal && !config.use_gvisor {
             Some(NativePty::open(config.console_size)?)
         } else {
@@ -1141,6 +1147,7 @@ impl Container {
                     state.environment = config.environment.iter().cloned().collect();
                     state.workdir = config.workdir.display().to_string();
                     state.config_hash = config.config_hash;
+                    state.topology_name = config.topology_name.clone();
                     state.bundle_path =
                         config.rootfs_path.as_ref().map(|p| p.display().to_string());
                     state.rootfs_path =
@@ -1152,7 +1159,6 @@ impl Container {
                     }
 
                     let mut network_driver: Option<BridgeDriver> = None;
-                    let trace_reader = Self::maybe_start_seccomp_trace_reader(&config, target_pid)?;
 
                     // Transition: Creating -> Created
                     state.status = OciStatus::Created;
@@ -1174,6 +1180,11 @@ impl Container {
                         cgroup.attach_process(target_pid)?;
                     }
 
+                    let trace_reader = Self::maybe_start_seccomp_trace_reader(
+                        &config,
+                        target_pid,
+                        cgroup_opt.as_ref().map(|cgroup| cgroup.path()),
+                    )?;
                     let deny_logger = Self::maybe_start_seccomp_deny_logger(
                         &config,
                         target_pid,
@@ -1220,6 +1231,7 @@ impl Container {
                     let mapped_gvisor_base =
                         runtime_base_override.filter(|_| is_root && gvisor_needs_precreated_userns);
                     Ok(CreatedContainer {
+                        outcome_reader: outcome_pipe.map(|(reader, _)| reader),
                         _landlock_handoff: landlock_handoff,
                         mapped_gvisor_base,
                         config,
@@ -1272,6 +1284,7 @@ impl Container {
                     native_seccomp.as_ref(),
                     native_landlock.as_ref(),
                     landlock_channel.map(|(_, child_end)| child_end),
+                    outcome_pipe.map(|(_, writer)| writer),
                     Some(ready_write),
                     userns_request_write,
                     userns_ack_read,
@@ -1331,6 +1344,7 @@ impl Container {
         native_seccomp: Option<&NativeSeccomp>,
         native_landlock: Option<&NativeLandlock>,
         landlock_channel: Option<std::os::unix::net::UnixStream>,
+        outcome_writer: Option<OwnedFd>,
         ready_pipe: Option<OwnedFd>,
         userns_request_pipe: Option<OwnedFd>,
         userns_ack_pipe: Option<OwnedFd>,
@@ -1498,6 +1512,7 @@ impl Container {
                     if let Some(fd) = ready_pipe {
                         Self::notify_namespace_ready(&fd, child.as_raw() as u32)?;
                     }
+                    drop(outcome_writer);
                     std::process::exit(Self::wait_for_pid_namespace_child(child));
                 }
                 ForkResult::Child => {
@@ -1908,7 +1923,7 @@ impl Container {
         let channel = landlock_channel.ok_or_else(|| {
             NucleusError::LandlockError("Missing Landlock handoff channel".into())
         })?;
-        let landlock_applied = native_landlock
+        let landlock_status = native_landlock
             .ok_or_else(|| NucleusError::LandlockError("Missing launch Landlock policy".into()))?
             .apply(allow_degraded_security, &channel, &self.config)?;
         // The PID-namespace intermediary may still have a dup of this socket.
@@ -1970,7 +1985,7 @@ impl Container {
             warn!("Seccomp not enforced; container is running with degraded hardening");
         }
 
-        if seccomp_applied && landlock_applied {
+        if seccomp_applied && landlock_status == landlock::RulesetStatus::FullyEnforced {
             sec_state = sec_state.transition(SecurityState::LandlockApplied)?;
             if self.config.seccomp_mode == SeccompMode::Trace {
                 warn!("Security state NOT locked: seccomp in trace mode (allow-all)");
@@ -1995,6 +2010,25 @@ impl Container {
             warn!("Security state not locked; one or more hardening controls are inactive");
         }
         debug!("Security state: {:?}", sec_state);
+
+        if let Some(writer) = outcome_writer {
+            let outcome = NativeSecurityOutcome {
+                landlock: match landlock_status {
+                    landlock::RulesetStatus::FullyEnforced => "fully_enforced",
+                    landlock::RulesetStatus::PartiallyEnforced => "partially_enforced",
+                    landlock::RulesetStatus::NotEnforced => "not_enforced",
+                }
+                .into(),
+                capabilities: if workload_caps.is_some() {
+                    "policy_applied"
+                } else {
+                    "drop_all"
+                }
+                .into(),
+                seccomp_applied,
+            };
+            serde_json::to_writer(std::fs::File::from(writer), &outcome)?;
+        }
 
         // 14c. Block on exec FIFO until start() opens it for reading.
         // This implements the OCI two-phase create/start: all container setup
@@ -2418,7 +2452,12 @@ impl Container {
 }
 
 impl CreatedContainer {
-    fn emit_control_event(&self, event: ContainerControlEvent) {
+    fn emit_control_event(
+        &self,
+        mut event: ContainerControlEvent,
+        outcome: Option<&NativeSecurityOutcome>,
+    ) {
+        event.security.record_native_outcome(outcome);
         if let Some(sink) = &self.event_sink {
             if let Err(e) = sink.emit(&event) {
                 warn!("Failed to emit control event: {}", e);
@@ -2467,12 +2506,6 @@ impl CreatedContainer {
         let child = self.child;
         self.state.status = OciStatus::Running;
         self.state_mgr.save_state(&self.state)?;
-        self.emit_control_event(ContainerControlEvent::started(
-            config,
-            target_pid,
-            self.state.cgroup_path.clone(),
-        ));
-
         let (sig_stop, sig_handle) =
             Container::setup_signal_forwarding_static(Pid::from_raw(target_pid as i32))?;
 
@@ -2481,6 +2514,18 @@ impl CreatedContainer {
             stop: Some(sig_stop),
             handle: Some(sig_handle),
         };
+
+        let outcome: Option<NativeSecurityOutcome> = self.outcome_reader.take().and_then(|fd| {
+            serde_json::from_reader(std::fs::File::from(fd))
+                .inspect_err(|err| warn!("Native setup did not report security outcomes: {err}"))
+                .ok()
+        });
+        if outcome.is_some() || config.use_gvisor {
+            self.emit_control_event(
+                ContainerControlEvent::started(config, target_pid, self.state.cgroup_path.clone()),
+                outcome.as_ref(),
+            );
+        }
 
         let mut console_relay = if config.terminal && config.console_socket.is_none() {
             self.native_console_master
@@ -2648,15 +2693,18 @@ impl CreatedContainer {
             Ok(exit_code) => ExitStatusEvent::code(*exit_code),
             Err(e) => ExitStatusEvent::error(e.to_string()),
         };
-        self.emit_control_event(ContainerControlEvent::summary(
-            config,
-            target_pid,
-            cgroup_path_for_summary,
-            exit_status_event,
-            resource_stats,
-            resource_stats_error,
-            CleanupEvent::from_errors(cleanup_errors),
-        ));
+        self.emit_control_event(
+            ContainerControlEvent::summary(
+                config,
+                target_pid,
+                cgroup_path_for_summary,
+                exit_status_event,
+                resource_stats,
+                resource_stats_error,
+                CleanupEvent::from_errors(cleanup_errors),
+            ),
+            outcome.as_ref(),
+        );
 
         match run_result {
             Ok(exit_code) => {
