@@ -65,7 +65,13 @@ jobs:
       - name: Run cargo audit
         env:
           RUSTC_WRAPPER: ""
-        run: cargo audit --deny warnings
+        # RUSTSEC-2026-0543 (chrono unmaintained) is informational and has no
+        # fixed release. chrono only reaches us through the dev-only model
+        # tracing chain tla-connect -> itf -> serde_with (chrono feature);
+        # no production target links it. cargo-audit >= 0.22 has no config
+        # file, so the ignore is passed on the CLI. Revisit when itf or
+        # serde_with drop chrono.
+        run: cargo audit --deny warnings --ignore RUSTSEC-2026-0543
 
       - name: Run cargo deny
         env:
