@@ -7,7 +7,7 @@ use crate::network::NetworkMode;
     target_arch = "aarch64",
     target_arch = "riscv64"
 ))]
-use crate::security::syscall_numbers::{SYS_FADVISE64, SYS_SENDFILE};
+use crate::security::syscall_numbers::{SYS_FADVISE64, SYS_FCHMODAT2, SYS_SENDFILE};
 use seccompiler::{BpfProgram, SeccompAction, SeccompCondition, SeccompFilter, SeccompRule};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -81,6 +81,8 @@ impl SeccompManager {
     }
 
     fn base_allowed_syscalls() -> Vec<i64> {
+        // The vec is only mutated on x86_64, which appends legacy syscalls.
+        #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
         let mut syscalls = vec![
             // File I/O
             libc::SYS_read,
@@ -1818,7 +1820,7 @@ fn syscall_name_to_number(name: &str) -> Option<i64> {
         "openat2" => Some(libc::SYS_openat2),
         "name_to_handle_at" => Some(libc::SYS_name_to_handle_at),
         "open_by_handle_at" => Some(libc::SYS_open_by_handle_at),
-        "fchmodat2" => Some(libc::SYS_fchmodat2),
+        "fchmodat2" => Some(SYS_FCHMODAT2),
         "statmount" => Some(457),
         "listmount" => Some(458),
         // Extended attributes (write)
@@ -1915,6 +1917,9 @@ fn syscall_name_to_number(name: &str) -> Option<i64> {
         "ustat" => Some(libc::SYS_ustat),
         #[cfg(target_arch = "x86_64")]
         "sysfs" => Some(libc::SYS_sysfs),
+        // mknod does not exist on the generic syscall table used by
+        // aarch64 and riscv64; those targets only have mknodat.
+        #[cfg(target_arch = "x86_64")]
         "mknod" => Some(libc::SYS_mknod),
         "mknodat" => Some(libc::SYS_mknodat),
         "migrate_pages" => Some(libc::SYS_migrate_pages),

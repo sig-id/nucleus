@@ -154,6 +154,8 @@ pub fn syscall_number_to_name(nr: i64) -> Option<&'static str> {
 /// Built as a function rather than a static to support cfg-gated x86_64-only
 /// legacy syscalls that don't exist on aarch64.
 fn syscall_table() -> Vec<(&'static str, i64)> {
+    // The vec is only mutated on x86_64, which appends legacy syscalls.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
     let mut table = vec![
         ("read", libc::SYS_read),
         ("write", libc::SYS_write),
