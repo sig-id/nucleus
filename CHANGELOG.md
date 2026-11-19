@@ -20,6 +20,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rejected under gVisor, and is recorded in the audit log and reported as
   `security.allow_jit` in `container_started`/`container_summary` so callers
   can attest the posture. W^X stays the default.
+- `--memory-deny-write-execute` (launch config `memory_deny_write_execute`):
+  sets `PR_SET_MDWE` on a native workload (#16). The seccomp W^X rule only
+  refuses a mapping that is writable and executable in one request, so a
+  workload could write a mapping and make it executable afterwards; any
+  interpreter with an FFI could run injected native code that way. With the
+  flag the kernel refuses that step too. The setting is saved with the
+  launch filter so `attach` and probe processes get it, is reported as
+  `security.memory_deny_write_execute` in `container_started` and
+  `container_summary`, and is recorded in the audit log. Opt-in, because JIT
+  runtimes cannot run under it; it conflicts with `--allow-jit`, is rejected
+  under gVisor, and needs Linux 6.3 (the launch fails on an older kernel
+  instead of starting without the protection).
 
 ### Fixed
 - Node 26 (V8 14) starts under the built-in seccomp filter. Its startup made

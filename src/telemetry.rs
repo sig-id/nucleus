@@ -346,6 +346,11 @@ pub struct SecurityEventMetadata {
     /// Callers attesting the reported posture treat this bit like
     /// `allow_degraded_security`: an explicit weakening they must expect.
     pub allow_jit: bool,
+    /// Whether the launch set `PR_SET_MDWE` (`--memory-deny-write-execute`):
+    /// the kernel refuses executable memory the workload wrote itself. A
+    /// native launch that asks for it and cannot set it fails, so `true`
+    /// here means the workload runs with it.
+    pub memory_deny_write_execute: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gpu: Option<GpuEventSummary>,
 }
@@ -404,6 +409,7 @@ impl SecurityEventMetadata {
             rootless: config.user_ns_config.is_some(),
             allow_degraded_security: config.allow_degraded_security,
             allow_jit: config.seccomp_allow_jit,
+            memory_deny_write_execute: config.memory_deny_write_execute,
             gpu,
         }
     }
@@ -544,6 +550,7 @@ mod tests {
         assert_eq!(value["security"]["landlock_status"], "unknown");
         assert_eq!(value["security"]["capabilities_status"], "unknown");
         assert_eq!(value["security"]["allow_jit"], false);
+        assert_eq!(value["security"]["memory_deny_write_execute"], false);
         assert!(value.get("resource_limits").is_some());
     }
 }

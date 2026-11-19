@@ -2501,9 +2501,13 @@ impl Container {
                 format!("path={:?}", path),
             );
         }
-        let install = native_seccomp
-            .ok_or_else(|| NucleusError::SeccompError("Missing native launch filter".into()))?
-            .apply();
+        let native_seccomp = native_seccomp
+            .ok_or_else(|| NucleusError::SeccompError("Missing native launch filter".into()))?;
+        // Set before the filter, which does not let the workload call this
+        // prctl, and outside the degraded-security handling below: a launch
+        // that asked for the memory policy must not start without it.
+        native_seccomp.deny_exec_gain()?;
+        let install = native_seccomp.install_filter();
         let seccomp_applied = match install {
             Ok(()) => true,
             Err(e)
@@ -2527,8 +2531,11 @@ impl Container {
                 &self.config.name,
                 AuditEventType::SeccompApplied,
                 format!(
-                    "mode={:?} network={} allow_jit={}",
-                    self.config.seccomp_mode, allow_network, self.config.seccomp_allow_jit
+                    "mode={:?} network={} allow_jit={} memory_deny_write_execute={}",
+                    self.config.seccomp_mode,
+                    allow_network,
+                    self.config.seccomp_allow_jit,
+                    native_seccomp.denies_exec_gain()
                 ),
             );
         } else if !allow_degraded_security {
