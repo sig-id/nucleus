@@ -96,7 +96,8 @@ impl IoDeviceLimit {
 pub struct ResourceLimits {
     /// Memory limit in bytes (None = unlimited)
     pub memory_bytes: Option<u64>,
-    /// Memory soft limit in bytes (auto-set to 90% of memory_bytes)
+    /// Memory high watermark in bytes: the kernel throttles and reclaims
+    /// above it. Only set on request; see [`ResourceLimits::with_memory_high`].
     pub memory_high: Option<u64>,
     /// Swap limit in bytes (Some(0) = disable swap)
     pub memory_swap_max: Option<u64>,
@@ -164,13 +165,14 @@ impl ResourceLimits {
 
     /// Set memory limit from string (e.g., "512M", "1G")
     ///
-    /// Automatically sets memory_high to 90% of the hard limit and
-    /// disables swap (memory_swap_max = 0) unless swap was explicitly enabled.
+    /// Disables swap (memory_swap_max = 0) unless swap was explicitly
+    /// enabled. No high watermark is set: without swap, anonymous memory
+    /// cannot be reclaimed, so a watermark below the limit throttles a
+    /// runaway workload almost indefinitely instead of letting it reach
+    /// memory.max and be OOM-killed.
     pub fn with_memory(mut self, limit: &str) -> Result<Self> {
         let bytes = Self::parse_memory(limit)?;
         self.memory_bytes = Some(bytes);
-        // Auto-set soft limit to 90% of hard limit (per spec)
-        self.memory_high = Some(bytes - bytes / 10);
         // Disable swap by default when memory limit is set
         if self.memory_swap_max.is_none() {
             self.memory_swap_max = Some(0);
@@ -179,6 +181,28 @@ impl ResourceLimits {
     }
 
     /// Enable swap (removes the default swap=0 restriction)
+    /// Set a memory high watermark (e.g., "900M") for workloads that
+    /// prefer throttling to being OOM-killed. It must not exceed the
+    /// memory limit, so `with_memory` must come first.
+    pub fn with_memory_high(mut self, limit: &str) -> Result<Self> {
+        let bytes = Self::parse_memory(limit)?;
+        match self.memory_bytes {
+            None => {
+                return Err(NucleusError::InvalidResourceLimit(
+                    "A memory high watermark requires a memory limit".to_string(),
+                ))
+            }
+            Some(max) if bytes > max => {
+                return Err(NucleusError::InvalidResourceLimit(format!(
+                    "Memory high watermark {bytes} exceeds the memory limit {max}"
+                )))
+            }
+            Some(_) => {}
+        }
+        self.memory_high = Some(bytes);
+        Ok(self)
+    }
+
     pub fn with_swap_enabled(mut self) -> Self {
         self.memory_swap_max = None;
         self
@@ -357,15 +381,33 @@ mod tests {
     }
 
     #[test]
-    fn test_with_memory_auto_sets_memory_high() {
+    fn test_with_memory_sets_no_high_watermark() {
+        // A watermark below the limit throttles instead of OOM-killing.
         let limits = ResourceLimits::unlimited().with_memory("1G").unwrap();
-        let expected_bytes = 1024 * 1024 * 1024u64;
-        assert_eq!(limits.memory_bytes, Some(expected_bytes));
-        // memory_high should be 90% of hard limit
-        assert_eq!(
-            limits.memory_high,
-            Some(expected_bytes - expected_bytes / 10)
-        );
+        assert_eq!(limits.memory_bytes, Some(1024 * 1024 * 1024));
+        assert_eq!(limits.memory_high, None);
+    }
+
+    #[test]
+    fn test_memory_high_is_opt_in_and_bounded_by_limit() {
+        let limits = ResourceLimits::unlimited()
+            .with_memory("1G")
+            .unwrap()
+            .with_memory_high("900M")
+            .unwrap();
+        assert_eq!(limits.memory_high, Some(900 * 1024 * 1024));
+        let at_limit = ResourceLimits::unlimited()
+            .with_memory("1G")
+            .unwrap()
+            .with_memory_high("1G")
+            .unwrap();
+        assert_eq!(at_limit.memory_high, at_limit.memory_bytes);
+        assert!(ResourceLimits::unlimited()
+            .with_memory("1G")
+            .unwrap()
+            .with_memory_high("2G")
+            .is_err());
+        assert!(ResourceLimits::unlimited().with_memory_high("1G").is_err());
     }
 
     #[test]
@@ -466,19 +508,6 @@ mod tests {
         assert!(limits.io_limits.is_empty());
         assert!(!limits.has_cgroup_control());
         assert!(ResourceLimits::default().has_cgroup_control());
-    }
-
-    #[test]
-    fn test_memory_high_uses_integer_arithmetic() {
-        // BUG-13: memory_high must use integer arithmetic, not floating point
-        let limits = ResourceLimits::unlimited().with_memory("1G").unwrap();
-        let bytes = 1024u64 * 1024 * 1024;
-        let expected_high = bytes - bytes / 10; // 90% via integer
-        assert_eq!(
-            limits.memory_high,
-            Some(expected_high),
-            "memory_high must be exactly bytes - bytes/10 (integer arithmetic)"
-        );
     }
 
     #[test]

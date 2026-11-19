@@ -66,11 +66,10 @@ mod tests {
     // --- ResourceLimits: with_memory auto-configuration ---
 
     #[test]
-    fn test_with_memory_sets_high_to_90_percent() {
+    fn test_with_memory_leaves_high_unset_so_overruns_oom_kill() {
         let limits = ResourceLimits::unlimited().with_memory("1G").unwrap();
-        let bytes = 1024u64 * 1024 * 1024;
-        assert_eq!(limits.memory_bytes, Some(bytes));
-        assert_eq!(limits.memory_high, Some(bytes - bytes / 10));
+        assert_eq!(limits.memory_bytes, Some(1024u64 * 1024 * 1024));
+        assert_eq!(limits.memory_high, None);
     }
 
     #[test]

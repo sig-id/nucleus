@@ -640,6 +640,7 @@ const RUN_CONFIG_PATH_CONFLICTS: &[&str] = &[
     "provider_config_rw",
     "workdir",
     "memory",
+    "memory_high",
     "cpus",
     "hostname",
     "cpu_weight",
@@ -738,6 +739,7 @@ const RUN_CONFIG_FD_CONFLICTS: &[&str] = &[
     "provider_config_rw",
     "workdir",
     "memory",
+    "memory_high",
     "cpus",
     "hostname",
     "cpu_weight",
@@ -882,6 +884,12 @@ enum Commands {
         /// Memory limit (e.g., 512M, 1G)
         #[arg(long)]
         memory: Option<String>,
+
+        /// Memory high watermark (e.g., 900M): the kernel throttles and
+        /// reclaims above it. Unset by default, so a workload that exceeds
+        /// --memory is OOM-killed instead of throttled. Requires --memory.
+        #[arg(long = "memory-high", value_name = "SIZE")]
+        memory_high: Option<String>,
 
         /// CPU limit (number of cores)
         #[arg(long)]
@@ -1505,6 +1513,7 @@ struct RunConfig {
     home: String,
     workdir: String,
     memory: Option<String>,
+    memory_high: Option<String>,
     cpus: Option<f64>,
     hostname: Option<String>,
     cpu_weight: Option<u64>,
@@ -1615,6 +1624,7 @@ impl Default for RunConfig {
             home: DEFAULT_HOME_PATH.to_string(),
             workdir: "/workspace".to_string(),
             memory: None,
+            memory_high: None,
             cpus: None,
             hostname: None,
             cpu_weight: None,
@@ -2218,6 +2228,7 @@ fn try_main() -> Result<i32> {
             home,
             workdir,
             memory,
+            memory_high,
             cpus,
             cpu_weight,
             io_limits,
@@ -2337,6 +2348,7 @@ fn try_main() -> Result<i32> {
                     home,
                     workdir,
                     memory,
+                    memory_high,
                     cpus,
                     hostname,
                     cpu_weight,
@@ -2545,6 +2557,7 @@ fn try_main() -> Result<i32> {
                 home,
                 workdir,
                 memory,
+                memory_high,
                 cpus,
                 hostname,
                 cpu_weight,
@@ -2649,6 +2662,11 @@ fn try_main() -> Result<i32> {
             if let Some(mem_str) = memory {
                 limits = limits.with_memory(&mem_str)?;
                 info!("Memory limit: {}", mem_str);
+            }
+
+            if let Some(high_str) = memory_high {
+                limits = limits.with_memory_high(&high_str)?;
+                info!("Memory high watermark: {}", high_str);
             }
 
             if let Some(cores) = cpus {
@@ -3484,6 +3502,7 @@ mod tests {
             home: DEFAULT_HOME_PATH.to_string(),
             workdir: "/workspace".to_string(),
             memory: Some("512M".to_string()),
+            memory_high: Some("400M".to_string()),
             cpus: Some(1.5),
             hostname: Some("svc".to_string()),
             cpu_weight: Some(100),
@@ -3607,6 +3626,7 @@ mod tests {
             home: DEFAULT_HOME_PATH.to_string(),
             workdir: "/workspace".to_string(),
             memory: None,
+            memory_high: None,
             cpus: None,
             hostname: None,
             cpu_weight: None,

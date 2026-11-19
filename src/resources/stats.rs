@@ -23,6 +23,45 @@ pub struct ResourceStats {
 
     /// Memory usage percentage (0-100)
     pub memory_percent: f64,
+
+    /// `memory.events` counters, which tell a memory failure apart from
+    /// other exits. Absent when the memory controller is not enabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_events: Option<MemoryEvents>,
+}
+
+/// Counters from a cgroup's `memory.events`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct MemoryEvents {
+    /// Times usage was throttled above memory.high.
+    pub high: u64,
+    /// Times usage hit memory.max.
+    pub max: u64,
+    /// Times the OOM killer was invoked for the cgroup.
+    pub oom: u64,
+    /// Processes killed by the OOM killer.
+    pub oom_kill: u64,
+}
+
+impl MemoryEvents {
+    fn parse(content: &str) -> Self {
+        let mut events = Self::default();
+        for line in content.lines() {
+            let mut fields = line.split_whitespace();
+            let (Some(key), Some(value)) = (fields.next(), fields.next()) else {
+                continue;
+            };
+            let Ok(value) = value.parse() else { continue };
+            match key {
+                "high" => events.high = value,
+                "max" => events.max = value,
+                "oom" => events.oom = value,
+                "oom_kill" => events.oom_kill = value,
+                _ => {}
+            }
+        }
+        events
+    }
 }
 
 impl ResourceStats {
@@ -57,6 +96,9 @@ impl ResourceStats {
             cpu_usage_ns,
             pid_count,
             memory_percent,
+            memory_events: fs::read_to_string(cgroup_path.join("memory.events"))
+                .ok()
+                .map(|content| MemoryEvents::parse(&content)),
         })
     }
 
@@ -161,6 +203,25 @@ impl ResourceStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_events_parse_counters_and_skip_unknown_lines() {
+        let events =
+            MemoryEvents::parse("low 0\nhigh 2885\nmax 7\noom 1\noom_kill 1\noom_group_kill 1\n");
+        assert_eq!(
+            events,
+            MemoryEvents {
+                high: 2885,
+                max: 7,
+                oom: 1,
+                oom_kill: 1
+            }
+        );
+        assert_eq!(
+            MemoryEvents::parse("garbage\nhigh x\n"),
+            MemoryEvents::default()
+        );
+    }
 
     #[test]
     fn test_format_memory() {
