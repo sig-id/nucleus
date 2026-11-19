@@ -1430,8 +1430,7 @@ mod tests {
         // --seccomp-allow must not kill the process. ENOSYS is what a kernel
         // without the syscall returns, so probing runtimes and libc fall
         // back or report a normal error instead of dying with SIGSYS:
-        // inotify watchers, utimensat timestamps (`touch`, `tar`, `git`),
-        // pidfds (Go, tokio), protection keys (V8), libuv's io_uring probe,
+        // inotify watchers, extended attribute writes, pidfds (Go, tokio), protection keys (V8), libuv's io_uring probe,
         // and the splice-family transfers.
         use crate::security::SeccompManager;
         let action = |prog: &BpfProgram, nr: i64, args: [u64; 6]| {
@@ -1448,12 +1447,12 @@ mod tests {
         let enosys = libc::SECCOMP_RET_ERRNO | libc::ENOSYS as u32;
         let probes = [
             ("inotify_init1", libc::SYS_inotify_init1),
-            ("utimensat", libc::SYS_utimensat),
+            ("setxattr", libc::SYS_setxattr),
             ("pkey_alloc", libc::SYS_pkey_alloc),
             ("timer_create", libc::SYS_timer_create),
             ("pidfd_open", libc::SYS_pidfd_open),
             ("sysinfo", libc::SYS_sysinfo),
-            ("getpriority", libc::SYS_getpriority),
+            ("setpriority", libc::SYS_setpriority),
             ("setrlimit", libc::SYS_setrlimit),
             ("io_uring_setup", libc::SYS_io_uring_setup),
             ("io_cancel", libc::SYS_io_cancel),
@@ -1465,6 +1464,32 @@ mod tests {
                 enosys,
                 "{name} must degrade to ENOSYS when not opted in"
             );
+        }
+
+        // The calls ordinary tools need in order to work, not merely to
+        // survive, are allowed by default: timestamps (`touch`, `tar`,
+        // `cp -p`, `make`), creat, fchmodat2 and read-only queries.
+        for name in [
+            "utimensat",
+            "creat",
+            "fchmodat2",
+            "getsid",
+            "getpriority",
+            "sched_getattr",
+            "sched_get_priority_max",
+        ] {
+            let Some(nr) = crate::security::seccomp::syscall_number_for_test(name) else {
+                continue; // not present on this architecture
+            };
+            assert_eq!(
+                action(&default, nr, [0; 6]),
+                RET_ALLOW,
+                "{name} must be allowed by default"
+            );
+        }
+        // Their mutating siblings stay opt-in.
+        for nr in [libc::SYS_setpriority, libc::SYS_sched_setattr] {
+            assert_eq!(action(&default, nr, [0; 6]), enosys);
         }
 
         // Opting in suppresses the override and yields the real syscall.

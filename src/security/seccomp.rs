@@ -311,8 +311,44 @@ impl SeccompManager {
             libc::SYS_signalfd,
         ]);
 
+        // Resolved by name because several of these exist only on x86_64.
+        syscalls.extend(
+            Self::DEFAULT_COMPATIBILITY_SYSCALLS
+                .iter()
+                .filter_map(|name| syscall_name_to_number(name)),
+        );
+
         syscalls
     }
+
+    /// Former opt-in syscalls that ordinary developer tools need to work, not
+    /// merely to survive (#45): an `ENOSYS` keeps the process alive, but
+    /// `touch`, `tar x`, `cp -p`, `make` and `git` still fail without the
+    /// timestamp calls. Each entry is either a read-only query of the
+    /// caller's own namespace or equivalent to a syscall the base list
+    /// already allows, so it grants no new reach:
+    ///
+    /// - `utimensat`/`utimes`/`utime`/`futimesat`: timestamps on files the
+    ///   caller may already write (same DAC check as `write`).
+    /// - `creat`: `openat(O_CREAT|O_WRONLY|O_TRUNC)`, same LSM hooks.
+    /// - `fchmodat2`: `fchmodat` with a flags word (glibc >= 2.39).
+    /// - `getsid`, `getpriority`, `sched_get_priority_*`,
+    ///   `sched_rr_get_interval`, `sched_getattr`: read-only, confined to
+    ///   the PID namespace, siblings of queries already allowed.
+    const DEFAULT_COMPATIBILITY_SYSCALLS: &'static [&'static str] = &[
+        "utimensat",
+        "utimes",
+        "utime",
+        "futimesat",
+        "creat",
+        "fchmodat2",
+        "getsid",
+        "getpriority",
+        "sched_get_priority_max",
+        "sched_get_priority_min",
+        "sched_rr_get_interval",
+        "sched_getattr",
+    ];
 
     // Linux takes these syscall arguments as int, including when a caller
     // supplies nonzero upper bits in the 64-bit seccomp argument slots.
@@ -1402,14 +1438,8 @@ impl SeccompManager {
         "name_to_handle_at",
         "io_cancel",
         "io_pgetevents",
-        "creat",
-        "fchmodat2",
         "statmount",
         "listmount",
-        "utimensat",
-        "utimes",
-        "utime",
-        "futimesat",
         // Extended attributes (write)
         "setxattr",
         "lsetxattr",
@@ -1427,14 +1457,9 @@ impl SeccompManager {
         // Scheduling (non-default)
         "sched_setparam",
         "sched_setscheduler",
-        "sched_get_priority_max",
-        "sched_get_priority_min",
-        "sched_rr_get_interval",
         "sched_setattr",
-        "sched_getattr",
         // Resource limits / priority
         "setrlimit",
-        "getpriority",
         "setpriority",
         "ioprio_set",
         "ioprio_get",
@@ -1460,7 +1485,6 @@ impl SeccompManager {
         "setfsuid",
         "setfsgid",
         "setgroups",
-        "getsid",
         // Capabilities (read-only query)
         "capget",
         // Signals (non-default)
@@ -1560,6 +1584,11 @@ use crate::security::seccomp_generate::{SeccompArgFilter, SeccompProfile};
 /// Map a syscall name (e.g. "read", "write") to its Linux syscall number.
 ///
 /// Covers the most common syscalls. Unknown names return None.
+#[cfg(test)]
+pub(super) fn syscall_number_for_test(name: &str) -> Option<i64> {
+    syscall_name_to_number(name)
+}
+
 fn syscall_name_to_number(name: &str) -> Option<i64> {
     match name {
         // File I/O
@@ -2206,18 +2235,19 @@ mod tests {
         let net = SeccompManager::network_mode_syscalls(true);
 
         // Include argument-filtered syscalls in the complete policy counts.
-        // vfork is x86_64-only in the syscall table. The offline count grew
-        // by four in #45: sendto/recvfrom/sendmsg/recvmsg are now
-        // argument-filtered in every network mode (Unix datagram IPC with
-        // networking denied; MSG_OOB still denied).
+        // vfork is x86_64-only in the syscall table. #45 grew the counts
+        // twice: sendto/recvfrom/sendmsg/recvmsg are argument-filtered in
+        // every network mode (+4 offline), and DEFAULT_COMPATIBILITY_SYSCALLS
+        // joined the base list (+12 on x86_64; utimes, utime, futimesat and
+        // creat do not exist on the generic syscall table, so +8 elsewhere).
         #[cfg(target_arch = "x86_64")]
-        const BASE_COUNT: usize = 168;
+        const BASE_COUNT: usize = 180;
         #[cfg(not(target_arch = "x86_64"))]
-        const BASE_COUNT: usize = 167;
+        const BASE_COUNT: usize = 175;
         #[cfg(target_arch = "x86_64")]
-        const FULL_COUNT_OFFLINE: usize = 184;
+        const FULL_COUNT_OFFLINE: usize = 196;
         #[cfg(not(target_arch = "x86_64"))]
-        const FULL_COUNT_OFFLINE: usize = 183;
+        const FULL_COUNT_OFFLINE: usize = 191;
         assert_eq!(base.len(), BASE_COUNT);
         assert_eq!(net.len(), 5);
         assert_eq!(
@@ -2225,9 +2255,9 @@ mod tests {
             FULL_COUNT_OFFLINE
         );
         #[cfg(target_arch = "x86_64")]
-        const FULL_COUNT_NETWORK: usize = 190;
+        const FULL_COUNT_NETWORK: usize = 202;
         #[cfg(not(target_arch = "x86_64"))]
-        const FULL_COUNT_NETWORK: usize = 189;
+        const FULL_COUNT_NETWORK: usize = 197;
         assert_eq!(
             SeccompManager::minimal_filter(true, &[]).unwrap().len(),
             FULL_COUNT_NETWORK

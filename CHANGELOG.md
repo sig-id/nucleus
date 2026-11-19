@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--seccomp-allow` (#45). Un-requested opt-in calls now return `ENOSYS`,
   indistinguishable from a kernel that lacks the call, so runtimes and libc
   fall back or report a normal error: Codex's config watcher (`inotify_init1`),
-  `utimensat` from `touch`, `tar` and `git`, Go's and tokio's `pidfd_open`,
+  Go's and tokio's `pidfd_open`,
   V8's `pkey_alloc`, libuv's `io_uring_setup` probe (Node 22+/26+),
   `sysinfo`, and the `splice`/`tee`/`sendfile` transfers that already
   degraded this way. `SECURITY_CRITICAL_DENIED_SYSCALLS` and
@@ -21,6 +21,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ENOSYS` denials compile into a second bitmap, so the filter's O(1)
   dispatch is unchanged, and a syscall that is both unconditionally allowed
   and unconditionally denied is now rejected at compile time.
+- File timestamps work by default (#45). An `ENOSYS` keeps a process alive,
+  but `touch`, `tar x`, `cp -p`, `make` and `git` still failed without
+  `utimensat`. It and its legacy forms (`utimes`, `utime`, `futimesat`),
+  `creat`, `fchmodat2` and the read-only queries `getsid`, `getpriority`,
+  `sched_getattr`, `sched_get_priority_max`/`min` and `sched_rr_get_interval`
+  moved from the opt-in list to the default allowlist. Each is a read-only
+  query or equivalent to a call the default list already allowed.
 - `sendto`, `recvfrom`, `sendmsg` and `recvmsg` are argument-filtered in
   every network mode instead of being killed with networking denied
   (#45). Socket creation is already family-filtered per mode, so the
