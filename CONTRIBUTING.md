@@ -174,6 +174,15 @@ If you discover a security vulnerability:
 2. Email security details to the maintainers
 3. Allow reasonable time for a fix before disclosure
 
+## Releasing
+
+1. Merge a release PR that bumps `Cargo.toml`/`Cargo.lock` and finalizes `CHANGELOG.md`.
+2. Publish a GitHub release tagged `vX.Y.Z` on the merge commit. The release
+   workflow reruns CI, checks the tag matches the crate version, and attaches
+   the x86_64 and aarch64 binaries.
+3. After the workflow passes, publish the crate manually from a clean checkout
+   of the tag: `cargo publish --locked`.
+
 ## License
 
 By contributing, you agree that your contributions will be licensed under the same terms as the project (MIT OR Apache-2.0).

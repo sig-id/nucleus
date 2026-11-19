@@ -79,22 +79,3 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release upload "${{ github.event.release.tag_name }}" "nucleus-${{ matrix.target }}.tar.gz" --clobber
-
-  publish:
-    needs:
-      - validate
-      - build
-    if: ${{ !github.event.release.draft && !github.event.release.prerelease }}
-    runs-on: ubuntu-latest
-    environment: crates-io
-
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Install Rust toolchain
-        run: rustup show active-toolchain
-
-      - run: cargo publish --locked
-        env:
-          RUSTC_WRAPPER: ""
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
