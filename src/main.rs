@@ -712,6 +712,7 @@ const RUN_CONFIG_PATH_CONFLICTS: &[&str] = &[
     "seccomp_log",
     "seccomp_log_denied",
     "seccomp_allow",
+    "allow_jit",
     "caps_policy",
     "caps_policy_sha256",
     "landlock_policy",
@@ -813,6 +814,7 @@ const RUN_CONFIG_FD_CONFLICTS: &[&str] = &[
     "seccomp_log",
     "seccomp_log_denied",
     "seccomp_allow",
+    "allow_jit",
     "caps_policy",
     "caps_policy_sha256",
     "landlock_policy",
@@ -1218,6 +1220,14 @@ enum Commands {
         #[arg(long = "seccomp-allow")]
         seccomp_allow: Vec<String>,
 
+        /// Per-launch JIT allowance: let the native seccomp filter permit
+        /// mappings that are writable and executable at once (mmap, mprotect,
+        /// pkey_mprotect), which JIT runtimes (Node/V8, JVM, PyPy, LuaJIT, .NET)
+        /// require. W^X stays the default; the allowance is reported in the
+        /// container_started event so callers can attest it.
+        #[arg(long = "allow-jit")]
+        allow_jit: bool,
+
         /// Path to capability policy file (TOML)
         #[arg(long = "caps-policy")]
         caps_policy: Option<String>,
@@ -1617,6 +1627,8 @@ struct RunConfig {
     seccomp_log: Option<String>,
     seccomp_log_denied: bool,
     seccomp_allow: Vec<String>,
+    #[serde(default)]
+    allow_jit: bool,
     caps_policy: Option<String>,
     caps_policy_sha256: Option<String>,
     landlock_policy: Option<String>,
@@ -1723,6 +1735,7 @@ impl Default for RunConfig {
             seccomp_log: None,
             seccomp_log_denied: false,
             seccomp_allow: Vec::new(),
+            allow_jit: false,
             caps_policy: None,
             caps_policy_sha256: None,
             landlock_policy: None,
@@ -2330,6 +2343,7 @@ fn try_main() -> Result<i32> {
             seccomp_log,
             seccomp_log_denied,
             seccomp_allow,
+            allow_jit,
             caps_policy,
             caps_policy_sha256,
             landlock_policy,
@@ -2451,6 +2465,7 @@ fn try_main() -> Result<i32> {
                     seccomp_log,
                     seccomp_log_denied,
                     seccomp_allow,
+                    allow_jit,
                     caps_policy,
                     caps_policy_sha256,
                     landlock_policy,
@@ -2676,6 +2691,7 @@ fn try_main() -> Result<i32> {
                 seccomp_log,
                 seccomp_log_denied,
                 seccomp_allow,
+                allow_jit,
                 caps_policy,
                 caps_policy_sha256,
                 landlock_policy,
@@ -2961,6 +2977,10 @@ fn try_main() -> Result<i32> {
 
             if !seccomp_allow.is_empty() {
                 config = config.with_seccomp_allow_syscalls(seccomp_allow);
+            }
+
+            if allow_jit {
+                config = config.with_seccomp_allow_jit(true);
             }
 
             // Capability policy
@@ -3640,6 +3660,7 @@ mod tests {
             seccomp_log: None,
             seccomp_log_denied: false,
             seccomp_allow: vec!["io_uring_setup".to_string(), "--detach".to_string()],
+            allow_jit: true,
             caps_policy: Some("/tmp/caps.toml".to_string()),
             caps_policy_sha256: Some("efgh".to_string()),
             landlock_policy: Some("/tmp/landlock.toml".to_string()),
@@ -3679,6 +3700,7 @@ mod tests {
             request.credential_broker_no_proxy_env
         );
         assert_eq!(decoded.seccomp_allow, request.seccomp_allow);
+        assert_eq!(decoded.allow_jit, request.allow_jit);
     }
 
     #[test]
@@ -3766,6 +3788,7 @@ mod tests {
             seccomp_log: None,
             seccomp_log_denied: false,
             seccomp_allow: Vec::new(),
+            allow_jit: false,
             caps_policy: None,
             caps_policy_sha256: None,
             landlock_policy: None,

@@ -7,13 +7,20 @@
 //! Program structure:
 //!
 //! 1. Arch validation (3 insns)
-//! 2. Compute bit_position = nr & 31 → M\[0\], word_index = nr >> 5 (5 insns)
-//! 3. Dispatch on word_index → load 32-bit bitmap constant (≤46 insns)
-//! 4. Bitmap test: `(bitmap >> bit_position) & 1` → ALLOW if set (5 insns)
-//! 5. Arg-filtered syscall chains for conditional rules (variable)
-//! 6. Default deny
+//! 2. Argument-tested errno denies, e.g. `ENOSYS` for `clone3` or `EPERM`
+//!    for namespace flags (variable)
+//! 3. Compute bit_position = nr & 31 → M\[0\], word_index = nr >> 5 (5 insns)
+//! 4. Dispatch on word_index → load 32-bit allow bitmap constant (≤46 insns)
+//! 5. Bitmap test: `(bitmap >> bit_position) & 1` → ALLOW if set (5 insns)
+//! 6. Errno bitmap dispatch + test: whole-syscall ENOSYS denies, consulted
+//!    only after the allow bitmap misses (≤52 insns)
+//! 7. Arg-filtered syscall chains for conditional rules (variable)
+//! 8. Default deny
 //!
 //! Hot path for unconditional allows: ~15 instructions (vs ~120+ for linear scan).
+//! Whole-syscall ENOSYS denials — the fallback for opt-in syscalls that were
+//! not requested through `--seccomp-allow` (#45) — are a second bitmap so the
+//! deny path stays O(1) as that set grows.
 
 use crate::error::{NucleusError, Result};
 use seccompiler::{sock_filter, BpfProgram, SeccompAction, SeccompRule, TargetArch};
@@ -120,23 +127,31 @@ pub(super) struct ErrnoRule {
     /// Test the low 32 bits of seccomp_data.args[1] (second argument, e.g. an
     /// `ioctl` request code).
     pub arg1: Option<ArgMatch>,
-    /// Test the low 32 bits of seccomp_data.args[2] (third argument, e.g. a
-    /// `mprotect` protection mask).
-    pub arg2: Option<ArgMatch>,
-    /// Additional argument tests ANDed with the fixed fields above. Several
-    /// tests may target the same index: W^X needs both the PROT_WRITE and
-    /// PROT_EXEC bits of a protection mask set, which is two AnyBit tests on
-    /// argument 2.
+    /// Additional argument tests, ANDed with the fixed fields above. Several
+    /// tests may target the same index: a W^X request has both the
+    /// PROT_WRITE and the PROT_EXEC bit of its protection mask set, which is
+    /// two `AnyBit` tests on argument 2.
     pub extra_args: &'static [(u8, ArgMatch)],
     pub errno: i32,
 }
 
 /// Compile a seccomp BPF program with exact-match syscall errno overrides.
 ///
-/// `errno_syscalls` are checked before both the unconditional allow bitmap and
-/// the argument-filtered chains. This lets the policy return ENOSYS for syscalls
-/// such as clone3, where libc can safely fall back to an older syscall that the
-/// filter can inspect.
+/// `errno_syscalls` are split into two encodings:
+///
+/// - Rules that test syscall arguments run first, before the allow bitmap
+///   and the argument-filtered chains. This lets the policy return `ENOSYS`
+///   for syscalls such as clone3, where libc can safely fall back to an
+///   older syscall the filter can inspect, or a targeted errno for a single
+///   denied argument combination.
+/// - Unconditional whole-syscall `ENOSYS` rules are compiled into a second
+///   bitmap consulted after the allow bitmap misses and before the
+///   argument-filtered chains, so a large opt-in deny set cannot regress
+///   the O(1) dispatch. A syscall that is both unconditionally allowed and
+///   unconditionally denied with `ENOSYS` is a contradictory policy and is
+///   rejected at compile time. (Argument-tested errno rules still run
+///   before everything and can override an allow for a matching argument
+///   combination.)
 pub(super) fn compile_bitmap_bpf_with_errno_syscalls(
     rules: BTreeMap<i64, Vec<SeccompRule>>,
     errno_syscalls: &[ErrnoRule],
@@ -165,6 +180,36 @@ pub(super) fn compile_bitmap_bpf_with_errno_syscalls(
         }
     }
 
+    // Whole-syscall ENOSYS denials join the second bitmap; argument-tested
+    // rules and other errnos stay in the linear section. The two encodings
+    // are disjoint by construction: an unconditional rule has no tests, and
+    // a bitmap hit can only return ENOSYS. An unconditional ENOSYS rule for
+    // a syscall that is also unconditionally allowed is a contradictory
+    // policy — reject it at compile time instead of picking a winner.
+    let errno_bitmap_val: u32 = SeccompAction::Errno(libc::ENOSYS as u32).into();
+    let mut errno_bitmap: [u32; NUM_BITMAP_WORDS] = [0; NUM_BITMAP_WORDS];
+    let mut tested_errno: Vec<&ErrnoRule> = Vec::new();
+    for rule in errno_syscalls {
+        let word_idx = (rule.nr >> 5) as usize;
+        if rule.arg0.is_none()
+            && rule.arg1.is_none()
+            && rule.extra_args.is_empty()
+            && rule.errno == libc::ENOSYS
+            && rule.nr >= 0
+            && word_idx < NUM_BITMAP_WORDS
+        {
+            if bitmap[word_idx] & (1u32 << (rule.nr & 31)) != 0 {
+                return Err(NucleusError::SeccompError(format!(
+                    "syscall {} is both unconditionally allowed and denied with ENOSYS",
+                    rule.nr
+                )));
+            }
+            errno_bitmap[word_idx] |= 1u32 << (rule.nr & 31);
+        } else {
+            tested_errno.push(rule);
+        }
+    }
+
     // Build arg section first – we need its size for dispatch jump offsets.
     let arg_section = build_arg_section(arg_filtered, mismatch_val, match_val);
 
@@ -180,6 +225,16 @@ pub(super) fn compile_bitmap_bpf_with_errno_syscalls(
     let dispatch_len = dispatch_entry_count * 3 + 1;
     let test_len: usize = 5; // LDX M[0]; RSH X; AND 1; JEQ; RET
 
+    // The errno bitmap repeats the dispatch + test shape, prefixed by a
+    // 2-insn reload of word_index (the allow bitmap test clobbered A and X).
+    let errno_words: Vec<(usize, u32)> = errno_bitmap
+        .iter()
+        .enumerate()
+        .filter(|(_, &w)| w != 0)
+        .map(|(i, &w)| (i, w))
+        .collect();
+    let errno_block_len = 2 + errno_words.len() * 3 + 1;
+
     let mut prog: BpfProgram = Vec::with_capacity(64 + arg_section.len());
 
     // === Section 1: Architecture validation ===
@@ -187,20 +242,18 @@ pub(super) fn compile_bitmap_bpf_with_errno_syscalls(
     prog.push(bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, audit_arch, 1, 0));
     prog.push(bpf_stmt(BPF_RET | BPF_K, libc::SECCOMP_RET_KILL_PROCESS));
 
-    // === Section 1b: Exact-match errno denies ===
-    for rule in errno_syscalls {
+    // === Section 1b: Argument-tested errno denies ===
+    for rule in tested_errno {
         prog.push(bpf_stmt(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_NR_OFFSET));
-        let mut tests: Vec<(u32, ArgMatch)> = [(0u32, rule.arg0), (1, rule.arg1), (2, rule.arg2)]
+        let tests: Vec<(u32, ArgMatch)> = [(0, rule.arg0), (1, rule.arg1)]
             .into_iter()
             .filter_map(|(index, test)| test.map(|test| (index, test)))
+            .chain(
+                rule.extra_args
+                    .iter()
+                    .map(|(index, test)| (u32::from(*index), *test)),
+            )
             .collect();
-        // Extra tests may repeat an argument index (W^X tests two bits of
-        // the same protection mask).
-        tests.extend(
-            rule.extra_args
-                .iter()
-                .map(|(index, test)| (*index as u32, *test)),
-        );
         // Each argument test is a load and a jump; a failed test skips the
         // remaining tests and the RET.
         let skip = 2 * tests.len() as u8 + 1;
@@ -240,7 +293,9 @@ pub(super) fn compile_bitmap_bpf_with_errno_syscalls(
     //   JA test_offset       →  jump to bitmap test section
     //
     // After all entries:
-    //   JA arg_offset        →  word_index not in bitmap; skip to arg section
+    //   JA                    →  word_index not in bitmap; skip the test
+    //                          section to the errno bitmap section (or the
+    //                          arg section when no errno bitmap words exist)
 
     let test_start = dispatch_len; // offset from dispatch start to test section
     for (entry_idx, &(word_idx, word_val)) in active_words.iter().enumerate() {
@@ -250,7 +305,8 @@ pub(super) fn compile_bitmap_bpf_with_errno_syscalls(
         let ja_offset = test_start - insn_pos - 3; // distance from JA to test start
         prog.push(bpf_stmt(BPF_JMP | BPF_JA, ja_offset as u32));
     }
-    // Out-of-range: jump past test section to arg section (or default deny).
+    // Out-of-range: jump past the test section to the errno bitmap section
+    // (or straight to the arg section / default deny when it is empty).
     prog.push(bpf_stmt(BPF_JMP | BPF_JA, test_len as u32));
 
     // === Section 4: Bitmap test ===
@@ -259,17 +315,40 @@ pub(super) fn compile_bitmap_bpf_with_errno_syscalls(
     // A = bitmap_word >> X
     // A = A & 1
     // if A == 1: return ALLOW
-    // else: fall through to arg section
+    // else: fall through to the errno bitmap section
     prog.push(bpf_stmt(BPF_LDX | BPF_MEM, M_BIT_POS));
     prog.push(bpf_stmt(BPF_ALU | BPF_RSH | BPF_X, 0));
     prog.push(bpf_stmt(BPF_ALU | BPF_AND | BPF_K, 1));
     prog.push(bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, 1, 0, 1)); // bit set → RET
     prog.push(bpf_stmt(BPF_RET | BPF_K, match_val)); // ALLOW
 
-    // === Section 5: Arg-filtered syscall chains ===
+    // === Section 5: Errno bitmap dispatch + test ===
+    //
+    // Same shape as the allow dispatch, after reloading word_index (the
+    // allow bitmap test clobbered A and X; M[0] still holds bit_position).
+    // A hit returns ENOSYS; a miss falls through to the arg section.
+    prog.push(bpf_stmt(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_NR_OFFSET)); // A = nr
+    prog.push(bpf_stmt(BPF_ALU | BPF_RSH | BPF_K, 5)); // A = word_index
+    let errno_test_start = errno_block_len; // relative to this section start
+    for (entry_idx, &(word_idx, word_val)) in errno_words.iter().enumerate() {
+        let insn_pos = 2 + entry_idx * 3; // position within this section
+        prog.push(bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, word_idx as u32, 0, 2));
+        prog.push(bpf_stmt(BPF_LD | BPF_IMM, word_val));
+        let ja_offset = errno_test_start - insn_pos - 3;
+        prog.push(bpf_stmt(BPF_JMP | BPF_JA, ja_offset as u32));
+    }
+    // Not in the errno bitmap either: skip its test, continue to arg section.
+    prog.push(bpf_stmt(BPF_JMP | BPF_JA, test_len as u32));
+    prog.push(bpf_stmt(BPF_LDX | BPF_MEM, M_BIT_POS));
+    prog.push(bpf_stmt(BPF_ALU | BPF_RSH | BPF_X, 0));
+    prog.push(bpf_stmt(BPF_ALU | BPF_AND | BPF_K, 1));
+    prog.push(bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, 1, 0, 1)); // bit set → RET
+    prog.push(bpf_stmt(BPF_RET | BPF_K, errno_bitmap_val)); // ERRNO | ENOSYS
+
+    // === Section 6: Arg-filtered syscall chains ===
     prog.extend(arg_section);
 
-    // === Section 6: Default deny ===
+    // === Section 7: Default deny ===
     prog.push(bpf_stmt(BPF_RET | BPF_K, mismatch_val));
 
     if prog.len() >= BPF_MAX_LEN {
@@ -535,19 +614,44 @@ mod tests {
     }
 
     #[test]
-    fn test_errno_syscall_overrides_unconditional_allow() {
+    fn test_unconditional_errno_allow_overlap_is_rejected() {
+        // An unconditional ENOSYS deny is compiled into the errno bitmap,
+        // which is consulted only after the allow bitmap misses. Rather than
+        // silently picking a winner, a syscall that is both unconditionally
+        // allowed and unconditionally denied is a contradictory policy and
+        // must fail loudly at compile time.
         let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
         rules.insert(0, Vec::new()); // read
         rules.insert(123, Vec::new()); // deliberately present in allow bitmap
 
-        let prog = compile_bitmap_bpf_with_errno_syscalls(
-            rules,
+        let result = compile_bitmap_bpf_with_errno_syscalls(
+            rules.clone(),
             &[ErrnoRule {
                 nr: 123,
                 arg0: None,
                 arg1: None,
                 errno: libc::ENOSYS,
-                arg2: None,
+                extra_args: &[],
+            }],
+            SeccompAction::KillProcess,
+            SeccompAction::Allow,
+            TargetArch::x86_64,
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("123"),
+            "overlap error must name the syscall: {err}"
+        );
+
+        // Disjoint policies keep the previous semantics: the errno deny
+        // applies to its syscall, everything unlisted keeps the default.
+        let prog = compile_bitmap_bpf_with_errno_syscalls(
+            rules,
+            &[ErrnoRule {
+                nr: 124,
+                arg0: None,
+                arg1: None,
+                errno: libc::ENOSYS,
                 extra_args: &[],
             }],
             SeccompAction::KillProcess,
@@ -559,10 +663,10 @@ mod tests {
         let data = make_seccomp_data(0, AUDIT_ARCH_X86_64, [0; 6]);
         assert_eq!(bpf_eval(&prog, &data), RET_ALLOW);
 
-        let data = make_seccomp_data(123, AUDIT_ARCH_X86_64, [0; 6]);
+        let data = make_seccomp_data(124, AUDIT_ARCH_X86_64, [0; 6]);
         assert_eq!(bpf_eval(&prog, &data), RET_ERRNO_ENOSYS);
 
-        let data = make_seccomp_data(124, AUDIT_ARCH_X86_64, [0; 6]);
+        let data = make_seccomp_data(125, AUDIT_ARCH_X86_64, [0; 6]);
         assert_eq!(bpf_eval(&prog, &data), RET_KILL);
     }
 
@@ -580,7 +684,6 @@ mod tests {
                 arg0: None,
                 arg1: Some(ArgMatch::Eq(libc::FICLONE as u32)),
                 errno: libc::EOPNOTSUPP,
-                arg2: None,
                 extra_args: &[],
             }],
             SeccompAction::KillProcess,
@@ -610,7 +713,7 @@ mod tests {
         // coreutils cp probes FICLONE on every copy and falls back to a
         // read/write loop on EOPNOTSUPP; killing the probe terminated
         // ordinary file copies with SIGSYS.
-        let rules = crate::security::SeccompManager::minimal_filter_for_test(false, &[]);
+        let rules = crate::security::SeccompManager::minimal_filter_for_test(false, &[], false);
         let prog = compile_bitmap_bpf_with_errno_syscalls(
             rules,
             crate::security::SeccompManager::errno_denied_syscalls_for_test(),
@@ -725,10 +828,10 @@ mod tests {
 
     #[test]
     fn test_denied_syscall_cannot_match_mprotect_arg_predicate() {
-        let rules = crate::security::SeccompManager::minimal_filter_for_test(false, &[]);
+        let rules = crate::security::SeccompManager::minimal_filter_for_test(false, &[], false);
         assert!(
-            !rules.contains_key(&libc::SYS_sendto),
-            "sendto must be denied when networking is disabled"
+            !rules.contains_key(&libc::SYS_bpf),
+            "bpf must be denied: it is neither allowed nor on the opt-in list"
         );
         assert!(
             rules
@@ -747,14 +850,14 @@ mod tests {
 
         for mprotect_allowed_prot in [0, libc::PROT_WRITE as u64, libc::PROT_EXEC as u64] {
             let data = make_seccomp_data(
-                libc::SYS_sendto as u32,
+                libc::SYS_bpf as u32,
                 AUDIT_ARCH_X86_64,
                 [0, 0, mprotect_allowed_prot, 0, 0, 0],
             );
             assert_eq!(
                 bpf_eval(&prog, &data),
                 RET_KILL,
-                "denied sendto syscall must not reuse mprotect arg2 predicate ({})",
+                "denied bpf syscall must not reuse mprotect arg2 predicate ({})",
                 mprotect_allowed_prot
             );
         }
@@ -778,7 +881,7 @@ mod tests {
             ]
         });
         std::fs::write(profile.path(), contents.to_string()).unwrap();
-        let program = SeccompManager::compile_profile(profile.path(), None).unwrap();
+        let program = SeccompManager::compile_profile(profile.path(), None, false).unwrap();
         let action = |flags: i32, stack| {
             bpf_eval(
                 &program,
@@ -809,7 +912,6 @@ mod tests {
                 arg0: Some(ArgMatch::AnyBit(0b1100)),
                 arg1: Some(ArgMatch::Eq(7)),
                 errno: libc::EPERM,
-                arg2: None,
                 extra_args: &[],
             }],
             SeccompAction::KillProcess,
@@ -836,7 +938,7 @@ mod tests {
     #[test]
     fn test_builtin_namespace_creation_returns_eperm() {
         // Nested sandboxes (bwrap, unshare -U) must see EPERM, not SIGSYS.
-        let rules = crate::security::SeccompManager::minimal_filter_for_test(false, &[]);
+        let rules = crate::security::SeccompManager::minimal_filter_for_test(false, &[], false);
         let prog = compile_bitmap_bpf_with_errno_syscalls(
             rules,
             crate::security::SeccompManager::errno_denied_syscalls_for_test(),
@@ -880,7 +982,7 @@ mod tests {
 
     #[test]
     fn test_builtin_clone3_returns_enosys() {
-        let rules = crate::security::SeccompManager::minimal_filter_for_test(true, &[]);
+        let rules = crate::security::SeccompManager::minimal_filter_for_test(true, &[], false);
         assert!(
             !rules.contains_key(&libc::SYS_clone3),
             "clone3 must not be in the unconditional allow bitmap"
@@ -903,7 +1005,8 @@ mod tests {
     // The requests must preserve all argument checks and network-mode gates.
     fn network_and_futex_program(network: bool) -> BpfProgram {
         let extra = ["futex", "socket", "socketpair", "setsockopt"].map(String::from);
-        let rules = crate::security::SeccompManager::minimal_filter_for_test(network, &extra);
+        let rules =
+            crate::security::SeccompManager::minimal_filter_for_test(network, &extra, false);
         compile_bitmap_bpf(
             rules,
             SeccompAction::KillProcess,
@@ -1018,7 +1121,7 @@ mod tests {
 
     #[test]
     fn test_builtin_prctl_cap_ambient_only_allows_is_set() {
-        let rules = crate::security::SeccompManager::minimal_filter_for_test(true, &[]);
+        let rules = crate::security::SeccompManager::minimal_filter_for_test(true, &[], false);
         assert!(
             rules
                 .get(&libc::SYS_prctl)
@@ -1077,121 +1180,6 @@ mod tests {
     }
 
     #[test]
-    fn test_builtin_prctl_allows_pr_set_vma_anon_name() {
-        // V8 and abseil name every anonymous region they map (Node 26 calls
-        // this during startup); killing it took down every Node 26 workload
-        // with SIGSYS before user code ran.
-        let rules = crate::security::SeccompManager::minimal_filter_for_test(true, &[]);
-        let prog = compile_bitmap_bpf_with_errno_syscalls(
-            rules,
-            crate::security::SeccompManager::errno_denied_syscalls_for_test(),
-            SeccompAction::KillProcess,
-            SeccompAction::Allow,
-            TargetArch::x86_64,
-        )
-        .unwrap();
-
-        // uapi: PR_SET_VMA = 0x53564d41 ("SVMA"), PR_SET_VMA_ANON_NAME = 0.
-        const PR_SET_VMA: u64 = 0x5356_4d41;
-        let name_vma = make_seccomp_data(
-            libc::SYS_prctl as u32,
-            AUDIT_ARCH_X86_64,
-            [PR_SET_VMA, 0, 0x1000, 4096, 0x7f00_0000_dead, 0],
-        );
-        assert_eq!(bpf_eval(&prog, &name_vma), RET_ALLOW);
-
-        // Only the ANON_NAME (0) subcommand is allowed; PR_SET_VMA_ANON_VMA
-        // (1) and unknown subcommands still hit the default deny.
-        for subcommand in [1u64, 2] {
-            let data = make_seccomp_data(
-                libc::SYS_prctl as u32,
-                AUDIT_ARCH_X86_64,
-                [PR_SET_VMA, subcommand, 0, 0, 0, 0],
-            );
-            assert_eq!(
-                bpf_eval(&prog, &data),
-                RET_KILL,
-                "PR_SET_VMA subcommand {} must be denied",
-                subcommand
-            );
-        }
-    }
-
-    #[test]
-    fn test_io_uring_degrades_to_enosys_unless_opted_in() {
-        // libuv (Node >= 26) probes io_uring once per event loop at startup
-        // and falls back to its thread pool on ENOSYS; the default KillProcess
-        // took every Node 26 workload down with SIGSYS before user code ran.
-        use crate::security::SeccompManager;
-        let default = SeccompManager::compile_builtin(false, &[], false).unwrap();
-        let eval = |prog: &BpfProgram, nr: i64, prot: u64| {
-            bpf_eval(
-                prog,
-                &make_seccomp_data(
-                    nr as u32,
-                    arch_audit_value(std::env::consts::ARCH.try_into().unwrap()),
-                    [0, 4096, prot, 0, 0, 0],
-                ),
-            )
-        };
-        const PROT_RWX: u64 = (libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC) as u64;
-        for nr in [
-            libc::SYS_io_uring_setup,
-            libc::SYS_io_uring_enter,
-            libc::SYS_io_uring_register,
-        ] {
-            assert_eq!(
-                eval(&default, nr, 0),
-                libc::SECCOMP_RET_ERRNO | libc::ENOSYS as u32,
-                "io_uring syscall {nr} must degrade to ENOSYS, not SIGSYS"
-            );
-        }
-
-        // Opting in suppresses the override and yields the real syscall.
-        let extra = ["io_uring_setup", "io_uring_enter", "io_uring_register"].map(String::from);
-        let opted_in = SeccompManager::compile_builtin(false, &extra, false).unwrap();
-        for nr in [
-            libc::SYS_io_uring_setup,
-            libc::SYS_io_uring_enter,
-            libc::SYS_io_uring_register,
-        ] {
-            assert_eq!(eval(&opted_in, nr, 0), RET_ALLOW);
-        }
-
-        // capget (own credentials, read-only) is probed by Node 26 at
-        // startup and must be allowed by default.
-        assert_eq!(eval(&default, libc::SYS_capget, 0), RET_ALLOW);
-        // capset mutates credentials and stays denied.
-        assert_eq!(eval(&default, libc::SYS_capset, 0), RET_KILL);
-
-        // The Node >= 26 runbook: V8 needs its whole code range RWX (there
-        // is no degrade path — V8 fatals on any other errno), so the default
-        // filter returns ENOMEM, the only errno base::OS::SetPermissions
-        // accepts, and --seccomp-allow mmap/mprotect lifts the mask.
-        for nr in [libc::SYS_mmap, libc::SYS_mprotect, libc::SYS_pkey_mprotect] {
-            assert_eq!(
-                eval(&default, nr, PROT_RWX),
-                libc::SECCOMP_RET_ERRNO | libc::ENOMEM as u32,
-                "W^X request on {nr} must degrade to ENOMEM, not SIGSYS"
-            );
-        }
-        let rwx = ["mmap", "mprotect"].map(String::from);
-        let node26 = SeccompManager::compile_builtin(false, &rwx, false).unwrap();
-        assert_eq!(eval(&node26, libc::SYS_mmap, PROT_RWX), RET_ALLOW);
-        assert_eq!(eval(&node26, libc::SYS_mprotect, PROT_RWX), RET_ALLOW);
-        // The lift is per-syscall: pkey_mprotect keeps the mask.
-        assert_eq!(
-            eval(&node26, libc::SYS_pkey_mprotect, PROT_RWX),
-            libc::SECCOMP_RET_ERRNO | libc::ENOMEM as u32
-        );
-        // Ordinary protections are unaffected either way.
-        assert_eq!(
-            eval(&node26, libc::SYS_mprotect, libc::PROT_WRITE as u64),
-            RET_ALLOW
-        );
-    }
-
-    #[test]
     fn hardened_mapping_transfer_and_gpu_rules_survive_compilation() {
         use crate::security::SeccompManager;
         let action = |prog: &BpfProgram, nr: i64, args: [u64; 6]| {
@@ -1216,30 +1204,22 @@ mod tests {
             "kcmp",
         ]
         .map(String::from);
-        let gpu = SeccompManager::compile_builtin(false, &extra, true).unwrap();
+        let gpu = SeccompManager::compile_builtin(false, &extra, true, false).unwrap();
         let custom = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(custom.path(), r#"{"defaultAction":"SCMP_ACT_KILL_PROCESS","architectures":[],"syscalls":[{"names":["mmap","mprotect","pkey_mprotect","shmat","personality","prctl","ioctl","mknodat","kcmp"],"action":"SCMP_ACT_ALLOW"}]}"#).unwrap();
-        let profile = SeccompManager::compile_profile(custom.path(), None).unwrap();
-        for (prog_idx, prog) in [&gpu, &profile].iter().enumerate() {
-            // W^X is still a hard invariant for the built-in mask (only the
-            // ENOMEM errno changed so probing runtimes degrade instead of
-            // dying with SIGSYS). The gpu program opted into mmap and
-            // pkey_mprotect via --seccomp-allow, which lifts the mask for
-            // exactly those two; the custom profile keeps every mask.
-            let is_gpu = prog_idx == 0;
+        let profile = SeccompManager::compile_profile(custom.path(), None, false).unwrap();
+        for prog in [&gpu, &profile] {
             for nr in [libc::SYS_mmap, libc::SYS_mprotect, libc::SYS_pkey_mprotect] {
-                let lifted = is_gpu && nr != libc::SYS_mprotect;
                 for (prot, expected) in [
                     (libc::PROT_READ | libc::PROT_WRITE, RET_ALLOW),
                     (libc::PROT_READ | libc::PROT_EXEC, RET_ALLOW),
+                    // Refused, but with the errno the kernel uses for the
+                    // same denial, not a kill (#46).
                     (
                         libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
-                        if lifted {
-                            RET_ALLOW
-                        } else {
-                            libc::SECCOMP_RET_ERRNO | libc::ENOMEM as u32
-                        },
+                        WX_REFUSED,
                     ),
+                    (libc::PROT_WRITE | libc::PROT_EXEC, WX_REFUSED),
                 ] {
                     assert_eq!(action(prog, nr, [0, 4096, prot as u64, 0, 0, 0]), expected);
                 }
@@ -1333,7 +1313,7 @@ mod tests {
             );
         }
         for network in [false, true] {
-            let default = SeccompManager::compile_builtin(network, &[], false).unwrap();
+            let default = SeccompManager::compile_builtin(network, &[], false, false).unwrap();
             for nr in [
                 libc::SYS_splice,
                 libc::SYS_tee,
@@ -1347,10 +1327,129 @@ mod tests {
                 assert_eq!(action(&gpu, nr, [0; 6]), RET_ALLOW);
             }
             for nr in [libc::SYS_mknodat, libc::SYS_kcmp] {
-                assert_eq!(action(&default, nr, [0; 6]), RET_KILL);
+                // #45: opt-in syscalls that were not requested degrade to
+                // ENOSYS instead of SIGSYS; both are argument-filtered when
+                // they are requested via --seccomp-allow.
+                assert_eq!(
+                    action(&default, nr, [0; 6]),
+                    libc::SECCOMP_RET_ERRNO | libc::ENOSYS as u32
+                );
+                // Requested (the `gpu` program opts in) they keep their
+                // argument-filtered allow: mode/type predicates apply.
+                assert_eq!(action(&gpu, nr, [0; 6]), RET_ALLOW);
             }
         }
         assert_eq!(action(&gpu, libc::SYS_pidfd_getfd, [0; 6]), RET_KILL);
+    }
+
+    /// The verdict for a mapping request that is writable and executable.
+    const WX_REFUSED: u32 = libc::SECCOMP_RET_ERRNO | libc::EACCES as u32;
+
+    #[test]
+    fn node_startup_probes_are_allowed_by_default() {
+        // V8 and abseil name every anonymous region they map, and libuv
+        // reads its own capability sets; Node 26 does both before user code
+        // runs, and either one used to end in SIGSYS.
+        use crate::security::SeccompManager;
+        let default = SeccompManager::compile_builtin(false, &[], false, false).unwrap();
+        let action = |nr: i64, args: [u64; 6]| {
+            bpf_eval(
+                &default,
+                &make_seccomp_data(
+                    nr as u32,
+                    arch_audit_value(std::env::consts::ARCH.try_into().unwrap()),
+                    args,
+                ),
+            )
+        };
+        // uapi: PR_SET_VMA = 0x53564d41 ("SVMA"), PR_SET_VMA_ANON_NAME = 0.
+        const PR_SET_VMA: u64 = 0x5356_4d41;
+        assert_eq!(
+            action(
+                libc::SYS_prctl,
+                [PR_SET_VMA, 0, 0x1000, 4096, 0x7f00_0000_dead, 0]
+            ),
+            RET_ALLOW
+        );
+        // Only the naming subcommand is allowed.
+        for subcommand in [1, 2] {
+            assert_eq!(
+                action(libc::SYS_prctl, [PR_SET_VMA, subcommand, 0, 0, 0, 0]),
+                RET_KILL
+            );
+        }
+        assert_eq!(action(libc::SYS_capget, [0; 6]), RET_ALLOW);
+        // capset changes credentials and stays denied.
+        assert_eq!(action(libc::SYS_capset, [0; 6]), RET_KILL);
+    }
+
+    #[test]
+    fn jit_allowance_permits_wx_mappings_and_survives_profiles() {
+        use crate::security::SeccompManager;
+        let action = |prog: &BpfProgram, nr: i64, args: [u64; 6]| {
+            bpf_eval(
+                prog,
+                &make_seccomp_data(
+                    nr as u32,
+                    arch_audit_value(std::env::consts::ARCH.try_into().unwrap()),
+                    args,
+                ),
+            )
+        };
+        let rwx = libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC;
+        let jit = SeccompManager::compile_builtin(true, &[], false, true).unwrap();
+        let strict = SeccompManager::compile_builtin(true, &[], false, false).unwrap();
+
+        // V8 manages its code range through mprotect/pkey_mprotect and maps
+        // RWX during startup; the allowance keeps those calls alive instead
+        // of SIGSYS (#46).
+        for nr in [libc::SYS_mmap, libc::SYS_mprotect, libc::SYS_pkey_mprotect] {
+            assert_eq!(action(&jit, nr, [0, 4096, rwx as u64, 0, 0, 0]), RET_ALLOW);
+        }
+        for nr in [libc::SYS_mmap, libc::SYS_mprotect] {
+            assert_eq!(
+                action(&strict, nr, [0, 4096, rwx as u64, 0, 0, 0]),
+                WX_REFUSED
+            );
+        }
+        // Without the allowance pkey_mprotect is an un-requested opt-in
+        // syscall, which reports ENOSYS whatever its arguments (#45).
+        assert_eq!(
+            action(
+                &strict,
+                libc::SYS_pkey_mprotect,
+                [0, 4096, rwx as u64, 0, 0, 0]
+            ),
+            libc::SECCOMP_RET_ERRNO | libc::ENOSYS as u32
+        );
+        // The allowance grants no other memory escape hatch.
+        assert_eq!(
+            action(
+                &jit,
+                libc::SYS_shmat,
+                [0, 0, libc::SHM_EXEC as u64, 0, 0, 0]
+            ),
+            RET_KILL
+        );
+        assert_eq!(action(&jit, libc::SYS_memfd_create, [0; 6]), RET_KILL);
+
+        // The same relaxation reaches custom profiles: with the allowance a
+        // listed mprotect stays unconditional, without it the built-in W^X
+        // argument filters are merged in (SEC-01).
+        let custom = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(custom.path(), r#"{"defaultAction":"SCMP_ACT_KILL_PROCESS","architectures":[],"syscalls":[{"names":["mmap","mprotect"],"action":"SCMP_ACT_ALLOW"}]}"#).unwrap();
+        let profile_jit = SeccompManager::compile_profile(custom.path(), None, true).unwrap();
+        let profile_strict = SeccompManager::compile_profile(custom.path(), None, false).unwrap();
+        for nr in [libc::SYS_mmap, libc::SYS_mprotect] {
+            assert_eq!(
+                action(&profile_jit, nr, [0, 4096, rwx as u64, 0, 0, 0]),
+                RET_ALLOW
+            );
+            assert_eq!(
+                action(&profile_strict, nr, [0, 4096, rwx as u64, 0, 0, 0]),
+                WX_REFUSED
+            );
+        }
     }
 
     #[test]
@@ -1366,7 +1465,7 @@ mod tests {
                 ),
             )
         };
-        let network = SeccompManager::compile_builtin(true, &[], false).unwrap();
+        let network = SeccompManager::compile_builtin(true, &[], false, false).unwrap();
         let setsockopt = |level: i64, option: i64| {
             action(
                 &network,
@@ -1430,15 +1529,126 @@ mod tests {
             assert_eq!(action(&network, nr, args), RET_KILL);
         }
 
-        // Without network mode the filtered network syscalls stay denied.
-        let offline = SeccompManager::compile_builtin(false, &[], false).unwrap();
+        // Without network mode setsockopt stays denied, but the send/recv
+        // transfer entry points are argument-filtered in every mode: local
+        // IPC is available with networking denied, so Unix datagram users
+        // (Codex's signal thread) survive; only MSG_OOB stays denied (#45).
+        let offline = SeccompManager::compile_builtin(false, &[], false, false).unwrap();
         assert_eq!(action(&offline, libc::SYS_setsockopt, [0; 6]), RET_KILL);
-        assert_eq!(action(&offline, libc::SYS_sendto, [0; 6]), RET_KILL);
+        for (nr, flags_arg) in [
+            (libc::SYS_sendto, 3),
+            (libc::SYS_recvfrom, 3),
+            (libc::SYS_sendmsg, 2),
+            (libc::SYS_recvmsg, 2),
+        ] {
+            let mut args = [0u64; 6];
+            assert_eq!(action(&offline, nr, args), RET_ALLOW);
+            args[flags_arg] = libc::MSG_OOB as u64;
+            assert_eq!(action(&offline, nr, args), RET_KILL);
+        }
+        // Network sockets themselves still cannot be created offline.
+        let mut inet = [0u64; 6];
+        inet[0] = libc::AF_INET as u64;
+        inet[1] = libc::SOCK_STREAM as u64;
+        assert_eq!(action(&offline, libc::SYS_socket, inet), RET_KILL);
+    }
+
+    #[test]
+    fn unrequested_opt_in_syscalls_degrade_to_enosys_not_sigsys() {
+        // #45: an opt-in syscall that was not requested through
+        // --seccomp-allow must not kill the process. ENOSYS is what a kernel
+        // without the syscall returns, so probing runtimes and libc fall
+        // back or report a normal error instead of dying with SIGSYS:
+        // inotify watchers, extended attribute writes, pidfds (Go, tokio), protection keys (V8), libuv's io_uring probe,
+        // and the splice-family transfers.
+        use crate::security::SeccompManager;
+        let action = |prog: &BpfProgram, nr: i64, args: [u64; 6]| {
+            bpf_eval(
+                prog,
+                &make_seccomp_data(
+                    nr as u32,
+                    arch_audit_value(std::env::consts::ARCH.try_into().unwrap()),
+                    args,
+                ),
+            )
+        };
+        let default = SeccompManager::compile_builtin(false, &[], false, false).unwrap();
+        let enosys = libc::SECCOMP_RET_ERRNO | libc::ENOSYS as u32;
+        let probes = [
+            ("inotify_init1", libc::SYS_inotify_init1),
+            ("setxattr", libc::SYS_setxattr),
+            ("pkey_alloc", libc::SYS_pkey_alloc),
+            ("timer_create", libc::SYS_timer_create),
+            ("pidfd_open", libc::SYS_pidfd_open),
+            ("sysinfo", libc::SYS_sysinfo),
+            ("setpriority", libc::SYS_setpriority),
+            ("setrlimit", libc::SYS_setrlimit),
+            ("io_uring_setup", libc::SYS_io_uring_setup),
+            ("io_cancel", libc::SYS_io_cancel),
+            ("splice", libc::SYS_splice),
+        ];
+        for (name, nr) in probes {
+            assert_eq!(
+                action(&default, nr, [0; 6]),
+                enosys,
+                "{name} must degrade to ENOSYS when not opted in"
+            );
+        }
+
+        // The calls ordinary tools need in order to work, not merely to
+        // survive, are allowed by default: timestamps (`touch`, `tar`,
+        // `cp -p`, `make`), creat, fchmodat2 and read-only queries.
+        for name in [
+            "utimensat",
+            "creat",
+            "fchmodat2",
+            "getsid",
+            "getpriority",
+            "sched_getattr",
+            "sched_get_priority_max",
+        ] {
+            let Some(nr) = crate::security::seccomp::syscall_number_for_test(name) else {
+                continue; // not present on this architecture
+            };
+            assert_eq!(
+                action(&default, nr, [0; 6]),
+                RET_ALLOW,
+                "{name} must be allowed by default"
+            );
+        }
+        // Their mutating siblings stay opt-in.
+        for nr in [libc::SYS_setpriority, libc::SYS_sched_setattr] {
+            assert_eq!(action(&default, nr, [0; 6]), enosys);
+        }
+
+        // Opting in suppresses the override and yields the real syscall.
+        let extra: Vec<String> = probes.iter().map(|(name, _)| name.to_string()).collect();
+        let opted_in = SeccompManager::compile_builtin(false, &extra, false, false).unwrap();
+        for (_, nr) in probes {
+            assert_eq!(action(&opted_in, nr, [0; 6]), RET_ALLOW);
+        }
+
+        // The security boundary is untouched: security-critical, privileged
+        // and non-opt-in syscalls keep the KILL_PROCESS default, and the
+        // clone3 fallback still returns ENOSYS so libc falls back to the
+        // filtered clone path.
+        for nr in [libc::SYS_add_key, libc::SYS_ptrace, libc::SYS_bpf] {
+            assert_eq!(action(&default, nr, [0; 6]), RET_KILL);
+        }
+        assert_eq!(action(&default, libc::SYS_clone3, [0; 6]), enosys);
+
+        // The deny fallback stays a bitmap dispatch: the whole-syscall
+        // ENOSYS set must not turn the program into a linear scan.
+        assert!(
+            default.len() < 700,
+            "built-in BPF program should stay compact, got {} instructions",
+            default.len()
+        );
     }
 
     #[test]
     fn test_builtin_prctl_denies_pr_set_mm_before_capability_checks() {
-        let rules = crate::security::SeccompManager::minimal_filter_for_test(true, &[]);
+        let rules = crate::security::SeccompManager::minimal_filter_for_test(true, &[], false);
         let prog = compile_bitmap_bpf_with_errno_syscalls(
             rules,
             crate::security::SeccompManager::errno_denied_syscalls_for_test(),
@@ -1468,7 +1678,7 @@ mod tests {
 
     #[test]
     fn test_builtin_ioctl_allows_tcgets2_for_shell_terminal_probe() {
-        let rules = crate::security::SeccompManager::minimal_filter_for_test(true, &[]);
+        let rules = crate::security::SeccompManager::minimal_filter_for_test(true, &[], false);
         let prog = compile_bitmap_bpf_with_errno_syscalls(
             rules,
             crate::security::SeccompManager::errno_denied_syscalls_for_test(),
@@ -1495,7 +1705,7 @@ mod tests {
 
     #[test]
     fn test_preadv2_pwritev2_deny_nonzero_flags() {
-        let rules = crate::security::SeccompManager::minimal_filter_for_test(true, &[]);
+        let rules = crate::security::SeccompManager::minimal_filter_for_test(true, &[], false);
         for syscall in [libc::SYS_preadv2, libc::SYS_pwritev2] {
             assert!(
                 rules.get(&syscall).is_some_and(|chain| !chain.is_empty()),
@@ -1577,7 +1787,7 @@ mod tests {
         // the same result as seccompiler's linear-scan BPF for many syscalls.
         use seccompiler::SeccompFilter;
 
-        let rules = crate::security::SeccompManager::minimal_filter_for_test(true, &[]);
+        let rules = crate::security::SeccompManager::minimal_filter_for_test(true, &[], false);
         let rules2 = rules.clone();
 
         // Linear-scan BPF (seccompiler)
@@ -1645,7 +1855,7 @@ mod tests {
 
     #[test]
     fn test_program_size_is_compact() {
-        let rules = crate::security::SeccompManager::minimal_filter_for_test(true, &[]);
+        let rules = crate::security::SeccompManager::minimal_filter_for_test(true, &[], false);
         let prog = compile_bitmap_bpf(
             rules,
             SeccompAction::KillProcess,
@@ -1708,7 +1918,7 @@ mod tests {
 
     #[test]
     fn test_all_jump_offsets_valid() {
-        let rules = crate::security::SeccompManager::minimal_filter_for_test(true, &[]);
+        let rules = crate::security::SeccompManager::minimal_filter_for_test(true, &[], false);
         let prog = compile_bitmap_bpf(
             rules,
             SeccompAction::KillProcess,

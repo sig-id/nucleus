@@ -7,36 +7,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `--allow-jit` (launch config `allow_jit`): a per-launch JIT allowance
+  for the native seccomp filter. JIT runtimes (V8/Node, JVM, PyPy, LuaJIT, .NET)
+  manage code ranges that are writable and executable at once; V8 has no
+  fallback for a denied RWX range, so under the default W^X policy no
+  Node workload gets as far as user code (#46). The allowance
+  permits write+execute mappings through `mmap`, `mprotect`, and
+  `pkey_mprotect` (no separate `--seccomp-allow pkey_mprotect` needed), keeps
+  every other memory guard enforced (executable `shmat` attachments,
+  `memfd_create`, device nodes), works with built-in and custom profiles, is
+  rejected under gVisor, and is recorded in the audit log and reported as
+  `security.allow_jit` in `container_started`/`container_summary` so callers
+  can attest the posture. W^X stays the default.
+
 ### Fixed
-- Node 26 (and every other V8 14 runtime: Electron, Chromium, Deno) died
-  with `SIGSYS` before any user code ran. The built-in seccomp profile now
-  handles the four syscalls V8/libuv touch at startup:
-  - `prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, ...)` (V8/abseil name every
-    region they map) is allowed, argument-filtered to the read-only
-    VMA-naming subcommand.
-  - `capget` is allowed by default: a read-only query of the caller's own
-    capabilities (querying another process still requires `CAP_SYS_PTRACE`).
-    `capset` stays denied.
-  - `io_uring_setup`/`io_uring_enter`/`io_uring_register` return `ENOSYS`
-    instead of killing: libuv probes io_uring once per event loop and falls
-    back to its thread pool, exactly as on a pre-5.1 kernel. io_uring stays
-    out of the default allowlist (documented attack surface); PostgreSQL 18+
-    and friends keep opting in via `--seccomp-allow` or a custom profile,
-    which suppresses the override.
-  - W^X violations (`mmap`/`mprotect`/`pkey_mprotect` with both
-    `PROT_WRITE` and `PROT_EXEC`) now return `ENOMEM` instead of `SIGSYS`.
-    V8 reserves its entire 512 MB code range RWX and fatals on any other
-    errno, so the W^X invariant itself is unchanged — no RWX mapping can be
-    created — but probing runtimes degrade instead of dying. Running V8
-    runtimes requires lifting the mask per syscall:
-    `nucleus run --seccomp-allow mmap --seccomp-allow mprotect -- node app.js`
-    (each lift is logged with a warning; `pkey_mprotect` is liftable the
-    same way). Without it Node 26 now exits with V8's actionable
-    "Failed to reserve virtual memory for CodeRange" message instead of an
-    unexplained core dump.
-- `ErrnoRule` (the seccomp errno-override mechanism) can now test argument 2
-  and repeat tests on one argument, which is how the W^X (both
-  `PROT_WRITE` and `PROT_EXEC` set) denial is expressed.
+- Node 26 (V8 14) starts under the built-in seccomp filter. Its startup made
+  two calls that ended in `SIGSYS` before user code ran:
+  `prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME)`, which V8 and abseil use to name
+  every anonymous region they map, is now allowed, argument-filtered to the
+  naming subcommand; and `capget`, a read-only query, is allowed by default
+  (`capset` stays denied). V8 also needs `--allow-jit`.
+- A mapping request that is writable and executable at once now fails with
+  `EACCES` instead of killing the process (#46). The rule is unchanged: no
+  such mapping can be created without `--allow-jit`. `EACCES` is what the
+  kernel returns for the same denial under SELinux `execmem` or
+  `PR_SET_MDWE`, so a JIT runtime started without the allowance reports the
+  refusal (the JVM prints "Failed to mark memory page as executable") where
+  it used to leave only a core dump.
+- The strict-agent native seccomp profile no longer kills the workload with
+  `SIGSYS` when it probes an opt-in syscall that was not requested with
+  `--seccomp-allow` (#45). Un-requested opt-in calls now return `ENOSYS`,
+  indistinguishable from a kernel that lacks the call, so runtimes and libc
+  fall back or report a normal error: Codex's config watcher (`inotify_init1`),
+  Go's and tokio's `pidfd_open`,
+  V8's `pkey_alloc`, libuv's `io_uring_setup` probe (Node 22+/26+),
+  `sysinfo`, and the `splice`/`tee`/`sendfile` transfers that already
+  degraded this way. `SECURITY_CRITICAL_DENIED_SYSCALLS` and
+  `PRIVILEGED_SYSCALLS` keep the `KILL_PROCESS` default. The whole-syscall
+  `ENOSYS` denials compile into a second bitmap, so the filter's O(1)
+  dispatch is unchanged, and a syscall that is both unconditionally allowed
+  and unconditionally denied is now rejected at compile time.
+- File timestamps work by default (#45). An `ENOSYS` keeps a process alive,
+  but `touch`, `tar x`, `cp -p`, `make` and `git` still failed without
+  `utimensat`. It and its legacy forms (`utimes`, `utime`, `futimesat`),
+  `creat`, `fchmodat2` and the read-only queries `getsid`, `getpriority`,
+  `sched_getattr`, `sched_get_priority_max`/`min` and `sched_rr_get_interval`
+  moved from the opt-in list to the default allowlist. Each is a read-only
+  query or equivalent to a call the default list already allowed.
+- `sendto`, `recvfrom`, `sendmsg` and `recvmsg` are argument-filtered in
+  every network mode instead of being killed with networking denied
+  (#45). Socket creation is already family-filtered per mode, so the
+  transfer calls add no reach beyond `read`/`write` on descriptors the
+  workload already holds; Unix datagram IPC (Codex's signal thread) keeps
+  working under `network = none`. `MSG_OOB` stays denied everywhere and
+  `setsockopt` remains network-only.
+- `--seccomp-allow sync_file_range` and `--seccomp-allow io_cancel` were
+  rejected as unknown syscall names because both were missing from the
+  name-to-number table while already being on the opt-in list; production
+  mode failed the launch outright (#45).
 
 ## [0.6.0] - 2026-11-19
 
