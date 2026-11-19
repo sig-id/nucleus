@@ -316,8 +316,44 @@ impl SeccompManager {
             libc::SYS_signalfd,
         ]);
 
+        // Resolved by name because several of these exist only on x86_64.
+        syscalls.extend(
+            Self::DEFAULT_COMPATIBILITY_SYSCALLS
+                .iter()
+                .filter_map(|name| syscall_name_to_number(name)),
+        );
+
         syscalls
     }
+
+    /// Former opt-in syscalls that ordinary developer tools need to work, not
+    /// merely to survive (#45): an `ENOSYS` keeps the process alive, but
+    /// `touch`, `tar x`, `cp -p`, `make` and `git` still fail without the
+    /// timestamp calls. Each entry is either a read-only query of the
+    /// caller's own namespace or equivalent to a syscall the base list
+    /// already allows, so it grants no new reach:
+    ///
+    /// - `utimensat`/`utimes`/`utime`/`futimesat`: timestamps on files the
+    ///   caller may already write (same DAC check as `write`).
+    /// - `creat`: `openat(O_CREAT|O_WRONLY|O_TRUNC)`, same LSM hooks.
+    /// - `fchmodat2`: `fchmodat` with a flags word (glibc >= 2.39).
+    /// - `getsid`, `getpriority`, `sched_get_priority_*`,
+    ///   `sched_rr_get_interval`, `sched_getattr`: read-only, confined to
+    ///   the PID namespace, siblings of queries already allowed.
+    const DEFAULT_COMPATIBILITY_SYSCALLS: &'static [&'static str] = &[
+        "utimensat",
+        "utimes",
+        "utime",
+        "futimesat",
+        "creat",
+        "fchmodat2",
+        "getsid",
+        "getpriority",
+        "sched_get_priority_max",
+        "sched_get_priority_min",
+        "sched_rr_get_interval",
+        "sched_getattr",
+    ];
 
     // Linux takes these syscall arguments as int, including when a caller
     // supplies nonzero upper bits in the 64-bit seccomp argument slots.
@@ -479,27 +515,37 @@ impl SeccompManager {
                 setsockopt_rules.push(Self::int_rule(&[(1, Eq, level), (2, Ne, option)])?);
             }
             rules.insert(libc::SYS_setsockopt, setsockopt_rules);
+        }
 
-            // Out-of-band data stays denied: MSG_OOB reaches TCP urgent-data
-            // handling and, on AF_UNIX, the same descriptor-heavy paths as
-            // ordinary data. It is filtered on the flags argument; passing
-            // descriptors with SCM_RIGHTS on AF_UNIX is not seccomp-filterable
-            // and remains an accepted residual risk.
-            for (nr, flags_arg) in [
-                (libc::SYS_sendto, 3),
-                (libc::SYS_recvfrom, 3),
-                (libc::SYS_sendmsg, 2),
-                (libc::SYS_recvmsg, 2),
-            ] {
-                rules.insert(
-                    nr,
-                    vec![Self::int_rule(&[(
-                        flags_arg,
-                        MaskedEq(libc::MSG_OOB as u64),
-                        0,
-                    )])?],
-                );
-            }
+        // Out-of-band data stays denied: MSG_OOB reaches TCP urgent-data
+        // handling and, on AF_UNIX, the same descriptor-heavy paths as
+        // ordinary data. It is filtered on the flags argument; passing
+        // descriptors with SCM_RIGHTS on AF_UNIX is not seccomp-filterable
+        // and remains an accepted residual risk.
+        //
+        // These transfer entry points are argument-filtered in every network
+        // mode, not only when networking is enabled (#45). socket() creation
+        // is already family-filtered per mode — with networking denied a
+        // workload can only hold AF_UNIX descriptors — so sendto/recvfrom/
+        // sendmsg/recvmsg add no reach beyond read/write on descriptors the
+        // workload already holds, while killing them took down agent
+        // tooling that uses Unix datagram sockets under network = none
+        // (Codex's signal thread recvfrom'd its notification socket and died
+        // with SIGSYS before running any command).
+        for (nr, flags_arg) in [
+            (libc::SYS_sendto, 3),
+            (libc::SYS_recvfrom, 3),
+            (libc::SYS_sendmsg, 2),
+            (libc::SYS_recvmsg, 2),
+        ] {
+            rules.insert(
+                nr,
+                vec![Self::int_rule(&[(
+                    flags_arg,
+                    MaskedEq(libc::MSG_OOB as u64),
+                    0,
+                )])?],
+            );
         }
         rules.insert(libc::SYS_socket, socket_rules);
 
@@ -942,17 +988,44 @@ impl SeccompManager {
             ioctl.push(Self::int_rule(&[(1, Gt, 0x56ff)])?);
             info!("GPU mode: permitting driver ioctls with legacy tty and console filtering");
         }
-        // Programs probe these transfer syscalls and fall back to read/write
-        // on ENOSYS. Killing the process would break ordinary file copies.
+        // An opt-in syscall that was not requested is refused with ENOSYS
+        // instead of SIGSYS (#45). The opt-in set is, by construction, calls
+        // Nucleus considers safe to allow; killing an agent workload that
+        // merely probes one — inotify_init1 watchers, utimensat timestamps
+        // from `touch`/`tar`/`git`, pidfd_open from Go and tokio, pkey_alloc
+        // from V8, libuv's io_uring_setup probe — left only an opaque kernel
+        // audit record, while ENOSYS is indistinguishable from a kernel that
+        // lacks the call, so runtimes and libc fall back or report a normal
+        // error. Docker's default profile returns EPERM for every disallowed
+        // call, and #35 made the same change for nested namespace creation.
+        // SECURITY_CRITICAL_DENIED_SYSCALLS and PRIVILEGED_SYSCALLS keep the
+        // KILL_PROCESS default: their deny is the security boundary, not a
+        // capability probe. Requesting a name via --seccomp-allow (or a
+        // custom profile that lists it) suppresses the override and yields
+        // the real syscall. This generalizes the previous splice/tee/sendfile
+        // special case, which is why those transfers still degrade to
+        // read/write loops when not requested.
         let mut errno_rules = Self::errno_denied_syscalls().to_vec();
-        for nr in [libc::SYS_splice, libc::SYS_tee, SYS_SENDFILE] {
-            if !rules.contains_key(&nr) {
-                errno_rules.push(ErrnoRule {
-                    nr,
-                    arg0: None,
-                    arg1: None,
-                    errno: libc::ENOSYS,
-                });
+        let mut opt_in_names: Vec<String> = Self::OPT_IN_SYSCALLS
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+        opt_in_names.extend(Self::opt_in_arg_filtered());
+        opt_in_names.sort();
+        opt_in_names.dedup();
+        for name in &opt_in_names {
+            // Every opt-in name must have a number mapping; a unit test
+            // enforces it so a new list entry cannot silently lose its
+            // errno override again (the sync_file_range gap from #45).
+            if let Some(nr) = syscall_name_to_number(name) {
+                if !rules.contains_key(&nr) {
+                    errno_rules.push(ErrnoRule {
+                        nr,
+                        arg0: None,
+                        arg1: None,
+                        errno: libc::ENOSYS,
+                    });
+                }
             }
         }
         Self::compile_rules(rules, &errno_rules)
@@ -1216,8 +1289,11 @@ impl SeccompManager {
     const KCMP_FILE: i32 = 0;
 
     /// Argument-filtered syscalls that are only available in network modes.
-    const NETWORK_ARG_FILTERED_SYSCALLS: &'static [&'static str] =
-        &["setsockopt", "sendto", "recvfrom", "sendmsg", "recvmsg"];
+    /// The send/recv transfer entry points are argument-filtered in every
+    /// mode (see minimal_filter); setsockopt stays network-only because its
+    /// option levels reach protocol subsystems a confined workload never
+    /// needs.
+    const NETWORK_ARG_FILTERED_SYSCALLS: &'static [&'static str] = &["setsockopt"];
 
     /// Argument-filtered syscalls that are absent unless explicitly requested.
     fn opt_in_arg_filtered() -> Vec<String> {
@@ -1394,14 +1470,8 @@ impl SeccompManager {
         "name_to_handle_at",
         "io_cancel",
         "io_pgetevents",
-        "creat",
-        "fchmodat2",
         "statmount",
         "listmount",
-        "utimensat",
-        "utimes",
-        "utime",
-        "futimesat",
         // Extended attributes (write)
         "setxattr",
         "lsetxattr",
@@ -1419,14 +1489,9 @@ impl SeccompManager {
         // Scheduling (non-default)
         "sched_setparam",
         "sched_setscheduler",
-        "sched_get_priority_max",
-        "sched_get_priority_min",
-        "sched_rr_get_interval",
         "sched_setattr",
-        "sched_getattr",
         // Resource limits / priority
         "setrlimit",
-        "getpriority",
         "setpriority",
         "ioprio_set",
         "ioprio_get",
@@ -1452,7 +1517,6 @@ impl SeccompManager {
         "setfsuid",
         "setfsgid",
         "setgroups",
-        "getsid",
         // Capabilities (read-only query)
         "capget",
         // Signals (non-default)
@@ -1552,6 +1616,11 @@ use crate::security::seccomp_generate::{SeccompArgFilter, SeccompProfile};
 /// Map a syscall name (e.g. "read", "write") to its Linux syscall number.
 ///
 /// Covers the most common syscalls. Unknown names return None.
+#[cfg(test)]
+pub(super) fn syscall_number_for_test(name: &str) -> Option<i64> {
+    syscall_name_to_number(name)
+}
+
 fn syscall_name_to_number(name: &str) -> Option<i64> {
     match name {
         // File I/O
@@ -1630,6 +1699,7 @@ fn syscall_name_to_number(name: &str) -> Option<i64> {
         "copy_file_range" => Some(libc::SYS_copy_file_range),
         "splice" => Some(libc::SYS_splice),
         "tee" => Some(libc::SYS_tee),
+        "sync_file_range" => Some(libc::SYS_sync_file_range),
         // Memory
         "mmap" => Some(libc::SYS_mmap),
         "munmap" => Some(libc::SYS_munmap),
@@ -1779,6 +1849,7 @@ fn syscall_name_to_number(name: &str) -> Option<i64> {
         "io_destroy" => Some(libc::SYS_io_destroy),
         "io_submit" => Some(libc::SYS_io_submit),
         "io_getevents" => Some(libc::SYS_io_getevents),
+        "io_cancel" => Some(libc::SYS_io_cancel),
         // Timers
         "setitimer" => Some(libc::SYS_setitimer),
         "getitimer" => Some(libc::SYS_getitimer),
@@ -2196,15 +2267,19 @@ mod tests {
         let net = SeccompManager::network_mode_syscalls(true);
 
         // Include argument-filtered syscalls in the complete policy counts.
-        // vfork is x86_64-only in the syscall table.
+        // vfork is x86_64-only in the syscall table. #45 grew the counts
+        // twice: sendto/recvfrom/sendmsg/recvmsg are argument-filtered in
+        // every network mode (+4 offline), and DEFAULT_COMPATIBILITY_SYSCALLS
+        // joined the base list (+12 on x86_64; utimes, utime, futimesat and
+        // creat do not exist on the generic syscall table, so +8 elsewhere).
         #[cfg(target_arch = "x86_64")]
-        const BASE_COUNT: usize = 168;
+        const BASE_COUNT: usize = 180;
         #[cfg(not(target_arch = "x86_64"))]
-        const BASE_COUNT: usize = 167;
+        const BASE_COUNT: usize = 175;
         #[cfg(target_arch = "x86_64")]
-        const FULL_COUNT_OFFLINE: usize = 180;
+        const FULL_COUNT_OFFLINE: usize = 196;
         #[cfg(not(target_arch = "x86_64"))]
-        const FULL_COUNT_OFFLINE: usize = 179;
+        const FULL_COUNT_OFFLINE: usize = 191;
         assert_eq!(base.len(), BASE_COUNT);
         assert_eq!(net.len(), 5);
         assert_eq!(
@@ -2214,9 +2289,9 @@ mod tests {
             FULL_COUNT_OFFLINE
         );
         #[cfg(target_arch = "x86_64")]
-        const FULL_COUNT_NETWORK: usize = 190;
+        const FULL_COUNT_NETWORK: usize = 202;
         #[cfg(not(target_arch = "x86_64"))]
-        const FULL_COUNT_NETWORK: usize = 189;
+        const FULL_COUNT_NETWORK: usize = 197;
         assert_eq!(
             SeccompManager::minimal_filter(true, &[], false)
                 .unwrap()
@@ -2745,6 +2820,148 @@ mod tests {
             rules.contains_key(&libc::SYS_io_uring_setup),
             "io_uring_setup is in OPT_IN_SYSCALLS and must be added"
         );
+    }
+
+    #[test]
+    fn test_opt_in_syscall_names_all_map_to_numbers() {
+        // #45: every opt-in name must resolve through
+        // syscall_name_to_number. A name that does not makes
+        // `--seccomp-allow <name>` warn (or hard-fail in production mode)
+        // as unknown, and compile_builtin cannot install its ENOSYS
+        // fallback — the exact gap that hit sync_file_range and io_cancel.
+        let arg_filtered = SeccompManager::opt_in_arg_filtered();
+        let mut names: Vec<&str> = SeccompManager::OPT_IN_SYSCALLS.to_vec();
+        names.extend(arg_filtered.iter().map(String::as_str));
+        for name in names {
+            assert!(
+                syscall_name_to_number(name).is_some(),
+                "opt-in syscall '{name}' needs a syscall_name_to_number entry"
+            );
+        }
+    }
+
+    #[test]
+    fn test_seccomp_allow_sync_file_range_and_io_cancel_are_known() {
+        // Regression for #45: both names are on the opt-in list but were
+        // missing from syscall_name_to_number, so `--seccomp-allow
+        // sync_file_range` was rejected as an unknown syscall (a hard error
+        // in production mode) even though sync_file_range is base-allowed.
+        let extra = vec!["sync_file_range".to_string(), "io_cancel".to_string()];
+        SeccompManager::validate_extra_syscalls_for_production(true, &extra).unwrap();
+        let rules = SeccompManager::minimal_filter(true, &extra, false).unwrap();
+        // sync_file_range is base-allowed; requesting it is a harmless no-op.
+        assert!(rules.contains_key(&libc::SYS_sync_file_range));
+        // io_cancel is genuinely opt-in and is added on request.
+        assert!(rules.contains_key(&libc::SYS_io_cancel));
+    }
+
+    #[test]
+    fn test_transfer_syscalls_are_arg_filtered_in_every_network_mode() {
+        // #45: socket() creation is family-filtered per network mode, so the
+        // send/recv transfer entry points are argument-filtered everywhere —
+        // with networking denied a workload can only hold AF_UNIX
+        // descriptors, and killing recvfrom took down Codex's signal thread.
+        for network in [false, true] {
+            let rules = SeccompManager::minimal_filter(network, &[], false).unwrap();
+            for nr in [
+                libc::SYS_sendto,
+                libc::SYS_recvfrom,
+                libc::SYS_sendmsg,
+                libc::SYS_recvmsg,
+            ] {
+                assert!(
+                    rules.contains_key(&nr),
+                    "transfer syscall {nr} must be argument-filtered in every network mode"
+                );
+            }
+            // setsockopt reaches protocol subsystems and stays network-only.
+            assert_eq!(rules.contains_key(&libc::SYS_setsockopt), network);
+        }
+        // Requesting a transfer syscall via --seccomp-allow is a harmless
+        // no-op in both modes now that the filters are unconditional.
+        SeccompManager::validate_extra_syscalls_for_production(
+            false,
+            &["recvfrom".to_string(), "sendto".to_string()],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn kernel_returns_enosys_for_unrequested_opt_in_syscall() {
+        // #45, enforced by the real kernel: a workload probing an opt-in
+        // syscall that was not requested gets ENOSYS and keeps running,
+        // while a non-opt-in syscall still kills the process with SIGSYS.
+        // Runs in fork children so the filter never touches the test runner.
+        use nix::sys::signal::Signal;
+        use nix::sys::wait::{waitpid, WaitStatus};
+        use nix::unistd::{fork, pipe, read, write, ForkResult};
+
+        let program = SeccompManager::compile_builtin(false, &[], false, false).unwrap();
+
+        // Child 1: probe sysinfo (opt-in, not requested) and report the errno.
+        let (read_fd, write_fd) = pipe().unwrap();
+        // The child never returns from this match: it applies the filter,
+        // probes sysinfo, writes the report with raw syscalls and exits.
+        // SAFETY: fork in a test process; the child only runs direct
+        // syscalls and cannot unwind into state owned by other test threads.
+        match unsafe { fork() }.unwrap() {
+            ForkResult::Parent { child } => {
+                drop(write_fd);
+                let mut buf = [0u8; 2];
+                assert_eq!(read(&read_fd, &mut buf).unwrap(), 2);
+                drop(read_fd);
+                assert_eq!(
+                    waitpid(child, None).unwrap(),
+                    WaitStatus::Exited(child, 0),
+                    "the child must survive probing an un-requested opt-in syscall"
+                );
+                assert_eq!(buf[0], 0xff, "sysinfo must fail with -1, not succeed");
+                assert_eq!(
+                    i32::from(buf[1]),
+                    libc::ENOSYS,
+                    "sysinfo must fail with ENOSYS instead of SIGSYS"
+                );
+            }
+            ForkResult::Child => {
+                drop(read_fd);
+                SeccompManager::apply_bpf_program(&program, false).unwrap();
+                // SAFETY: libc::sysinfo is a POD struct of integers; zeroing
+                // it produces a valid value for the kernel to overwrite.
+                let mut info: libc::sysinfo = unsafe { std::mem::zeroed() };
+                // SAFETY: writes into the zeroed POD struct above; the call
+                // takes no pointers besides the struct reference.
+                let rc = unsafe { libc::sysinfo(&mut info) };
+                let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                let _ = write(&write_fd, &[rc as u8, errno as u8]);
+                drop(write_fd);
+                std::process::exit(0);
+            }
+        }
+
+        // Child 2: probe bpf (never opt-in-able) and must die with SIGSYS —
+        // the ENOSYS fallback must not soften the default deny boundary.
+        // SAFETY: fork in a test process; the child only issues the raw bpf
+        // syscall and cannot touch shared test state.
+        match unsafe { fork() }.unwrap() {
+            ForkResult::Parent { child } => {
+                assert!(
+                    matches!(
+                        waitpid(child, None).unwrap(),
+                        WaitStatus::Signaled(_, Signal::SIGSYS, _)
+                    ),
+                    "a non-opt-in syscall must still kill the process with SIGSYS"
+                );
+            }
+            ForkResult::Child => {
+                SeccompManager::apply_bpf_program(&program, false).unwrap();
+                // SAFETY: scalar arguments only; the filter is expected to
+                // kill this child with SIGSYS before the call returns.
+                unsafe {
+                    libc::syscall(libc::SYS_bpf, 0_u64, 0_u64, 0_u64);
+                };
+                std::process::exit(0);
+            }
+        }
     }
 
     #[test]
