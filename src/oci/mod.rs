@@ -700,6 +700,14 @@ impl OciHooks {
             )));
         }
 
+        if crate::filesystem::owner_unmapped(uid) {
+            return Err(NucleusError::HookError(format!(
+                "{} hook {} is owned by a user outside this user namespace – refusing to execute",
+                phase,
+                hook_path.display()
+            )));
+        }
+
         // Reject hooks owned by arbitrary UIDs – must be root or effective UID
         if uid != 0 && uid != effective_uid {
             return Err(NucleusError::HookError(format!(
