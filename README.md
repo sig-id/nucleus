@@ -300,6 +300,34 @@ and `--log <file>` keep full logging available.
 nucleus --events-fd 5 run --config-fd 4 4<request.json 5>events.jsonl
 ```
 
+**Held start.** `--start-fd FD` (launch config `start_fd`) gives `run` the
+create → verify → start split of OCI `create`/`start` without a second
+process or persisted state. After all setup is complete — namespaces, mounts,
+cgroup, dropped capabilities, seccomp, Landlock — Nucleus emits
+`container_started` and the container's init blocks reading one byte from the
+inherited descriptor, exactly like the OCI exec FIFO. The workload is exec'd
+only when the byte arrives, so an orchestrator can verify the reported
+posture (security status, limits, cgroup, mounts) before the workload's first
+instruction. If the descriptor reaches EOF instead, Nucleus tears the
+container down and exits non-zero without running the workload; the
+`container_summary` event carries a `Start gate closed` error. The gate works
+with `--config-fd`/`--events-fd`, must not share a descriptor with
+`--events-fd`, and is not available with `--detach`.
+
+```bash
+mkfifo gate
+exec 9<>gate   # hold the gate open read-write; a bare 4<gate would block
+nucleus --events-fd 5 run --start-fd 4 --config-fd 3 \
+  3<request.json 5>events.jsonl 4<&9 &
+# ... read container_started from events.jsonl, verify the posture ...
+printf go >&9                     # release the workload
+# refuse instead with: exec 9>&- (EOF, no byte)
+```
+
+The gate descriptor should be the read end of a pipe (or an equivalent
+one-byte readable descriptor); it must be greater than 2 and is inherited by
+the container's init, which closes it before exec'ing the workload.
+
 **No orphans.** The container dies with its supervisor. Every setup process
 arms a parent-death signal, so killing only the `nucleus` process (SIGKILL, OOM)
 takes the container's init, and with it the PID namespace or the gVisor
@@ -1356,7 +1384,7 @@ permissions must exclude group and other writes. Host root uses
 
 Use `--events-jsonl <path>` to write control-plane lifecycle events as JSON Lines, or `--events-fd <fd>` to write them to an inherited file descriptor. The stream is separate from workload stdout/stderr and PTY bytes; operators can consume it without parsing user process output. `--events-fd` rejects stdio descriptors and is not available with `--detach`; use `--events-jsonl` for detached containers. `--events-fd` also implies `--quiet`, so the container ID and informational logs stay off the workload's stdout and stderr.
 
-Events include a container start record and a final summary record. The records carry the container ID, PID, cgroup path, workspace/context mount, network mode, seccomp mode, Landlock status, capability status, resource limits, exit status, resource stats, and whether cleanup succeeded.
+Events include a container start record and a final summary record. The records carry the container ID, PID, cgroup path, workspace/context mount, network mode, seccomp mode, Landlock status, capability status, resource limits, exit status, resource stats, and whether cleanup succeeded. With `--start-fd`, `container_started` is written before the workload is released, and a refused start is reported in the summary's `exit_status.error` (see [Embedding in an Orchestrator](#embedding-in-an-orchestrator)).
 
 ## Additional Hardening Flags
 

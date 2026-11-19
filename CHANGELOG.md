@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `--start-fd FD` (launch config `start_fd`): an opt-in start gate for
+  `run`. After setup completes, Nucleus emits `container_started` and the
+  container's init blocks reading one byte from the inherited descriptor,
+  like the OCI exec FIFO; the workload execs only when the byte arrives, so
+  an orchestrator can verify the reported posture first. On EOF without a
+  byte the container is torn down and Nucleus exits non-zero without running
+  the workload (#42).
 - `--broker-proxy-listen 127.0.0.1:PORT` (launch config `broker_proxy_listen`)
   runs the broker forwarder in the supervisor. The container init binds the
   listener in its network namespace and hands it over with `SCM_RIGHTS`; the

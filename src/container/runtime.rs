@@ -33,7 +33,7 @@ use nix::unistd::{
     chown, fork, pipe, read, setresgid, setresuid, write, ForkResult, Gid, Pid, Uid,
 };
 use std::net::{SocketAddr, SocketAddrV4, TcpStream};
-use std::os::fd::OwnedFd;
+use std::os::fd::{OwnedFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -75,6 +75,9 @@ pub struct CreatedContainer {
     pub(super) trace_reader: Option<SeccompTraceReader>,
     pub(super) deny_logger: Option<SeccompDenyLogger>,
     pub(super) exec_fifo_path: Option<PathBuf>,
+    /// Read end of the start gate status pipe (`--start-fd`); `start()`
+    /// waits on it after emitting `container_started`.
+    pub(super) start_gate_reader: Option<OwnedFd>,
     outcome_reader: Option<OwnedFd>,
     mapped_gvisor_base: Option<PathBuf>,
     _landlock_handoff: Option<crate::security::landlock_handoff::LandlockHandoff>,
@@ -88,6 +91,40 @@ pub struct CreatedContainer {
 }
 
 const CREDENTIAL_BROKER_CONNECT_TIMEOUT: Duration = Duration::from_millis(750);
+
+/// Exit status the container init reports when the opt-in start gate
+/// (`--start-fd`) is closed without a release byte. Distinct from the
+/// workload's own exit codes so a supervisor can tell a refused start from a
+/// failed process; runc reserves 125 for the same purpose.
+pub(crate) const START_GATE_EXIT_CODE: i32 = 125;
+
+/// Child-side half of the opt-in start gate (`--start-fd`): the inherited
+/// release descriptor plus the write end of the pipe that reports the gate's
+/// outcome to the supervisor.
+pub(super) struct StartGate {
+    release_fd: RawFd,
+    status_writer: OwnedFd,
+}
+
+impl StartGate {
+    /// The caller-provided descriptor the container's init blocks on.
+    pub(super) fn release_fd(&self) -> RawFd {
+        self.release_fd
+    }
+}
+
+/// Outcome of the start gate handshake, as observed by the supervisor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StartGateStatus {
+    /// The caller wrote the release byte; the init is proceeding to exec.
+    Released,
+    /// The caller closed the gate descriptor without a release byte. The
+    /// workload must not run; the container is torn down.
+    Refused,
+    /// The init exited before the gate was resolved (setup failure or a
+    /// kill). Its own exit status is the authoritative result.
+    Unresolved,
+}
 
 impl Container {
     pub fn new(config: ContainerConfig) -> Self {
@@ -196,6 +233,96 @@ impl Container {
     /// releases the child process.
     pub fn create(&self) -> Result<CreatedContainer> {
         self.create_internal(true)
+    }
+
+    /// Child side of the start gate: block reading one byte from the
+    /// caller's descriptor, as with the OCI exec FIFO, and report the
+    /// outcome to the supervisor before returning.
+    ///
+    /// Runs after every security-relevant setup step (and after the security
+    /// outcome was written, so `container_started` already reflects the
+    /// enforced posture) and before the workload is exec'd. `read` and
+    /// `write` stay permitted by the installed seccomp filter.
+    fn read_start_gate(gate: &StartGate) -> StartGateStatus {
+        let mut byte = [0u8; 1];
+        loop {
+            // SAFETY: read(2) writes at most one byte into `byte`; the fd was
+            // validated as open in validate_runtime_support.
+            let n = unsafe { libc::read(gate.release_fd, byte.as_mut_ptr().cast(), 1) };
+            match n {
+                1 => {
+                    let _ = write(&gate.status_writer, b"S");
+                    return StartGateStatus::Released;
+                }
+                0 => {
+                    let _ = write(&gate.status_writer, b"F");
+                    return StartGateStatus::Refused;
+                }
+                -1 if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted => {
+                    continue;
+                }
+                _ => {
+                    let err = std::io::Error::last_os_error();
+                    error!(
+                        "Failed to read the start gate descriptor {}: {}",
+                        gate.release_fd(),
+                        err
+                    );
+                    // No status byte: the supervisor falls back to the init's
+                    // own exit status, which reports this failure.
+                    return StartGateStatus::Unresolved;
+                }
+            }
+        }
+    }
+
+    /// Hold the container at the start gate in the init process. Returns only
+    /// when the caller released the workload; a refusal (EOF) or a read
+    /// failure exits the process without exec'ing the workload.
+    fn hold_at_start_gate(gate: &StartGate) {
+        match Self::read_start_gate(gate) {
+            StartGateStatus::Released => {
+                debug!(
+                    "Start gate fd {} released by the caller; proceeding to exec",
+                    gate.release_fd()
+                );
+            }
+            StartGateStatus::Refused => {
+                error!(
+                    "Start gate fd {} closed without a release byte; exiting without \
+                     running the workload",
+                    gate.release_fd()
+                );
+                std::process::exit(START_GATE_EXIT_CODE);
+            }
+            StartGateStatus::Unresolved => std::process::exit(1),
+        }
+    }
+
+    /// Supervisor side of the start gate: read the init's report about the
+    /// gate handshake. `Unresolved` means no report arrived (the init died
+    /// first); its exit status then speaks for itself.
+    fn read_start_gate_status(reader: &OwnedFd) -> StartGateStatus {
+        let mut byte = [0u8; 1];
+        loop {
+            match read(reader, &mut byte) {
+                Err(nix::errno::Errno::EINTR) => continue,
+                Ok(1) if byte[0] == b'S' => return StartGateStatus::Released,
+                Ok(1) if byte[0] == b'F' => return StartGateStatus::Refused,
+                Ok(0) => return StartGateStatus::Unresolved,
+                Ok(_) => {
+                    warn!(
+                        "Invalid start gate status byte {:?} from the container init",
+                        byte[0]
+                    );
+                    return StartGateStatus::Unresolved;
+                }
+                Err(e) => {
+                    warn!("Failed to read the start gate status pipe: {}", e);
+                    return StartGateStatus::Unresolved;
+                }
+            }
+        }
     }
 
     /// H6: Mark all file descriptors > 2 close-on-exec in the child process after fork.
@@ -823,6 +950,18 @@ impl Container {
                 "Native workloads require a private mount namespace".into(),
             ));
         }
+        if defer_exec_until_start && self.config.start_fd.is_some() {
+            // The exec FIFO already gates the two-phase lifecycle, and its
+            // handshake happens before the start gate: combining them would
+            // have the supervisor block on the FIFO while the init waits at
+            // the gate. The start gate is the `run`-lifecycle equivalent of
+            // create/start.
+            return Err(NucleusError::ConfigError(
+                "--start-fd cannot be combined with the two-phase create/start \
+                 lifecycle; the exec FIFO already holds the workload"
+                    .into(),
+            ));
+        }
         let is_root = nix::unistd::Uid::effective().is_root();
         let mut config = self.config.clone();
         Self::configure_user_namespace(&mut config, is_root, UserNamespaceConfig::root_remapped)?;
@@ -1061,6 +1200,12 @@ impl Container {
         let (parent_setup_read, parent_setup_write) = pipe().map_err(|e| {
             NucleusError::ExecError(format!("Failed to create parent setup sync pipe: {}", e))
         })?;
+        // Opt-in start gate (--start-fd): the pipe through which the
+        // container's init reports whether the caller released the workload.
+        // The release descriptor itself is inherited from the caller.
+        let start_gate_pipe = config.start_fd.map(|_| pipe()).transpose().map_err(|e| {
+            NucleusError::ExecError(format!("Failed to create start gate status pipe: {}", e))
+        })?;
 
         // M11: fork() in multi-threaded context. Flush log buffers and drop
         // tracing guards before fork to minimize deadlock risk from locks held
@@ -1116,6 +1261,12 @@ impl Container {
             ForkResult::Parent { child } => {
                 drop(ready_write);
                 drop(parent_setup_read);
+                // Keep only the reading end: holding the write end open would
+                // mask the EOF that reports an init that died before the gate.
+                let start_gate_reader = start_gate_pipe.map(|(reader, writer)| {
+                    drop(writer);
+                    reader
+                });
                 let (userns_request_read, userns_ack_write) =
                     if let Some((request_read, request_write, ack_read, ack_write)) = userns_sync {
                         drop(request_write);
@@ -1341,6 +1492,7 @@ impl Container {
                         trace_reader,
                         deny_logger,
                         exec_fifo_path: exec_fifo,
+                        start_gate_reader,
                         native_console_master,
                         event_sink,
                         _lifecycle_span: lifecycle_span.clone(),
@@ -1364,6 +1516,19 @@ impl Container {
                 }
                 drop(ready_read);
                 drop(parent_setup_write);
+                // The gate's release descriptor was inherited from the caller;
+                // only the init keeps the status write end.
+                let start_gate =
+                    config
+                        .start_fd
+                        .zip(start_gate_pipe)
+                        .map(|(release_fd, (reader, writer))| {
+                            drop(reader);
+                            StartGate {
+                                release_fd,
+                                status_writer: writer,
+                            }
+                        });
                 let (userns_request_write, userns_ack_read) =
                     if let Some((request_read, request_write, ack_read, ack_write)) = userns_sync {
                         drop(request_read);
@@ -1395,6 +1560,7 @@ impl Container {
                     userns_ack_read,
                     Some(parent_setup_read),
                     exec_fifo,
+                    start_gate,
                     runtime_base_override,
                     native_console_slave,
                 ) {
@@ -1456,6 +1622,7 @@ impl Container {
         userns_ack_pipe: Option<OwnedFd>,
         parent_setup_pipe: Option<OwnedFd>,
         exec_fifo: Option<PathBuf>,
+        start_gate: Option<StartGate>,
         runtime_base_override: Option<PathBuf>,
         native_console_slave: Option<OwnedFd>,
     ) -> Result<()> {
@@ -1549,6 +1716,12 @@ impl Container {
                     "Parent closed setup pipe before signalling gVisor child",
                     "Failed waiting for parent setup acknowledgement",
                 )?;
+            }
+            // The sandbox's OCI bundle is prepared and runsc exec'd only
+            // after the caller releases the start gate; `container_started`
+            // was written by the supervisor before it waits on the gate.
+            if let Some(gate) = start_gate.as_ref() {
+                Self::hold_at_start_gate(gate);
             }
             return self.setup_and_exec_gvisor(
                 artifact_base,
@@ -2240,6 +2413,14 @@ impl Container {
             serde_json::to_writer(std::fs::File::from(writer), &outcome)?;
         }
 
+        // 13c. Opt-in start gate (--start-fd): all setup is complete and the
+        // security outcome above feeds `container_started`, which the
+        // supervisor emits before it waits on the gate. Hold the workload
+        // until the caller has verified that posture and released it.
+        if let Some(gate) = start_gate.as_ref() {
+            Self::hold_at_start_gate(gate);
+        }
+
         // 14c. Block on exec FIFO until start() opens it for reading.
         // This implements the OCI two-phase create/start: all container setup
         // is complete, but the user process doesn't exec until explicitly started.
@@ -2741,6 +2922,41 @@ impl CreatedContainer {
             );
         }
 
+        // Opt-in start gate (--start-fd): the container's init is now blocked
+        // after setup, holding the workload until the caller – who has just
+        // received `container_started` – verifies the posture and releases
+        // it. Everything below observes a running workload (stdio relay,
+        // readiness probe, health checks, poststart hooks), so none of it may
+        // start before the gate is resolved.
+        let mut gate_refused = false;
+        if let Some(gate_reader) = self.start_gate_reader.take() {
+            match Container::read_start_gate_status(&gate_reader) {
+                StartGateStatus::Released => {
+                    info!(
+                        "Start gate fd {} released by the caller; workload starting",
+                        config.start_fd.unwrap_or(-1)
+                    );
+                }
+                StartGateStatus::Refused => {
+                    error!(
+                        "Start gate fd {} closed without a release byte; tearing down \
+                         without running the workload",
+                        config.start_fd.unwrap_or(-1)
+                    );
+                    gate_refused = true;
+                }
+                StartGateStatus::Unresolved => {
+                    // The init died before the gate resolved: failed setup or a
+                    // killed tree. Fall through; wait_for_child reports its
+                    // exit status, and the teardown below still runs.
+                    debug!(
+                        "Container init exited before the start gate was resolved; \
+                         reporting its exit status"
+                    );
+                }
+            }
+        }
+
         let mut console_relay = if config.terminal && config.console_socket.is_none() {
             self.native_console_master
                 .take()
@@ -2751,7 +2967,7 @@ impl CreatedContainer {
         };
 
         // Run readiness probe before declaring service ready
-        if let Some(ref probe) = config.readiness_probe {
+        if let (false, Some(probe)) = (gate_refused, config.readiness_probe.as_ref()) {
             let notify_socket = if config.sd_notify {
                 std::env::var("NOTIFY_SOCKET").ok()
             } else {
@@ -2762,7 +2978,8 @@ impl CreatedContainer {
 
         // Start health check thread if configured
         let cancel_flag = Arc::new(AtomicBool::new(false));
-        let health_handle = if let Some(ref hc) = config.health_check {
+        let health_handle = if let (false, Some(hc)) = (gate_refused, config.health_check.as_ref())
+        {
             if !hc.command.is_empty() {
                 let hc = hc.clone();
                 let state = self.state.clone();
@@ -2784,7 +3001,7 @@ impl CreatedContainer {
         };
 
         // Run poststart hooks (after user process started, in parent)
-        if let Some(ref hooks) = config.hooks {
+        if let (false, Some(hooks)) = (gate_refused, config.hooks.as_ref()) {
             if !hooks.poststart.is_empty() {
                 let hook_state = OciContainerState {
                     oci_version: "1.0.2".to_string(),
@@ -2806,6 +3023,15 @@ impl CreatedContainer {
             let _ = self.state_mgr.save_state(&self.state);
 
             child_waited = true;
+            if gate_refused {
+                // The init already reported the refusal; its 125 is not the
+                // workload's exit status.
+                return Err(NucleusError::StartGateClosed(format!(
+                    "the caller closed the start gate descriptor (fd {}) without \
+                     writing the release byte; the workload was not run",
+                    config.start_fd.unwrap_or(-1)
+                )));
+            }
             Ok(exit_code)
         })();
 
@@ -2838,16 +3064,22 @@ impl CreatedContainer {
             Self::collect_resource_stats(cgroup_path_for_summary.as_deref());
         let mut cleanup_errors = Vec::new();
 
-        let workspace_synced = match Container::sync_workspace_copy_in_out(config) {
-            Ok(()) => true,
-            Err(e) => {
-                let msg = format!("workspace sync failed: {}", e);
-                warn!("{}", msg);
-                cleanup_errors.push(msg);
-                if run_result.is_ok() {
-                    run_result = Err(e);
+        // A refused start never ran the workload: nothing may be copied out
+        // of the container, but the staging area is still cleaned up below.
+        let workspace_synced = if gate_refused {
+            true
+        } else {
+            match Container::sync_workspace_copy_in_out(config) {
+                Ok(()) => true,
+                Err(e) => {
+                    let msg = format!("workspace sync failed: {}", e);
+                    warn!("{}", msg);
+                    cleanup_errors.push(msg);
+                    if run_result.is_ok() {
+                        run_result = Err(e);
+                    }
+                    false
                 }
-                false
             }
         };
         if workspace_synced {
@@ -3004,6 +3236,7 @@ mod tests {
     use crate::container::KernelLockdownMode;
     use crate::network::NetworkMode;
     use std::ffi::OsString;
+    use std::os::fd::AsRawFd;
     use std::sync::{Mutex, MutexGuard};
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -4131,6 +4364,118 @@ mod tests {
         assert!(
             segment.contains("gvisor_precreated_userns"),
             "the bundle transfer must be gated on the completed user namespace handoff"
+        );
+    }
+
+    #[test]
+    fn start_gate_release_byte_releases_and_reports_started() {
+        let (release_read, release_write) = pipe().unwrap();
+        let (status_read, status_write) = pipe().unwrap();
+        let gate = StartGate {
+            release_fd: release_read.as_raw_fd(),
+            status_writer: status_write,
+        };
+        // The release byte is already in the pipe; the gate must not block.
+        write(&release_write, b"go").unwrap();
+        drop(release_write);
+
+        assert_eq!(Container::read_start_gate(&gate), StartGateStatus::Released);
+        assert_eq!(
+            Container::read_start_gate_status(&status_read),
+            StartGateStatus::Released
+        );
+    }
+
+    #[test]
+    fn start_gate_eof_without_a_byte_reports_refused() {
+        let (release_read, release_write) = pipe().unwrap();
+        let (status_read, status_write) = pipe().unwrap();
+        let gate = StartGate {
+            release_fd: release_read.as_raw_fd(),
+            status_writer: status_write,
+        };
+        // EOF without a byte: the caller refuses the posture.
+        drop(release_write);
+
+        assert_eq!(Container::read_start_gate(&gate), StartGateStatus::Refused);
+        assert_eq!(
+            Container::read_start_gate_status(&status_read),
+            StartGateStatus::Refused
+        );
+    }
+
+    #[test]
+    fn start_gate_status_pipe_maps_reports_and_silence() {
+        let (read, writer) = pipe().unwrap();
+        // Garbage bytes are not a verdict the supervisor can act on.
+        write(&writer, b"X").unwrap();
+        drop(writer);
+        assert_eq!(
+            Container::read_start_gate_status(&read),
+            StartGateStatus::Unresolved
+        );
+
+        let (read, writer) = pipe().unwrap();
+        // No report at all: the init died before the gate was resolved.
+        drop(writer);
+        assert_eq!(
+            Container::read_start_gate_status(&read),
+            StartGateStatus::Unresolved
+        );
+    }
+
+    #[test]
+    fn start_gate_rejects_the_two_phase_lifecycle() {
+        // The exec FIFO handshake precedes the gate; combining them would
+        // deadlock the supervisor on the FIFO while the init waits at the gate.
+        let (release_read, _release_write) = pipe().unwrap();
+        let config = ContainerConfig::try_new(None, vec!["/bin/sh".into()])
+            .unwrap()
+            .with_start_fd(release_read.as_raw_fd());
+        let err = match Container::new(config).create() {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("the two-phase lifecycle must reject --start-fd"),
+        };
+        assert!(
+            err.contains("two-phase create/start"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn start_gate_holds_after_security_outcome_and_before_exec() {
+        // Structural regression: the gate may only hold a container whose
+        // security outcome was already written, so `container_started` is
+        // emitted with the enforced posture while the workload waits.
+        let source = include_str!("runtime.rs");
+        let fn_body = extract_fn_body(source, "fn setup_and_exec");
+        let outcome = fn_body
+            .find("serde_json::to_writer(std::fs::File::from(writer), &outcome)")
+            .unwrap();
+        // The native hold (the gVisor handoff gates earlier in the same fn).
+        let gate = fn_body.rfind("hold_at_start_gate").unwrap();
+        let fifo = fn_body.find("Block on exec FIFO").unwrap();
+        assert!(
+            outcome < gate && gate < fifo,
+            "the start gate must hold after the security outcome and before the exec FIFO"
+        );
+    }
+
+    #[test]
+    fn gvisor_start_gate_holds_the_sandbox_before_the_runsc_handoff() {
+        // Structural regression: under gVisor the gate holds the launch after
+        // the supervisor setup handshake and before the runsc handoff, so a
+        // refused start never prepares or boots the sandbox.
+        let source = include_str!("runtime.rs");
+        let fn_body = extract_fn_body(source, "fn setup_and_exec");
+        let handoff = fn_body
+            .find("Failed waiting for parent setup acknowledgement")
+            .unwrap();
+        let gate = fn_body.find("hold_at_start_gate").unwrap();
+        let runsc = fn_body.find("setup_and_exec_gvisor(").unwrap();
+        assert!(
+            handoff < gate && gate < runsc,
+            "the gVisor start gate must hold after the parent handshake and before the runsc handoff"
         );
     }
 }
