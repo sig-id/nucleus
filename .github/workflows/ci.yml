@@ -136,6 +136,6 @@ jobs:
 
       - uses: cachix/install-nix-action@3dc140bfc76c49fbd4dd958429132e3746bcb086 # v31.11.5
 
-      # Consumers build the flake package, including its tests, in the Nix sandbox.
-      - name: Build flake package
-        run: nix build --print-build-logs .#default
+      # Consumers build the flake package in the Nix sandbox; its tests run in the nextest check.
+      - name: Build flake package and sandbox tests
+        run: nix build --print-build-logs .#default .#checks.x86_64-linux.my-crate-nextest

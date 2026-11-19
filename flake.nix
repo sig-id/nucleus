@@ -272,8 +272,6 @@
           "oci::tests::test_oci_hook_nonzero_exit_is_error"
           "oci::tests::test_oci_hooks_best_effort_continues_on_failure"
         ];
-        sandboxTestSkipArgs =
-          "-- --exact " + lib.concatMapStringsSep " " (test: "--skip ${test}") sandboxIncompatibleTests;
         sandboxNextestFilter =
           "-E 'not (" + lib.concatMapStringsSep " | " (test: "test(=${test})") sandboxIncompatibleTests + ")'";
 
@@ -300,14 +298,23 @@
           ];
         };
 
-        # Build dependencies only (for caching)
-        cargoArtifacts = if cargoLockExists then craneLib.buildDepsOnly commonArgs else null;
+        # Build dependencies only (for caching). The stubbed sources use none of
+        # the dependencies, so silence cargo's unused-dependency lint there only.
+        cargoArtifacts = if cargoLockExists then craneLib.buildDepsOnly (commonArgs // {
+          dummySrc = craneLib.mkDummySrc {
+            inherit src;
+            extraDummyScript = ''
+              chmod +w $out/Cargo.toml
+              printf '\n[lints.cargo]\nunused_dependencies = "allow"\n' >> $out/Cargo.toml
+            '';
+          };
+        }) else null;
 
         # Build the actual crate
         my-crate = if cargoLockExists then craneLib.buildPackage (commonArgs // {
           inherit cargoArtifacts;
-          nativeCheckInputs = gvisorRuntimePkgs;
-          cargoTestExtraArgs = sandboxTestSkipArgs;
+          # Tests run once, in the my-crate-nextest check, not in every consumer build.
+          doCheck = false;
           nativeBuildInputs = commonArgs.nativeBuildInputs ++ [ pkgs.makeWrapper ];
           postFixup = lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
             wrapProgram $out/bin/nucleus --prefix PATH : "${runtimePath}"
