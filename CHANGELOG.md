@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 - No unreleased changes.
 
+## [0.5.1] - 2026-11-19
+
+### Fixed
+- The Nix flake package builds again. It no longer runs the test suite, which
+  recompiled dependencies the cached artifacts already held; tests run once in
+  the `my-crate-nextest` check, which skips the four tests that need host
+  semantics the Nix build sandbox withholds (setid `chmod`, a root-owned `/nix`
+  for hook trust checks). CI still runs those four, and now also builds the
+  package and nextest check so a sandbox-only failure blocks the merge.
+- The dependency-only Nix build no longer emits a spurious unused-dependency
+  warning for every dependency of its stubbed sources.
+- The Nix package version comes from `Cargo.toml` instead of a stale `0.4.0`.
+
 ## [0.5.0] - 2026-11-19
 
 ### Security

@@ -949,7 +949,7 @@ dependencies = [
 
 [[package]]
 name = "nucleus-container"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "caps",
  "clap",
