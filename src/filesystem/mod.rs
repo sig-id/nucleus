@@ -8,7 +8,9 @@ mod target;
 mod tmpfs;
 mod trusted_dir;
 pub(crate) use target::*;
-pub(crate) use trusted_dir::{owner_unmapped, trusted_container_directory, trusted_directory};
+pub(crate) use trusted_dir::{
+    owner_outside_namespace, owner_unmapped, trusted_container_directory, trusted_directory,
+};
 mod workspace;
 
 /// Open `name` below `dir` as an `O_PATH` pin, refusing to follow a symlink

@@ -790,10 +790,15 @@ impl OciHooks {
             )));
         }
 
-        let unmapped = crate::filesystem::owner_unmapped(uid);
-        if unmapped && namespace == HookNamespace::Runtime {
+        // Container-namespace hooks may belong to an owner outside the
+        // namespace, but only when that is provable: if the namespace maps
+        // the overflow UID, a user inside it could own this file.
+        let outside = namespace == HookNamespace::Container
+            && crate::filesystem::owner_outside_namespace(uid);
+        if crate::filesystem::owner_unmapped(uid) && !outside {
             return Err(NucleusError::HookError(format!(
-                "{} hook {} is owned by a user outside this user namespace – refusing to execute",
+                "{} hook {} has an owner that cannot be verified from this user namespace \
+                 – refusing to execute",
                 phase,
                 hook_path.display()
             )));
@@ -801,7 +806,7 @@ impl OciHooks {
 
         // Reject hooks owned by arbitrary UIDs – must be root or effective UID,
         // or (for container-namespace hooks) an owner outside the namespace.
-        if uid != 0 && uid != effective_uid && !unmapped {
+        if uid != 0 && uid != effective_uid && !outside {
             return Err(NucleusError::HookError(format!(
                 "{} hook {} is owned by UID {} (expected 0 or {}) – refusing to execute",
                 phase,
@@ -2823,6 +2828,31 @@ mod tests {
                 "startContainer",
             )
             .unwrap();
+        });
+    }
+
+    #[test]
+    fn container_hooks_refuse_an_owner_the_namespace_could_hold() {
+        // A 65,536-ID mapping (root remapping) makes the overflow UID a real
+        // user inside the namespace, so an overflow-UID owner proves nothing.
+        let uid = nix::unistd::Uid::current();
+        let overflow = std::fs::read_to_string("/proc/sys/kernel/overflowuid")
+            .unwrap()
+            .trim()
+            .to_owned();
+        in_unmapped_user_namespace(move || {
+            std::fs::write("/proc/self/uid_map", format!("{overflow} {uid} 1")).unwrap();
+            let err = OciHooks::run_container_hooks(
+                &[bash_hook("exit 0")],
+                &creating_state(),
+                "startContainer",
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains("cannot be verified") || err.contains("Cannot verify directory"),
+                "{err}"
+            );
         });
     }
 

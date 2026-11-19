@@ -18,7 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `createContainer` and `startContainer` hooks resolve inside the
     container. Their owner check now also trusts owners outside the
     container's user namespace, which nothing inside it can act as; the
-    group/world-writable and setuid checks still apply.
+    group/world-writable and setuid checks still apply. An owner is only
+    provably outside when the namespace leaves the overflow UID unmapped.
+    Under a mapping that includes it (root remapping and other 65,536-ID
+    maps), a host-owned hook is indistinguishable from one owned by a user
+    inside the namespace and is still refused.
 
 ## [0.5.2] - 2026-11-19
 
