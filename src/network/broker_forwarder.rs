@@ -14,11 +14,15 @@
 use crate::error::{NucleusError, Result};
 use crate::filesystem::BrokerSocket;
 use nix::sys::socket::{recvmsg, sendmsg, ControlMessage, ControlMessageOwned, MsgFlags};
+use std::collections::HashMap;
 use std::io::{IoSlice, IoSliceMut};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
-use std::thread;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 use tracing::{debug, info, warn};
 
 /// Upper bound on relayed connections open at once.
@@ -79,76 +83,196 @@ pub(crate) fn receive(channel: &UnixStream) -> Result<TcpListener> {
     Ok(listener)
 }
 
-/// Accept connections on `listener` and relay each one to `broker` until the
-/// supervisor exits.
-pub(crate) fn spawn(listener: TcpListener, broker: &BrokerSocket) -> Result<()> {
-    // Connect through the inode verified at launch, never by path.
-    let pinned = broker.pin()?;
-    let local = listener.local_addr()?;
-    let host_path = broker.host_path().to_path_buf();
-    let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    thread::Builder::new()
-        .name("broker-forward".into())
-        .spawn(move || {
-            let target = format!("/proc/self/fd/{}", pinned.as_raw_fd());
-            for stream in listener.incoming() {
-                let client = match stream {
-                    Ok(client) => client,
-                    Err(e) => {
-                        warn!("Broker forwarder accept failed: {e}");
-                        continue;
-                    }
-                };
-                if active.load(std::sync::atomic::Ordering::Acquire) >= MAX_CONNECTIONS {
-                    warn!("Broker forwarder at {MAX_CONNECTIONS} connections; refusing one");
-                    continue;
-                }
-                let upstream = match UnixStream::connect(&target) {
-                    Ok(upstream) => upstream,
-                    Err(e) => {
-                        warn!("Cannot connect to broker socket {host_path:?}: {e}");
-                        continue;
-                    }
-                };
-                let active = active.clone();
-                active.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-                if let Err(e) = relay(client, upstream, active.clone()) {
-                    active.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-                    warn!("Broker forwarder cannot relay a connection: {e}");
-                }
-            }
+/// Relays the workload's broker connections for one container.
+///
+/// Dropping it stops accepting, shuts down every open connection and joins
+/// all of its threads, so the supervisor is single-threaded again and the
+/// listener (and with it the container's network namespace) and the pinned
+/// broker descriptor are released.
+pub(crate) struct BrokerForwarder {
+    shared: Arc<Shared>,
+    /// A second handle on the listening socket, used to wake the accept loop.
+    wake: TcpListener,
+    acceptor: Option<JoinHandle<()>>,
+}
+
+struct Shared {
+    stopping: AtomicBool,
+    conns: Mutex<Conns>,
+}
+
+#[derive(Default)]
+struct Conns {
+    next_id: u64,
+    /// Both ends of every connection whose relay has not finished.
+    open: HashMap<u64, (TcpStream, UnixStream)>,
+    threads: Vec<JoinHandle<()>>,
+}
+
+/// A connection's claim on one of the `MAX_CONNECTIONS` slots. Both relay
+/// directions hold it; the slot frees when the second one finishes.
+struct Slot {
+    shared: Arc<Shared>,
+    id: u64,
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        if let Ok(mut conns) = self.shared.conns.lock() {
+            conns.open.remove(&self.id);
+        }
+    }
+}
+
+impl BrokerForwarder {
+    /// Accept connections on `listener` and relay each one to `broker`.
+    pub(crate) fn spawn(listener: TcpListener, broker: &BrokerSocket) -> Result<Self> {
+        // Connect through the inode verified at launch, never by path.
+        let pinned = broker.pin()?;
+        let local = listener.local_addr()?;
+        let wake = listener.try_clone()?;
+        let host_path = broker.host_path().to_path_buf();
+        let shared = Arc::new(Shared {
+            stopping: AtomicBool::new(false),
+            conns: Mutex::new(Conns::default()),
+        });
+        let worker = shared.clone();
+        let acceptor = thread::Builder::new()
+            .name("broker-forward".into())
+            .spawn(move || accept_loop(&listener, &pinned, &host_path, &worker))
+            .map_err(|e| {
+                NucleusError::NetworkError(format!("Cannot start broker forwarder: {e}"))
+            })?;
+        info!("Broker forwarder listening on {local} inside the container");
+        Ok(Self {
+            shared,
+            wake,
+            acceptor: Some(acceptor),
         })
-        .map_err(|e| NucleusError::NetworkError(format!("Cannot start broker forwarder: {e}")))?;
-    info!("Broker forwarder listening on {local} inside the container");
-    Ok(())
+    }
+}
+
+impl Drop for BrokerForwarder {
+    fn drop(&mut self) {
+        self.shared.stopping.store(true, Ordering::Release);
+        // Shutting down a listening socket wakes a blocked accept.
+        let _ = nix::sys::socket::shutdown(self.wake.as_raw_fd(), nix::sys::socket::Shutdown::Both);
+        if let Some(acceptor) = self.acceptor.take() {
+            let _ = acceptor.join();
+        }
+        let threads = match self.shared.conns.lock() {
+            Ok(mut conns) => {
+                for (client, upstream) in conns.open.values() {
+                    let _ = client.shutdown(Shutdown::Both);
+                    let _ = upstream.shutdown(Shutdown::Both);
+                }
+                std::mem::take(&mut conns.threads)
+            }
+            Err(_) => Vec::new(),
+        };
+        for thread in threads {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn accept_loop(
+    listener: &TcpListener,
+    pinned: &OwnedFd,
+    host_path: &std::path::Path,
+    shared: &Arc<Shared>,
+) {
+    let target = format!("/proc/self/fd/{}", pinned.as_raw_fd());
+    loop {
+        let accepted = listener.accept();
+        if shared.stopping.load(Ordering::Acquire) {
+            return;
+        }
+        let client = match accepted {
+            Ok((client, _)) => client,
+            Err(e) => {
+                warn!("Broker forwarder accept failed: {e}");
+                // Do not spin on a persistent error such as EMFILE.
+                thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+        };
+        let full = shared
+            .conns
+            .lock()
+            .map(|conns| conns.open.len() >= MAX_CONNECTIONS)
+            .unwrap_or(true);
+        if full {
+            warn!("Broker forwarder at {MAX_CONNECTIONS} connections; refusing one");
+            continue;
+        }
+        let upstream = match UnixStream::connect(&target) {
+            Ok(upstream) => upstream,
+            Err(e) => {
+                warn!("Cannot connect to broker socket {host_path:?}: {e}");
+                continue;
+            }
+        };
+        if let Err(e) = relay(client, upstream, shared) {
+            warn!("Broker forwarder cannot relay a connection: {e}");
+        }
+    }
 }
 
 /// Copy both directions of one connection on two threads, propagating
-/// half-closes so request/response protocols see end-of-file.
-fn relay(
-    client: TcpStream,
-    upstream: UnixStream,
-    active: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-) -> std::io::Result<()> {
-    let client_read = client.try_clone()?;
-    let upstream_write = upstream.try_clone()?;
-    thread::Builder::new()
+/// half-closes so request/response protocols see end-of-file. The slot and
+/// the registered descriptors are released when both directions are done,
+/// including when a thread cannot be started.
+fn relay(client: TcpStream, upstream: UnixStream, shared: &Arc<Shared>) -> std::io::Result<()> {
+    let handles = (client.try_clone()?, upstream.try_clone()?);
+    let (up_from, up_to) = (client.try_clone()?, upstream.try_clone()?);
+    let mut conns = shared
+        .conns
+        .lock()
+        .map_err(|_| std::io::Error::other("broker forwarder state poisoned"))?;
+    let id = conns.next_id;
+    conns.next_id += 1;
+    conns.open.insert(id, handles);
+    conns.threads.retain(|thread| !thread.is_finished());
+    let slot = Arc::new(Slot {
+        shared: shared.clone(),
+        id,
+    });
+
+    let up_slot = slot.clone();
+    let up = thread::Builder::new()
         .name("broker-up".into())
         .spawn(move || {
-            let (mut from, mut to) = (client_read, upstream_write);
+            let _slot = up_slot;
+            let (mut from, mut to) = (up_from, up_to);
             let _ = std::io::copy(&mut from, &mut to);
             let _ = to.shutdown(Shutdown::Write);
-        })?;
-    thread::Builder::new()
+        });
+    // On failure the closure, its slot clone and its descriptors are dropped.
+    conns.threads.push(up?);
+    let down = thread::Builder::new()
         .name("broker-down".into())
         .spawn(move || {
+            let _slot = slot;
             let (mut from, mut to) = (upstream, client);
             let _ = std::io::copy(&mut from, &mut to);
             let _ = to.shutdown(Shutdown::Write);
-            debug!("Broker connection closed");
-            active.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-        })?;
-    Ok(())
+            debug!("Broker connection direction closed");
+        });
+    match down {
+        Ok(down) => {
+            conns.threads.push(down);
+            Ok(())
+        }
+        Err(e) => {
+            // Unblock the upload thread so it releases the slot.
+            if let Some((client, upstream)) = conns.open.get(&id) {
+                let _ = client.shutdown(Shutdown::Both);
+                let _ = upstream.shutdown(Shutdown::Both);
+            }
+            Err(e)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -167,7 +291,7 @@ mod tests {
         bind_and_send("127.0.0.1:0".parse().unwrap(), &container).unwrap();
         let listener = receive(&supervisor).unwrap();
         let addr = listener.local_addr().unwrap();
-        spawn(listener, &broker).unwrap();
+        let _forwarder = BrokerForwarder::spawn(listener, &broker).unwrap();
 
         // Echo server standing in for the broker: reads to EOF, answers.
         let server = thread::spawn(move || {
@@ -185,6 +309,69 @@ mod tests {
         client.read_to_end(&mut response).unwrap();
         server.join().unwrap();
         assert_eq!(response, b"echo:CONNECT example.com:443");
+    }
+
+    fn wait_until(mut done: impl FnMut() -> bool) -> bool {
+        for _ in 0..500 {
+            if done() {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
+    #[test]
+    fn slot_is_held_until_both_directions_finish() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("broker.sock");
+        let broker_listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let broker = BrokerSocket::verify(&socket_path).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let forwarder = BrokerForwarder::spawn(listener, &broker).unwrap();
+        let open = || forwarder.shared.conns.lock().unwrap().open.len();
+
+        // The broker closes at once; the client keeps its write side open.
+        let client = TcpStream::connect(addr).unwrap();
+        let (conn, _) = broker_listener.accept().unwrap();
+        drop(conn);
+        let mut buf = [0u8; 1];
+        assert_eq!((&client).read(&mut buf).unwrap(), 0, "download side closed");
+        assert_eq!(open(), 1, "upload direction still holds the slot");
+
+        drop(client);
+        assert!(wait_until(|| open() == 0));
+    }
+
+    #[test]
+    fn dropping_the_forwarder_joins_every_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("broker.sock");
+        let broker_listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let broker = BrokerSocket::verify(&socket_path).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let forwarder = BrokerForwarder::spawn(listener, &broker).unwrap();
+        // Two idle connections keep relay threads blocked on both sides.
+        let clients: Vec<_> = (0..2).map(|_| TcpStream::connect(addr).unwrap()).collect();
+        let conns: Vec<_> = (0..2).map(|_| broker_listener.accept().unwrap()).collect();
+        assert!(wait_until(|| forwarder
+            .shared
+            .conns
+            .lock()
+            .unwrap()
+            .threads
+            .len()
+            == 4));
+        let threads = Arc::downgrade(&forwarder.shared);
+
+        drop(forwarder);
+        // Every worker has been joined, so no thread holds the shared state,
+        // and the listener is closed.
+        assert_eq!(threads.strong_count(), 0);
+        assert!(TcpStream::connect(addr).is_err());
+        drop((clients, conns));
     }
 
     #[test]

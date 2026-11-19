@@ -78,6 +78,8 @@ pub struct CreatedContainer {
     outcome_reader: Option<OwnedFd>,
     mapped_gvisor_base: Option<PathBuf>,
     _landlock_handoff: Option<crate::security::landlock_handoff::LandlockHandoff>,
+    /// Relays broker connections; dropping it stops and joins its threads.
+    broker_forwarder: Option<crate::network::broker_forwarder::BrokerForwarder>,
     pub(super) native_console_master: Option<OwnedFd>,
     pub(super) event_sink: Option<EventSink>,
     pub(super) _lifecycle_span: tracing::Span,
@@ -1171,13 +1173,17 @@ impl Container {
                     let target_pid = Self::wait_for_namespace_ready(&ready_read, child)?;
                     target_pid_for_cleanup = Some(target_pid);
 
-                    if let (Some((parent_end, child_end)), Some(broker)) =
-                        (broker_channel, config.broker_socket.as_ref())
-                    {
-                        drop(child_end);
-                        let listener = crate::network::broker_forwarder::receive(&parent_end)?;
-                        crate::network::broker_forwarder::spawn(listener, broker)?;
-                    }
+                    // Dropped with the container, or here if setup fails.
+                    let broker_forwarder = match (broker_channel, config.broker_socket.as_ref()) {
+                        (Some((parent_end, child_end)), Some(broker)) => {
+                            drop(child_end);
+                            let listener = crate::network::broker_forwarder::receive(&parent_end)?;
+                            Some(crate::network::broker_forwarder::BrokerForwarder::spawn(
+                                listener, broker,
+                            )?)
+                        }
+                        _ => None,
+                    };
 
                     if !config.use_gvisor {
                         if let Some(ref socket_path) = config.console_socket {
@@ -1324,6 +1330,7 @@ impl Container {
                     Ok(CreatedContainer {
                         outcome_reader: outcome_pipe.map(|(reader, _)| reader),
                         _landlock_handoff: landlock_handoff,
+                        broker_forwarder,
                         mapped_gvisor_base,
                         config,
                         state_mgr,
@@ -2809,6 +2816,8 @@ impl CreatedContainer {
         }
         health_guard.stop();
         sig_guard.stop();
+        // The workload is gone: stop relaying and release the namespace.
+        drop(self.broker_forwarder.take());
 
         // Run poststop hooks (best-effort)
         if let Some(ref hooks) = config.hooks {
