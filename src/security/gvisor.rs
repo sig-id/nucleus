@@ -146,6 +146,8 @@ impl GVisorOciRunOptions {
 pub struct GVisorRuntime {
     runsc_path: String,
     prepared_base: Option<PathBuf>,
+    /// `Some` once the launcher prepared the (optional) runsc debug directory.
+    prepared_debug_dir: Option<Option<PathBuf>>,
 }
 
 impl GVisorRuntime {
@@ -158,6 +160,7 @@ impl GVisorRuntime {
         Ok(Self {
             runsc_path,
             prepared_base: None,
+            prepared_debug_dir: None,
         })
     }
 
@@ -170,6 +173,7 @@ impl GVisorRuntime {
         Self {
             runsc_path,
             prepared_base: None,
+            prepared_debug_dir: None,
         }
     }
 
@@ -177,6 +181,13 @@ impl GVisorRuntime {
     /// entering the user namespace where host ownership is no longer visible.
     pub(crate) fn with_prepared_base(mut self, base: PathBuf) -> Self {
         self.prepared_base = Some(base);
+        self
+    }
+
+    /// Like [`Self::with_prepared_base`], for the result of
+    /// [`Self::prepare_runsc_debug_dir`].
+    pub(crate) fn with_prepared_debug_dir(mut self, dir: Option<PathBuf>) -> Self {
+        self.prepared_debug_dir = Some(dir);
         self
     }
 
@@ -405,7 +416,10 @@ impl GVisorRuntime {
         // Build runsc command with OCI bundle.
         // Global flags (--root, --network, --platform) must come BEFORE the subcommand.
         // runsc --root <dir> --network <mode> --platform <plat> run --bundle <path> <id>
-        let debug_dir = Self::runsc_debug_dir()?;
+        let debug_dir = match &self.prepared_debug_dir {
+            Some(dir) => dir.clone(),
+            None => Self::prepare_runsc_debug_dir()?,
+        };
         let mut args = self.build_oci_run_args(
             container_id,
             bundle,
@@ -580,7 +594,9 @@ impl GVisorRuntime {
         Ok(env)
     }
 
-    fn runsc_debug_dir() -> Result<Option<PathBuf>> {
+    /// Validate and create `NUCLEUS_RUNSC_DEBUG_DIR`. Call it under the host
+    /// credentials: the trust check cannot see host owners from a user namespace.
+    pub(crate) fn prepare_runsc_debug_dir() -> Result<Option<PathBuf>> {
         let Some(raw) = std::env::var_os(RUNSC_DEBUG_DIR_ENV).filter(|value| !value.is_empty())
         else {
             return Ok(None);

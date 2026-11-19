@@ -76,6 +76,7 @@ impl Container {
     pub(super) fn setup_and_exec_gvisor(
         &self,
         artifact_base: std::path::PathBuf,
+        runsc_debug_dir: Option<std::path::PathBuf>,
         precreated_userns: bool,
         gpu_device_set: Option<&GpuDeviceSet>,
     ) -> Result<()> {
@@ -89,7 +90,9 @@ impl Container {
             })?
         };
 
-        let gvisor = gvisor.with_prepared_base(artifact_base);
+        let gvisor = gvisor
+            .with_prepared_base(artifact_base)
+            .with_prepared_debug_dir(runsc_debug_dir);
         self.setup_and_exec_gvisor_oci(&gvisor, precreated_userns, gpu_device_set)
     }
 

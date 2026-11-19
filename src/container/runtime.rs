@@ -1449,6 +1449,7 @@ impl Container {
                 Some(base) => base.to_owned(),
                 None => GVisorRuntime::prepare_artifact_base()?,
             };
+            let runsc_debug_dir = GVisorRuntime::prepare_runsc_debug_dir()?;
             let mut handoff_bundle: Option<std::fs::File> = None;
             if mapped_base.is_none() {
                 if let Some(bundle) = &self.config.bundle_dir {
@@ -1509,6 +1510,7 @@ impl Container {
             }
             return self.setup_and_exec_gvisor(
                 artifact_base,
+                runsc_debug_dir,
                 gvisor_precreated_userns,
                 gpu_device_set,
             );
@@ -4006,6 +4008,21 @@ mod tests {
             vec![existing.join("a/b"), existing.join("a")],
             "ancestors are reported deepest-first, excluding existing prefixes"
         );
+    }
+
+    #[test]
+    fn test_runsc_debug_dir_is_prepared_before_userns_handoff() {
+        // Inside the handoff namespace host-root-owned ancestors such as /var
+        // stat as unmapped, so the trust check must run before it.
+        let source = include_str!("runtime.rs");
+        let fn_body = extract_fn_body(source, "fn setup_and_exec");
+        let prepare = fn_body.find("prepare_runsc_debug_dir").unwrap();
+        let handoff = fn_body.find("prepare_gvisor_handoff_namespace").unwrap();
+        assert!(prepare < handoff);
+
+        let setup = include_str!("gvisor_setup.rs");
+        let gvisor_body = extract_fn_body(setup, "fn setup_and_exec_gvisor");
+        assert!(gvisor_body.contains("with_prepared_debug_dir(runsc_debug_dir)"));
     }
 
     #[test]

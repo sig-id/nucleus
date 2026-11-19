@@ -38,6 +38,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - gVisor bind mounts of non-regular files (such as sockets) get a file
   mountpoint instead of a directory.
 
+## [0.5.2] - 2026-11-19
+
+### Fixed
+- Rootless gVisor containers start again when `NUCLEUS_RUNSC_DEBUG_DIR` is
+  set. 0.5.0 checked the debug directory's ancestors after entering the
+  launch's user namespace, where host-root-owned directories such as `/var`
+  appear unmapped, so every start failed with `Untrusted directory "/var"
+  (uid 65534)`. The directory is now validated under the host credentials
+  before the handoff.
+- The Nix flake no longer warns that `buildDepsOnly` ignores `src` on every
+  evaluation.
+
+### Security
+- Trusted-directory and OCI hook owner checks report an owner that is not
+  mapped into the current user namespace as such, and reject it. Previously,
+  in a namespace without an ID map the caller's own UID was the overflow UID
+  too, so every directory appeared caller-owned and passed the check.
+
 ## [0.5.1] - 2026-11-19
 
 ### Fixed
