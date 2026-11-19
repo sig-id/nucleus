@@ -6,7 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
-- No unreleased changes.
+
+### Fixed
+- Deny the `FICLONE`/`FICLONERANGE` ioctl requests with `EOPNOTSUPP` instead
+  of the default kill action. Modern coreutils `cp` probes reflink support on
+  every copy and falls back to a read/write loop on `EOPNOTSUPP`; killing the
+  probe terminated ordinary file copies with `SIGSYS` on up-to-date
+  distributions.
 
 ## [0.4.0] - 2026-09-09
 

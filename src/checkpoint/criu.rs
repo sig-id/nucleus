@@ -288,7 +288,12 @@ impl CriuRuntime {
             cgroup.set_limits(&limits.to_resource_limits())?;
         }
         if let Some(filter) = &launch.gpu_device_filter {
-            cgroup.install_gpu_device_allowlist(&filter.gpu, &filter.supervisor, filter.include_tty, false)?;
+            cgroup.install_gpu_device_allowlist(
+                &filter.gpu,
+                &filter.supervisor,
+                filter.include_tty,
+                false,
+            )?;
         }
         let membership = cgroup.membership_file()?;
         // CRIU creates the pidfile with O_EXCL. Give it a fresh name in a

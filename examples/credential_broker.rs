@@ -241,12 +241,12 @@ fn tunnel(left: TcpStream, right: TcpStream) -> io::Result<()> {
     let upload = thread::spawn(move || copy_and_shutdown(&mut left_reader, &mut right_writer));
     let download = thread::spawn(move || copy_and_shutdown(&mut right_reader, &mut left_writer));
 
-    let upload_result = upload.join().unwrap_or_else(|_| {
-        Err(io::Error::other("upload thread panicked"))
-    });
-    let download_result = download.join().unwrap_or_else(|_| {
-        Err(io::Error::other("download thread panicked"))
-    });
+    let upload_result = upload
+        .join()
+        .unwrap_or_else(|_| Err(io::Error::other("upload thread panicked")));
+    let download_result = download
+        .join()
+        .unwrap_or_else(|_| Err(io::Error::other("download thread panicked")));
 
     upload_result?;
     download_result?;

@@ -104,7 +104,12 @@ fn compile_bitmap_bpf(
 #[derive(Clone, Copy)]
 pub(super) struct ErrnoRule {
     pub nr: i64,
+    /// Match the low 32 bits of seccomp_data.args[0] (int-valued first
+    /// argument, e.g. a `prctl` option).
     pub arg0: Option<u32>,
+    /// Match the low 32 bits of seccomp_data.args[1] (int-valued second
+    /// argument, e.g. an `ioctl` request code).
+    pub arg1: Option<u32>,
     pub errno: i32,
 }
 
@@ -167,13 +172,17 @@ pub(super) fn compile_bitmap_bpf_with_errno_syscalls(
     // === Section 1b: Exact-match errno denies ===
     for rule in errno_syscalls {
         prog.push(bpf_stmt(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_NR_OFFSET));
-        let skip = if rule.arg0.is_some() { 3 } else { 1 };
+        let matches = rule.arg0.iter().chain(rule.arg1.iter()).count();
+        let skip = 2 * matches as u8 + 1;
         prog.push(bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, rule.nr as u32, 0, skip));
-        if let Some(value) = rule.arg0 {
-            // All supported targets use little-endian seccomp_data arguments.
-            let offset = std::mem::offset_of!(libc::seccomp_data, args) as u32;
-            prog.push(bpf_stmt(BPF_LD | BPF_W | BPF_ABS, offset));
-            prog.push(bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, value, 0, 1));
+        // All supported targets use little-endian seccomp_data arguments;
+        // load the low 32 bits of the matched argument slot.
+        let args_offset = std::mem::offset_of!(libc::seccomp_data, args) as u32;
+        for (index, value) in [(0, rule.arg0), (1, rule.arg1)] {
+            if let Some(value) = value {
+                prog.push(bpf_stmt(BPF_LD | BPF_W | BPF_ABS, args_offset + index * 8));
+                prog.push(bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, value, 0, 1));
+            }
         }
         prog.push(bpf_stmt(
             BPF_RET | BPF_K,
@@ -494,6 +503,7 @@ mod tests {
             &[ErrnoRule {
                 nr: 123,
                 arg0: None,
+                arg1: None,
                 errno: libc::ENOSYS,
             }],
             SeccompAction::KillProcess,
@@ -509,6 +519,87 @@ mod tests {
         assert_eq!(bpf_eval(&prog, &data), RET_ERRNO_ENOSYS);
 
         let data = make_seccomp_data(124, AUDIT_ARCH_X86_64, [0; 6]);
+        assert_eq!(bpf_eval(&prog, &data), RET_KILL);
+    }
+
+    #[test]
+    fn test_errno_syscall_matches_second_argument() {
+        // ioctl request codes live in args[1]; errno overrides must be able
+        // to match them so probes like FICLONE can fall back gracefully.
+        let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
+        rules.insert(0, Vec::new()); // read
+
+        let prog = compile_bitmap_bpf_with_errno_syscalls(
+            rules,
+            &[ErrnoRule {
+                nr: 123,
+                arg0: None,
+                arg1: Some(libc::FICLONE as u32),
+                errno: libc::EOPNOTSUPP,
+            }],
+            SeccompAction::KillProcess,
+            SeccompAction::Allow,
+            TargetArch::x86_64,
+        )
+        .unwrap();
+
+        // Matching request code returns the errno.
+        let data = make_seccomp_data(123, AUDIT_ARCH_X86_64, [0, libc::FICLONE, 0, 0, 0, 0]);
+        assert_eq!(
+            bpf_eval(&prog, &data),
+            libc::SECCOMP_RET_ERRNO | libc::EOPNOTSUPP as u32
+        );
+
+        // A different request code falls through to the default action.
+        let data = make_seccomp_data(123, AUDIT_ARCH_X86_64, [0, 0x5401, 0, 0, 0, 0]);
+        assert_eq!(bpf_eval(&prog, &data), RET_KILL);
+
+        // Other syscalls are unaffected.
+        let data = make_seccomp_data(0, AUDIT_ARCH_X86_64, [0; 6]);
+        assert_eq!(bpf_eval(&prog, &data), RET_ALLOW);
+    }
+
+    #[test]
+    fn test_builtin_ioctl_ficlone_returns_eopnotsupp() {
+        // coreutils cp probes FICLONE on every copy and falls back to a
+        // read/write loop on EOPNOTSUPP; killing the probe terminated
+        // ordinary file copies with SIGSYS.
+        let rules = crate::security::SeccompManager::minimal_filter_for_test(false, &[]);
+        let prog = compile_bitmap_bpf_with_errno_syscalls(
+            rules,
+            crate::security::SeccompManager::errno_denied_syscalls_for_test(),
+            SeccompAction::KillProcess,
+            SeccompAction::Allow,
+            TargetArch::x86_64,
+        )
+        .unwrap();
+
+        for request in [libc::FICLONE, libc::FICLONERANGE] {
+            let data = make_seccomp_data(
+                libc::SYS_ioctl as u32,
+                AUDIT_ARCH_X86_64,
+                [0, request, 0, 0, 0, 0],
+            );
+            assert_eq!(
+                bpf_eval(&prog, &data),
+                libc::SECCOMP_RET_ERRNO | libc::EOPNOTSUPP as u32,
+                "ioctl request {request:#x} must return EOPNOTSUPP"
+            );
+        }
+
+        // Terminal ioctls stay allowed and unknown requests stay killed.
+        let data = make_seccomp_data(
+            libc::SYS_ioctl as u32,
+            AUDIT_ARCH_X86_64,
+            [0, 0x5401, 0, 0, 0, 0], // TCGETS
+        );
+        assert_eq!(bpf_eval(&prog, &data), RET_ALLOW);
+
+        let data = make_seccomp_data(
+            libc::SYS_ioctl as u32,
+            AUDIT_ARCH_X86_64,
+            [0, 0xdead_beef, 0, 0, 0, 0],
+        );
         assert_eq!(bpf_eval(&prog, &data), RET_KILL);
     }
 

@@ -576,7 +576,8 @@ pub enum ReadinessProbe {
     clap::ValueEnum,
     serde::Serialize,
     serde::Deserialize,
-)]#[serde(rename_all = "kebab-case")]
+)]
+#[serde(rename_all = "kebab-case")]
 pub enum GpuVendor {
     /// Discover and bind whatever GPU devices are present on the host.
     #[default]
@@ -680,7 +681,10 @@ impl GpuPassthroughConfig {
 pub fn gpu_environment(gpu: &GpuPassthroughConfig) -> Vec<(&'static str, String)> {
     let mut env = vec![
         ("NVIDIA_VISIBLE_DEVICES", gpu.visible_devices.clone()),
-        ("NVIDIA_DRIVER_CAPABILITIES", gpu.driver_capabilities.clone()),
+        (
+            "NVIDIA_DRIVER_CAPABILITIES",
+            gpu.driver_capabilities.clone(),
+        ),
     ];
     if gpu.vendor.includes_nvidia() {
         env.push((
@@ -3028,7 +3032,8 @@ mod tests {
         // Agent is the default service mode and must permit GPU.
         assert_eq!(cfg.service_mode, ServiceMode::Agent);
         assert!(cfg.gpu.is_some());
-        cfg.validate_production_mode().expect("agent mode permits gpu");
+        cfg.validate_production_mode()
+            .expect("agent mode permits gpu");
     }
 
     #[test]
@@ -3051,6 +3056,8 @@ mod tests {
             ..GpuPassthroughConfig::default()
         };
         let env = gpu_environment(&gpu);
-        assert!(!env.iter().any(|(k, _)| *k == "__EGL_VENDOR_LIBRARY_FILENAMES"));
+        assert!(!env
+            .iter()
+            .any(|(k, _)| *k == "__EGL_VENDOR_LIBRARY_FILENAMES"));
     }
 }
