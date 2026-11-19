@@ -408,13 +408,22 @@ fn clear_destination_entry(parent: &OwnedFd, name: &std::ffi::OsStr) -> Result<(
 }
 
 /// Clear `name` below the pinned `parent` directory, whatever it is.
+///
+/// Directories are emptied relative to their own pin and then removed with
+/// `unlinkat(AT_REMOVEDIR)` under the pinned parent. `std::fs::remove_dir_all`
+/// must not be pointed at the pin path: it opens the top-level path with
+/// `O_NOFOLLOW`, which rejects the procfs descriptor link itself (EPERM), so
+/// deleting a directory would abort the whole synchronization.
 fn remove_pinned_entry(parent: &OwnedFd, name: &std::ffi::OsStr) -> Result<()> {
     let child = super::pinned_child(parent, name)?;
     if super::pinned_kind(&child)? == nix::sys::stat::SFlag::S_IFDIR {
-        // remove_dir_all on the pin path deletes exactly the pinned tree;
-        // the implementation opens its own descriptors without following
-        // symlinks.
-        fs::remove_dir_all(super::fd_path(&child)).map_err(|e| {
+        remove_pinned_tree(&child, 0)?;
+        nix::unistd::unlinkat(
+            parent,
+            Path::new(name),
+            nix::unistd::UnlinkatFlags::RemoveDir,
+        )
+        .map_err(|e| {
             NucleusError::FilesystemError(format!(
                 "Failed to remove workspace directory {:?}: {}",
                 name, e
@@ -433,6 +442,36 @@ fn remove_pinned_entry(parent: &OwnedFd, name: &std::ffi::OsStr) -> Result<()> {
             ))
         })
     }
+}
+
+/// Empty a pinned directory tree bottom-up, removing every entry relative to
+/// its pinned parent so a concurrent writer cannot redirect a removal.
+fn remove_pinned_tree(dir: &OwnedFd, depth: u32) -> Result<()> {
+    if depth > MAX_WORKSPACE_DEPTH {
+        return Err(NucleusError::FilesystemError(format!(
+            "Maximum workspace directory depth ({}) exceeded",
+            MAX_WORKSPACE_DEPTH
+        )));
+    }
+    for name in workspace_entry_names(dir, depth)? {
+        let child = super::pinned_child(dir, &name)?;
+        let is_dir = super::pinned_kind(&child)? == nix::sys::stat::SFlag::S_IFDIR;
+        if is_dir {
+            remove_pinned_tree(&child, depth + 1)?;
+        }
+        let flag = if is_dir {
+            nix::unistd::UnlinkatFlags::RemoveDir
+        } else {
+            nix::unistd::UnlinkatFlags::NoRemoveDir
+        };
+        nix::unistd::unlinkat(dir, Path::new(&name), flag).map_err(|e| {
+            NucleusError::FilesystemError(format!(
+                "Failed to remove workspace entry {:?}: {}",
+                name, e
+            ))
+        })?;
+    }
+    Ok(())
 }
 
 fn remove_existing_path(path: &Path) -> Result<()> {
@@ -555,6 +594,61 @@ mod tests {
         set_modes(stage.path());
         sync_workspace_out(stage.path(), host.path()).unwrap();
         check(host.path());
+    }
+
+    #[test]
+    fn test_workspace_sync_removes_deleted_directories() {
+        // Regression (review finding): removing a deleted directory through
+        // the pin must succeed — std::fs::remove_dir_all on /proc/self/fd/N
+        // fails with EPERM, which used to abort the whole sync.
+        let host = tempfile::TempDir::new().unwrap();
+        let stage = tempfile::TempDir::new().unwrap();
+
+        fs::create_dir_all(host.path().join("build").join("nested")).unwrap();
+        fs::write(host.path().join("build").join("nested").join("bin"), b"x").unwrap();
+        fs::write(host.path().join("build").join("lib"), b"y").unwrap();
+        fs::write(host.path().join("keep.txt"), b"keep").unwrap();
+
+        copy_workspace_in(host.path(), stage.path()).unwrap();
+        fs::remove_dir_all(stage.path().join("build")).unwrap();
+
+        sync_workspace_out(stage.path(), host.path()).unwrap();
+
+        assert!(!host.path().join("build").exists());
+        assert!(host.path().join("keep.txt").is_file());
+    }
+
+    #[test]
+    fn test_workspace_sync_replaces_directory_with_file_and_symlink() {
+        // A directory occupied by a stale entry must be cleared through the
+        // pins when staging publishes a file or a symlink under the same name.
+        let host = tempfile::TempDir::new().unwrap();
+        let stage = tempfile::TempDir::new().unwrap();
+
+        fs::create_dir_all(host.path().join("as_file").join("inner")).unwrap();
+        fs::write(host.path().join("as_file").join("inner").join("f"), b"old").unwrap();
+        fs::create_dir_all(host.path().join("as_link")).unwrap();
+        fs::write(host.path().join("as_link").join("f"), b"old").unwrap();
+
+        copy_workspace_in(host.path(), stage.path()).unwrap();
+        fs::remove_dir_all(stage.path().join("as_file")).unwrap();
+        fs::write(stage.path().join("as_file"), b"now a file").unwrap();
+        fs::remove_dir_all(stage.path().join("as_link")).unwrap();
+        symlink(Path::new("as_file"), stage.path().join("as_link")).unwrap();
+
+        sync_workspace_out(stage.path(), host.path()).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(host.path().join("as_file")).unwrap(),
+            "now a file"
+        );
+        assert!(host
+            .path()
+            .join("as_link")
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 
     #[test]
