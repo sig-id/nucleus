@@ -127,6 +127,11 @@ pub(super) struct ErrnoRule {
     /// Test the low 32 bits of seccomp_data.args[1] (second argument, e.g. an
     /// `ioctl` request code).
     pub arg1: Option<ArgMatch>,
+    /// Additional argument tests, ANDed with the fixed fields above. Several
+    /// tests may target the same index: a W^X request has both the
+    /// PROT_WRITE and the PROT_EXEC bit of its protection mask set, which is
+    /// two `AnyBit` tests on argument 2.
+    pub extra_args: &'static [(u8, ArgMatch)],
     pub errno: i32,
 }
 
@@ -188,6 +193,7 @@ pub(super) fn compile_bitmap_bpf_with_errno_syscalls(
         let word_idx = (rule.nr >> 5) as usize;
         if rule.arg0.is_none()
             && rule.arg1.is_none()
+            && rule.extra_args.is_empty()
             && rule.errno == libc::ENOSYS
             && rule.nr >= 0
             && word_idx < NUM_BITMAP_WORDS
@@ -242,6 +248,11 @@ pub(super) fn compile_bitmap_bpf_with_errno_syscalls(
         let tests: Vec<(u32, ArgMatch)> = [(0, rule.arg0), (1, rule.arg1)]
             .into_iter()
             .filter_map(|(index, test)| test.map(|test| (index, test)))
+            .chain(
+                rule.extra_args
+                    .iter()
+                    .map(|(index, test)| (u32::from(*index), *test)),
+            )
             .collect();
         // Each argument test is a load and a jump; a failed test skips the
         // remaining tests and the RET.
@@ -620,6 +631,7 @@ mod tests {
                 arg0: None,
                 arg1: None,
                 errno: libc::ENOSYS,
+                extra_args: &[],
             }],
             SeccompAction::KillProcess,
             SeccompAction::Allow,
@@ -640,6 +652,7 @@ mod tests {
                 arg0: None,
                 arg1: None,
                 errno: libc::ENOSYS,
+                extra_args: &[],
             }],
             SeccompAction::KillProcess,
             SeccompAction::Allow,
@@ -671,6 +684,7 @@ mod tests {
                 arg0: None,
                 arg1: Some(ArgMatch::Eq(libc::FICLONE as u32)),
                 errno: libc::EOPNOTSUPP,
+                extra_args: &[],
             }],
             SeccompAction::KillProcess,
             SeccompAction::Allow,
@@ -898,6 +912,7 @@ mod tests {
                 arg0: Some(ArgMatch::AnyBit(0b1100)),
                 arg1: Some(ArgMatch::Eq(7)),
                 errno: libc::EPERM,
+                extra_args: &[],
             }],
             SeccompAction::KillProcess,
             SeccompAction::Allow,
@@ -1198,10 +1213,13 @@ mod tests {
                 for (prot, expected) in [
                     (libc::PROT_READ | libc::PROT_WRITE, RET_ALLOW),
                     (libc::PROT_READ | libc::PROT_EXEC, RET_ALLOW),
+                    // Refused, but with the errno the kernel uses for the
+                    // same denial, not a kill (#46).
                     (
                         libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
-                        RET_KILL,
+                        WX_REFUSED,
                     ),
+                    (libc::PROT_WRITE | libc::PROT_EXEC, WX_REFUSED),
                 ] {
                     assert_eq!(action(prog, nr, [0, 4096, prot as u64, 0, 0, 0]), expected);
                 }
@@ -1324,6 +1342,47 @@ mod tests {
         assert_eq!(action(&gpu, libc::SYS_pidfd_getfd, [0; 6]), RET_KILL);
     }
 
+    /// The verdict for a mapping request that is writable and executable.
+    const WX_REFUSED: u32 = libc::SECCOMP_RET_ERRNO | libc::EACCES as u32;
+
+    #[test]
+    fn node_startup_probes_are_allowed_by_default() {
+        // V8 and abseil name every anonymous region they map, and libuv
+        // reads its own capability sets; Node 26 does both before user code
+        // runs, and either one used to end in SIGSYS.
+        use crate::security::SeccompManager;
+        let default = SeccompManager::compile_builtin(false, &[], false, false).unwrap();
+        let action = |nr: i64, args: [u64; 6]| {
+            bpf_eval(
+                &default,
+                &make_seccomp_data(
+                    nr as u32,
+                    arch_audit_value(std::env::consts::ARCH.try_into().unwrap()),
+                    args,
+                ),
+            )
+        };
+        // uapi: PR_SET_VMA = 0x53564d41 ("SVMA"), PR_SET_VMA_ANON_NAME = 0.
+        const PR_SET_VMA: u64 = 0x5356_4d41;
+        assert_eq!(
+            action(
+                libc::SYS_prctl,
+                [PR_SET_VMA, 0, 0x1000, 4096, 0x7f00_0000_dead, 0]
+            ),
+            RET_ALLOW
+        );
+        // Only the naming subcommand is allowed.
+        for subcommand in [1, 2] {
+            assert_eq!(
+                action(libc::SYS_prctl, [PR_SET_VMA, subcommand, 0, 0, 0, 0]),
+                RET_KILL
+            );
+        }
+        assert_eq!(action(libc::SYS_capget, [0; 6]), RET_ALLOW);
+        // capset changes credentials and stays denied.
+        assert_eq!(action(libc::SYS_capset, [0; 6]), RET_KILL);
+    }
+
     #[test]
     fn jit_allowance_permits_wx_mappings_and_survives_profiles() {
         use crate::security::SeccompManager;
@@ -1350,7 +1409,7 @@ mod tests {
         for nr in [libc::SYS_mmap, libc::SYS_mprotect] {
             assert_eq!(
                 action(&strict, nr, [0, 4096, rwx as u64, 0, 0, 0]),
-                RET_KILL
+                WX_REFUSED
             );
         }
         // Without the allowance pkey_mprotect is an un-requested opt-in
@@ -1388,7 +1447,7 @@ mod tests {
             );
             assert_eq!(
                 action(&profile_strict, nr, [0, 4096, rwx as u64, 0, 0, 0]),
-                RET_KILL
+                WX_REFUSED
             );
         }
     }

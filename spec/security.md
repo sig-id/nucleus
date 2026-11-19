@@ -119,7 +119,9 @@ keyctl
 bpf             # eBPF program loading
 perf_event_open # Performance monitoring
 userfaultfd     # User fault handling
-io_uring        # Async I/O (potential escape vector)
+io_uring        # Async I/O (large attack surface; probes return ENOSYS,
+                # so libuv/Node >= 26 falls back — opt in for real users)
+capset          # Credential mutation (capget is allowed: read-only)
 ```
 
 Notes:

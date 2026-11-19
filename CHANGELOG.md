@@ -11,8 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `--allow-jit` (launch config `allow_jit`): a per-launch JIT allowance
   for the native seccomp filter. JIT runtimes (V8/Node, JVM, PyPy, LuaJIT, .NET)
   manage code ranges that are writable and executable at once; V8 has no
-  fallback for a denied RWX range, so the default W^X policy killed every
-  Node workload with `SIGSYS` before user code ran (#46). The allowance
+  fallback for a denied RWX range, so under the default W^X policy no
+  Node workload gets as far as user code (#46). The allowance
   permits write+execute mappings through `mmap`, `mprotect`, and
   `pkey_mprotect` (no separate `--seccomp-allow pkey_mprotect` needed), keeps
   every other memory guard enforced (executable `shmat` attachments,
@@ -22,6 +22,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   can attest the posture. W^X stays the default.
 
 ### Fixed
+- Node 26 (V8 14) starts under the built-in seccomp filter. Its startup made
+  two calls that ended in `SIGSYS` before user code ran:
+  `prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME)`, which V8 and abseil use to name
+  every anonymous region they map, is now allowed, argument-filtered to the
+  naming subcommand; and `capget`, a read-only query, is allowed by default
+  (`capset` stays denied). V8 also needs `--allow-jit`.
+- A mapping request that is writable and executable at once now fails with
+  `EACCES` instead of killing the process (#46). The rule is unchanged: no
+  such mapping can be created without `--allow-jit`. `EACCES` is what the
+  kernel returns for the same denial under SELinux `execmem` or
+  `PR_SET_MDWE`, so a JIT runtime started without the allowance reports the
+  refusal (the JVM prints "Failed to mark memory page as executable") where
+  it used to leave only a core dump.
 - The strict-agent native seccomp profile no longer kills the workload with
   `SIGSYS` when it probes an opt-in syscall that was not requested with
   `--seccomp-allow` (#45). Un-requested opt-in calls now return `ENOSYS`,

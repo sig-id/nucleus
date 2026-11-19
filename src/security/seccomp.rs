@@ -79,6 +79,11 @@ const DENIED_CLONE_NAMESPACE_FLAGS: u64 = (libc::CLONE_NEWUSER
     | libc::CLONE_NEWCGROUP
     | libc::CLONE_NEWTIME) as u64;
 
+// The uapi value is the ASCII magic "SVMA". The libc crate exports it only
+// for android and l4re, so the constants live here.
+const PR_SET_VMA: i32 = 0x5356_4d41;
+const PR_SET_VMA_ANON_NAME: i32 = 0;
+
 // Errno rules test only the low 32 bits of the flag argument.
 const _: () = assert!(DENIED_CLONE_NAMESPACE_FLAGS <= u32::MAX as u64);
 
@@ -337,6 +342,8 @@ impl SeccompManager {
     ///   caller may already write (same DAC check as `write`).
     /// - `creat`: `openat(O_CREAT|O_WRONLY|O_TRUNC)`, same LSM hooks.
     /// - `fchmodat2`: `fchmodat` with a flags word (glibc >= 2.39).
+    /// - `capget`: reads capability sets, which `/proc/<pid>/status` also
+    ///   shows; libuv and V8 call it at startup. `capset` stays denied.
     /// - `getsid`, `getpriority`, `sched_get_priority_*`,
     ///   `sched_rr_get_interval`, `sched_getattr`: read-only, confined to
     ///   the PID namespace, siblings of queries already allowed.
@@ -353,6 +360,7 @@ impl SeccompManager {
         "sched_get_priority_min",
         "sched_rr_get_interval",
         "sched_getattr",
+        "capget",
     ];
 
     // Linux takes these syscall arguments as int, including when a caller
@@ -656,6 +664,14 @@ impl SeccompManager {
                 ))
             })?;
         prctl_rules.push(ambient_probe_rule);
+        // Naming an anonymous mapping (it shows up in /proc/<pid>/maps) is
+        // metadata on memory the caller already owns. V8 and abseil name
+        // every region they map, so Node 26 calls this before user code
+        // runs. Other PR_SET_VMA subcommands still hit the default deny.
+        prctl_rules.push(Self::int_rule(&[
+            (0, Eq, PR_SET_VMA),
+            (1, Eq, PR_SET_VMA_ANON_NAME),
+        ])?);
         rules.insert(libc::SYS_prctl, prctl_rules);
 
         // M3: prlimit64 – only allow GET (new_limit == NULL, i.e. arg2 == 0).
@@ -1024,10 +1040,12 @@ impl SeccompManager {
                         arg0: None,
                         arg1: None,
                         errno: libc::ENOSYS,
+                        extra_args: &[],
                     });
                 }
             }
         }
+        errno_rules.extend(Self::wx_errno_rules(&rules));
         Self::compile_rules(rules, &errno_rules)
     }
 
@@ -1176,7 +1194,9 @@ impl SeccompManager {
                 }
             }
         }
-        Self::compile_rules(rules, Self::errno_denied_syscalls())
+        let mut errno_rules = Self::errno_denied_syscalls().to_vec();
+        errno_rules.extend(Self::wx_errno_rules(&rules));
+        Self::compile_rules(rules, &errno_rules)
     }
 
     fn compile_rules(
@@ -1343,6 +1363,37 @@ impl SeccompManager {
         "process_vm_writev",
     ];
 
+    /// Refuse a mapping that is writable and executable at once with
+    /// `EACCES` instead of killing the process (#46).
+    ///
+    /// The invariant is unchanged: without `--allow-jit` no such mapping can
+    /// be created. Only the failure mode changes. `EACCES` is what the kernel
+    /// itself returns when SELinux `execmem` or `PR_SET_MDWE` refuses the same
+    /// request, so a JIT runtime started without the allowance reports the
+    /// refusal (the JVM: "Failed to mark memory page as executable") where it
+    /// used to leave only a SIGSYS core dump.
+    ///
+    /// A rule is emitted only for a protection syscall that is present and
+    /// still argument-filtered: the JIT allowance makes them unconditional,
+    /// and a syscall the policy does not list keeps its own verdict.
+    fn wx_errno_rules(rules: &BTreeMap<i64, Vec<SeccompRule>>) -> Vec<ErrnoRule> {
+        const WRITE_AND_EXEC: &[(u8, ArgMatch)] = &[
+            (2, ArgMatch::AnyBit(libc::PROT_WRITE as u32)),
+            (2, ArgMatch::AnyBit(libc::PROT_EXEC as u32)),
+        ];
+        [libc::SYS_mmap, libc::SYS_mprotect, libc::SYS_pkey_mprotect]
+            .into_iter()
+            .filter(|nr| rules.get(nr).is_some_and(|chain| !chain.is_empty()))
+            .map(|nr| ErrnoRule {
+                nr,
+                arg0: None,
+                arg1: None,
+                errno: libc::EACCES,
+                extra_args: WRITE_AND_EXEC,
+            })
+            .collect()
+    }
+
     fn errno_denied_syscalls() -> &'static [ErrnoRule] {
         &[
             ErrnoRule {
@@ -1350,6 +1401,7 @@ impl SeccompManager {
                 arg0: None,
                 arg1: None,
                 errno: libc::ENOSYS,
+                extra_args: &[],
             },
             // Nested sandboxes (bubblewrap, `unshare -U`, Codex's tool
             // sandbox) create namespaces. Refusing with EPERM, the errno an
@@ -1363,18 +1415,21 @@ impl SeccompManager {
                 arg0: Some(ArgMatch::AnyBit(DENIED_CLONE_NAMESPACE_FLAGS as u32)),
                 arg1: None,
                 errno: libc::EPERM,
+                extra_args: &[],
             },
             ErrnoRule {
                 nr: libc::SYS_unshare,
                 arg0: Some(ArgMatch::AnyBit(DENIED_CLONE_NAMESPACE_FLAGS as u32)),
                 arg1: None,
                 errno: libc::EPERM,
+                extra_args: &[],
             },
             ErrnoRule {
                 nr: libc::SYS_setns,
                 arg0: None,
                 arg1: None,
                 errno: libc::EPERM,
+                extra_args: &[],
             },
             // Nix wrappers probe PR_SET_MM_ARG_START and tolerate EPERM.
             ErrnoRule {
@@ -1382,6 +1437,7 @@ impl SeccompManager {
                 arg0: Some(ArgMatch::Eq(libc::PR_SET_MM as u32)),
                 arg1: None,
                 errno: libc::EPERM,
+                extra_args: &[],
             },
             // coreutils 9.x `cp` probes FICLONE (and FICLONERANGE) on every
             // copy attempt and falls back to a plain read/write loop when the
@@ -1396,12 +1452,14 @@ impl SeccompManager {
                 arg0: None,
                 arg1: Some(ArgMatch::Eq(libc::FICLONE as u32)),
                 errno: libc::EOPNOTSUPP,
+                extra_args: &[],
             },
             ErrnoRule {
                 nr: libc::SYS_ioctl,
                 arg0: None,
                 arg1: Some(ArgMatch::Eq(libc::FICLONERANGE as u32)),
                 errno: libc::EOPNOTSUPP,
+                extra_args: &[],
             },
         ]
     }
@@ -1517,8 +1575,6 @@ impl SeccompManager {
         "setfsuid",
         "setfsgid",
         "setgroups",
-        // Capabilities (read-only query)
-        "capget",
         // Signals (non-default)
         "rt_tgsigqueueinfo",
         // Misc
@@ -2270,16 +2326,16 @@ mod tests {
         // vfork is x86_64-only in the syscall table. #45 grew the counts
         // twice: sendto/recvfrom/sendmsg/recvmsg are argument-filtered in
         // every network mode (+4 offline), and DEFAULT_COMPATIBILITY_SYSCALLS
-        // joined the base list (+12 on x86_64; utimes, utime, futimesat and
-        // creat do not exist on the generic syscall table, so +8 elsewhere).
+        // joined the base list (+13 on x86_64 with capget; utimes, utime, futimesat and
+        // creat do not exist on the generic syscall table, so +9 elsewhere).
         #[cfg(target_arch = "x86_64")]
-        const BASE_COUNT: usize = 180;
+        const BASE_COUNT: usize = 181;
         #[cfg(not(target_arch = "x86_64"))]
-        const BASE_COUNT: usize = 175;
+        const BASE_COUNT: usize = 176;
         #[cfg(target_arch = "x86_64")]
-        const FULL_COUNT_OFFLINE: usize = 196;
+        const FULL_COUNT_OFFLINE: usize = 197;
         #[cfg(not(target_arch = "x86_64"))]
-        const FULL_COUNT_OFFLINE: usize = 191;
+        const FULL_COUNT_OFFLINE: usize = 192;
         assert_eq!(base.len(), BASE_COUNT);
         assert_eq!(net.len(), 5);
         assert_eq!(
@@ -2289,9 +2345,9 @@ mod tests {
             FULL_COUNT_OFFLINE
         );
         #[cfg(target_arch = "x86_64")]
-        const FULL_COUNT_NETWORK: usize = 202;
+        const FULL_COUNT_NETWORK: usize = 203;
         #[cfg(not(target_arch = "x86_64"))]
-        const FULL_COUNT_NETWORK: usize = 197;
+        const FULL_COUNT_NETWORK: usize = 198;
         assert_eq!(
             SeccompManager::minimal_filter(true, &[], false)
                 .unwrap()
