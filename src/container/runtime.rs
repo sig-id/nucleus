@@ -44,7 +44,7 @@ use tempfile::Builder;
 use tracing::{debug, error, info, info_span, warn};
 
 use super::console::{NativeConsoleRelay, NativePty};
-use super::supervisor_link::{die_with_supervisor, Lifeline};
+use super::supervisor_link::{die_with_supervisor, Lifeline, ReapedTree};
 
 /// Container runtime that orchestrates all isolation mechanisms
 ///
@@ -1072,7 +1072,26 @@ impl Container {
         // The container must not outlive this process, however it ends.
         let lifeline = Lifeline::new()?;
         if let Some(cgroup) = &cgroup_opt {
-            if let Err(e) = lifeline.spawn_cgroup_reaper(cgroup.path()) {
+            // Under gVisor the reaper also removes the runsc state and bundle
+            // directory, which the orderly teardown would otherwise remove.
+            let gvisor_state = if !config.use_gvisor {
+                None
+            } else if let Some(base) = runtime_base_override
+                .as_deref()
+                .filter(|_| is_root && gvisor_needs_precreated_userns)
+            {
+                Some(base.to_path_buf())
+            } else {
+                GVisorRuntime::prepare_artifact_base()?;
+                Some(GVisorRuntime::artifact_dir(&config.id)?)
+            };
+            let state = gvisor_state.as_deref().and_then(|dir| {
+                Some(ReapedTree {
+                    parent: dir.parent()?,
+                    name: dir.file_name()?,
+                })
+            });
+            if let Err(e) = lifeline.spawn_cgroup_reaper(cgroup.path(), state) {
                 if config.service_mode.requires_cgroup_enforcement() {
                     return Err(e);
                 }
