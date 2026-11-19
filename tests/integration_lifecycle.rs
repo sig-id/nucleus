@@ -372,4 +372,299 @@ mod tests {
             err
         );
     }
+
+    // --- Opt-in start gate (--start-fd) ---
+
+    /// Everything a gated launch needs: the supervisor process, the gate's
+    /// write end (held by the "orchestrator"), and the event stream file.
+    struct GatedLaunch {
+        child: std::process::Child,
+        gate_writer: Option<std::fs::File>,
+        events_path: std::path::PathBuf,
+        state_root: std::path::PathBuf,
+        /// Drained in the background so debug logging cannot fill the pipe;
+        /// printed when a launch fails so CI failures are diagnosable.
+        stderr_tail: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        stderr_drain: Option<std::thread::JoinHandle<()>>,
+    }
+
+    /// Wait for the background stderr drain to finish and return the tail.
+    fn finish_stderr_tail(launch: &mut GatedLaunch) -> String {
+        if let Some(handle) = launch.stderr_drain.take() {
+            let _ = handle.join();
+        }
+        String::from_utf8_lossy(&launch.stderr_tail.lock().unwrap().clone()).into_owned()
+    }
+
+    /// Spawn `nucleus --events-fd 4 run --start-fd 3 ...` with the gate pipe
+    /// on fd 3 and the event stream on fd 4, as an orchestrator would.
+    ///
+    /// SAFETY: `pre_exec` runs between fork and exec and only calls the
+    /// async-signal-safe `fcntl(F_DUPFD)`, `dup2` and `close`.
+    fn spawn_gated(workload: &str, state_root: &std::path::Path) -> GatedLaunch {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::process::CommandExt;
+        use std::process::Stdio;
+
+        let (gate_reader, gate_writer) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).unwrap();
+        let events_path = state_root.join("events.jsonl");
+        let events = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&events_path)
+            .unwrap();
+        let gate_fd = gate_reader.as_raw_fd();
+        let events_fd = events.as_raw_fd();
+
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_nucleus"));
+        cmd.args(["--events-fd", "4", "run", "--start-fd", "3", "--root"])
+            .arg(state_root)
+            .args([
+                "--runtime",
+                "native",
+                "--trust-level",
+                "trusted",
+                "--rootless",
+                "--pids",
+                "0",
+                "--",
+                "/bin/sh",
+                "-c",
+                workload,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            // Quiet mode (implied by --events-fd) would hide the launch's own
+            // diagnostics; explicit RUST_LOG keeps them for failures.
+            .env("RUST_LOG", "nucleus=debug");
+        // SAFETY: the closure only calls async-signal-safe fcntl/dup2/close.
+        unsafe {
+            cmd.pre_exec(move || {
+                // Copy onto the fixed numbers Nucleus expects without clobbering
+                // either original if it already sits on 3 or 4.
+                let gate_copy = libc::fcntl(gate_fd, libc::F_DUPFD, 10);
+                if gate_copy < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let events_copy = libc::fcntl(events_fd, libc::F_DUPFD, 10);
+                if events_copy < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::dup2(gate_copy, 3) < 0 || libc::dup2(events_copy, 4) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                libc::close(gate_copy);
+                libc::close(events_copy);
+                Ok(())
+            });
+        }
+
+        let mut child = cmd.spawn().unwrap();
+        // Drain the supervisor's stderr in the background so the debug logs
+        // below cannot fill the pipe and block the launch; keep a tail for
+        // failure diagnostics.
+        let stderr_tail = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut stderr_drain = None;
+        if let Some(mut stderr) = child.stderr.take() {
+            let tail = stderr_tail.clone();
+            stderr_drain = Some(std::thread::spawn(move || {
+                use std::io::Read;
+                let mut chunk = [0u8; 4096];
+                loop {
+                    match stderr.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            let mut tail = tail.lock().unwrap();
+                            tail.extend_from_slice(&chunk[..n]);
+                            let len = tail.len();
+                            if len > 24 * 1024 {
+                                tail.drain(..len - 24 * 1024);
+                            }
+                        }
+                    }
+                }
+            }));
+        }
+        // The parent ("orchestrator") keeps only the write end; the child
+        // inherited the read end as fd 3.
+        drop(gate_reader);
+        GatedLaunch {
+            child,
+            gate_writer: Some(gate_writer.into()),
+            events_path,
+            state_root: state_root.to_path_buf(),
+            stderr_tail,
+            stderr_drain,
+        }
+    }
+
+    /// Wait until the event stream contains a record of the given type.
+    /// Skips the test (with a note) if unprivileged user namespaces are
+    /// unavailable on this machine and the launch failed for that reason.
+    fn wait_for_event(launch: &mut GatedLaunch, event_type: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if let Ok(text) = std::fs::read_to_string(&launch.events_path) {
+                for line in text.lines() {
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
+                        if value["type"] == event_type {
+                            return;
+                        }
+                    }
+                }
+            }
+            if let Some(status) = launch.child.try_wait().unwrap() {
+                let stderr = finish_stderr_tail(launch);
+                if stderr.contains("Failed to create namespace")
+                    || stderr.contains("Operation not permitted")
+                {
+                    eprintln!(
+                        "skipping: unprivileged user namespaces are unavailable here \
+                         (nucleus exited {status})"
+                    );
+                    std::process::exit(0);
+                }
+                panic!("nucleus exited with {status} before '{event_type}' was emitted:\n{stderr}");
+            }
+            if std::time::Instant::now() > deadline {
+                let _ = launch.child.kill();
+                panic!("timed out waiting for the '{event_type}' event");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    #[test]
+    fn start_gate_sigterm_cancels_the_hold_and_tears_down() {
+        let state = tempfile::tempdir().unwrap();
+        let mut launch = spawn_gated("echo WORKLOAD-RAN; exit 7", state.path());
+
+        wait_for_event(&mut launch, "container_started");
+
+        // The orchestrator vanishes without touching the gate; the
+        // supervisor's shutdown signal must cancel the hold (a PID-namespace
+        // init ignores default-terminating signals, so plain forwarding is
+        // not enough) and tear the container down in an orderly way.
+        unsafe {
+            libc::kill(launch.child.id() as libc::pid_t, libc::SIGTERM);
+        }
+
+        let output = launch.child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(143));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !stdout.contains("WORKLOAD-RAN"),
+            "the workload must not run when the hold is cancelled: {stdout}"
+        );
+
+        // The cancellation goes through the normal teardown path, so the
+        // summary reports exit status 143 instead of the supervisor dying.
+        let events = event_records(&launch.events_path);
+        let summary = events
+            .iter()
+            .find(|event| event["type"] == "container_summary")
+            .expect("container_summary after the cancelled hold");
+        assert_eq!(summary["exit_status"]["code"], 143);
+    }
+
+    fn event_records(path: &std::path::Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect()
+    }
+
+    #[test]
+    fn start_gate_holds_workload_until_released_after_container_started() {
+        use std::io::Write;
+        let state = tempfile::tempdir().unwrap();
+        let mut launch = spawn_gated("echo WORKLOAD-RAN; exit 7", state.path());
+
+        // The workload stays held after `container_started`: the release
+        // byte has not been written yet.
+        wait_for_event(&mut launch, "container_started");
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert!(
+            launch.child.try_wait().unwrap().is_none(),
+            "the workload must still be held at the start gate"
+        );
+        let so_far = event_records(&launch.events_path);
+        assert!(
+            so_far
+                .iter()
+                .all(|event| event["type"] != "container_summary"),
+            "no summary may be emitted while the workload is held"
+        );
+
+        // Release the gate; the workload runs and its exit code is reported.
+        launch
+            .gate_writer
+            .take()
+            .expect("gate writer held")
+            .write_all(b"go")
+            .unwrap();
+        let output = launch.child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(7));
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("WORKLOAD-RAN"),
+            "the workload should have run after the release byte"
+        );
+
+        let events = event_records(&launch.events_path);
+        let summary = events
+            .iter()
+            .find(|event| event["type"] == "container_summary")
+            .expect("container_summary after the workload exits");
+        assert_eq!(summary["exit_status"]["code"], 7);
+    }
+
+    #[test]
+    fn start_gate_eof_tears_down_without_running_the_workload() {
+        let state = tempfile::tempdir().unwrap();
+        let mut launch = spawn_gated("echo WORKLOAD-RAN; exit 7", state.path());
+
+        wait_for_event(&mut launch, "container_started");
+
+        // Closing the gate without a byte refuses the posture: the container
+        // is torn down and Nucleus exits non-zero without running anything.
+        drop(launch.gate_writer.take().expect("gate writer held"));
+
+        let stderr = finish_stderr_tail(&mut launch);
+        let output = launch.child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !stdout.contains("WORKLOAD-RAN"),
+            "the workload must not run when the gate reaches EOF: {stdout}"
+        );
+        assert!(
+            stderr.contains("Start gate closed"),
+            "the refusal should be reported on stderr: {stderr}"
+        );
+
+        let events = event_records(&launch.events_path);
+        let summary = events
+            .iter()
+            .find(|event| event["type"] == "container_summary")
+            .expect("container_summary after the refusal");
+        let error = summary["exit_status"]["error"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            error.contains("start gate"),
+            "the summary should carry the refusal: {error}"
+        );
+
+        // The teardown removed the persisted state.
+        let leftover: Vec<_> = std::fs::read_dir(&launch.state_root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+            .collect();
+        assert!(leftover.is_empty(), "no container state may survive");
+    }
 }

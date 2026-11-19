@@ -41,6 +41,9 @@ pub enum NucleusError {
     #[error("Process execution failed: {0}")]
     ExecError(String),
 
+    #[error("Start gate closed without a release byte: {0}")]
+    StartGateClosed(String),
+
     #[error("gVisor runtime error: {0}")]
     GVisorError(String),
 

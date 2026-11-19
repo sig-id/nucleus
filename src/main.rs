@@ -725,6 +725,7 @@ const RUN_CONFIG_PATH_CONFLICTS: &[&str] = &[
     "hooks",
     "topology_config_hash",
     "topology_name",
+    "start_fd",
     "command",
 ];
 
@@ -830,6 +831,7 @@ const RUN_CONFIG_FD_CONFLICTS: &[&str] = &[
     "gpu_driver_capabilities",
     "gpu_visible_devices",
     "no_gpu_driver_libs",
+    "start_fd",
     "command",
 ];
 
@@ -983,6 +985,15 @@ enum Commands {
         /// Write container PID to this file after creation
         #[arg(long)]
         pid_file: Option<PathBuf>,
+
+        /// Hold the workload until one byte is written to this inherited
+        /// descriptor. After setup completes Nucleus emits `container_started`
+        /// (use --events-fd/--events-jsonl) and the container's init blocks
+        /// reading this fd; the workload execs only when the byte arrives. If
+        /// the descriptor reaches EOF instead, the container is torn down and
+        /// Nucleus exits non-zero without running the workload.
+        #[arg(long = "start-fd", value_name = "fd")]
+        start_fd: Option<i32>,
 
         /// Path to AF_UNIX socket for console pseudo-terminal master
         #[arg(long)]
@@ -1545,6 +1556,8 @@ struct RunConfig {
     additional_groups: Vec<String>,
     bundle: Option<PathBuf>,
     pid_file: Option<PathBuf>,
+    #[serde(default)]
+    start_fd: Option<i32>,
     console_socket: Option<PathBuf>,
     #[serde(default)]
     terminal: bool,
@@ -1657,6 +1670,7 @@ impl Default for RunConfig {
             additional_groups: Vec::new(),
             bundle: None,
             pid_file: None,
+            start_fd: None,
             console_socket: None,
             terminal: false,
             network: NetworkModeArg::None,
@@ -2263,6 +2277,7 @@ fn try_main() -> Result<i32> {
             additional_groups,
             bundle,
             pid_file,
+            start_fd,
             console_socket,
             terminal,
             network,
@@ -2383,6 +2398,7 @@ fn try_main() -> Result<i32> {
                     additional_groups,
                     bundle,
                     pid_file,
+                    start_fd,
                     console_socket,
                     terminal,
                     network,
@@ -2483,6 +2499,20 @@ fn try_main() -> Result<i32> {
                     "--events-fd cannot be used with --detach; use --events-jsonl so the systemd-managed process can open the stream"
                         .to_string(),
                 ));
+            }
+            if create_request.detach && create_request.start_fd.is_some() {
+                return Err(NucleusError::ConfigError(
+                    "--start-fd cannot be used with --detach: the systemd service does not \
+                     inherit the gate descriptor; run in the foreground instead"
+                        .to_string(),
+                ));
+            }
+            if let (Some(start), Some(events)) = (create_request.start_fd, events_fd) {
+                if start == events {
+                    return Err(NucleusError::ConfigError(
+                        "--start-fd and --events-fd must be different descriptors".to_string(),
+                    ));
+                }
             }
             let _ = resolve_service_mode(create_request.service_mode, create_request.strict_agent)?;
 
@@ -2593,6 +2623,7 @@ fn try_main() -> Result<i32> {
                 additional_groups,
                 bundle,
                 pid_file,
+                start_fd,
                 console_socket,
                 terminal,
                 network,
@@ -3255,6 +3286,12 @@ fn try_main() -> Result<i32> {
                 config.hooks = Some(oci_hooks);
             }
 
+            // Start gate descriptor: inherited by the container's init,
+            // which blocks on it after setup until the caller releases it.
+            if let Some(fd) = start_fd {
+                config = config.with_start_fd(fd);
+            }
+
             // PID file path – canonicalize parent to prevent symlink traversal
             if let Some(ref pid_path) = pid_file {
                 let pid = PathBuf::from(pid_path);
@@ -3550,6 +3587,7 @@ mod tests {
             additional_groups: vec!["27".to_string()],
             bundle: Some(PathBuf::from("/tmp/bundle")),
             pid_file: Some(PathBuf::from("/tmp/pid")),
+            start_fd: None,
             console_socket: Some(PathBuf::from("/tmp/console.sock")),
             terminal: true,
             network: NetworkModeArg::Bridge,
@@ -3675,6 +3713,7 @@ mod tests {
             additional_groups: Vec::new(),
             bundle: None,
             pid_file: None,
+            start_fd: None,
             console_socket: None,
             terminal: false,
             network: NetworkModeArg::None,
@@ -3794,6 +3833,64 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn start_gate_flag_parses_and_conflicts_with_config_documents() {
+        let cli =
+            Cli::try_parse_from(["nucleus", "run", "--start-fd", "7", "--", "/bin/true"]).unwrap();
+        match cli.command {
+            Commands::Create { start_fd, .. } => assert_eq!(start_fd, Some(7)),
+            _ => panic!("expected create command"),
+        }
+
+        // Config documents own the whole launch request; the fd cannot be
+        // mixed in per-option flags.
+        let err = Cli::try_parse_from([
+            "nucleus",
+            "run",
+            "--config",
+            "agent.nucleus.json",
+            "--start-fd",
+            "7",
+            "--",
+            "/bin/true",
+        ])
+        .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+
+        let err = Cli::try_parse_from([
+            "nucleus",
+            "run",
+            "--config-fd",
+            "4",
+            "--start-fd",
+            "7",
+            "--",
+            "/bin/true",
+        ])
+        .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn start_gate_is_part_of_the_launch_config_document() {
+        let config = parse_run_config(
+            r#"{"command":["/bin/true"],"start_fd":9}"#,
+            "test",
+            Some(RunConfigFormat::Json),
+        )
+        .unwrap();
+        assert_eq!(config.start_fd, Some(9));
+
+        // Older documents without the field keep working.
+        let config = parse_run_config(
+            r#"{"command":["/bin/true"]}"#,
+            "test",
+            Some(RunConfigFormat::Json),
+        )
+        .unwrap();
+        assert_eq!(config.start_fd, None);
     }
 
     #[test]

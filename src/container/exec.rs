@@ -276,16 +276,49 @@ impl Container {
                 let child_pid = child;
                 let sig_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let sig_stop_clone = sig_stop.clone();
+                // Raw libc set: glibc's sigwait unblocks the waited set in the
+                // calling thread, which would make this thread the target for
+                // a default-disposition SIGTERM and kill the init. Poll with
+                // sigtimedwait instead, which never changes the mask the
+                // thread inherited (the set blocked above).
+                let mut wait_set: libc::sigset_t = unsafe { std::mem::zeroed() };
+                // SAFETY: sigemptyset/sigaddset only initialize the stack value.
+                unsafe {
+                    libc::sigemptyset(&mut wait_set);
+                    libc::sigaddset(&mut wait_set, libc::SIGTERM);
+                    libc::sigaddset(&mut wait_set, libc::SIGINT);
+                    libc::sigaddset(&mut wait_set, libc::SIGHUP);
+                    libc::sigaddset(&mut wait_set, libc::SIGQUIT);
+                    libc::sigaddset(&mut wait_set, libc::SIGUSR1);
+                    libc::sigaddset(&mut wait_set, libc::SIGUSR2);
+                    libc::sigaddset(&mut wait_set, libc::SIGWINCH);
+                }
+                let wait_slice = libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 200_000_000,
+                };
                 let sig_thread = std::thread::spawn(move || {
                     loop {
-                        if let Ok(signal) = sigset.wait() {
+                        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                        // SAFETY: sigtimedwait writes only into `info`; the
+                        // set and timeout are valid stack values.
+                        let ret = unsafe { libc::sigtimedwait(&wait_set, &mut info, &wait_slice) };
+                        if ret > 0 {
                             // Check the stop flag *after* waking so that the
                             // wake-up signal is not forwarded to the child
                             // during shutdown.
                             if sig_stop_clone.load(std::sync::atomic::Ordering::Acquire) {
                                 break;
                             }
-                            let _ = kill(child_pid, signal);
+                            if let Ok(signal) = Signal::try_from(ret) {
+                                let _ = kill(child_pid, signal);
+                            }
+                            continue;
+                        }
+                        match std::io::Error::last_os_error().raw_os_error() {
+                            // EAGAIN: the wait slice elapsed; EINTR: a handler ran.
+                            Some(e) if e == libc::EAGAIN || e == libc::EINTR => continue,
+                            _ => break,
                         }
                     }
                 });

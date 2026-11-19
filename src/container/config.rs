@@ -888,6 +888,15 @@ pub struct ContainerConfig {
     /// Path to write the container PID (OCI --pid-file).
     pub pid_file: Option<PathBuf>,
 
+    /// Opt-in start gate for the single-phase `run` lifecycle: after setup
+    /// completes and `container_started` is emitted, the container's init
+    /// blocks reading one byte from this inherited descriptor (like the OCI
+    /// exec FIFO) and execs the workload only when the byte arrives. EOF
+    /// without a byte tears the container down without running the workload.
+    /// Launch plumbing only: it never reaches the config hash or persisted
+    /// container state.
+    pub start_fd: Option<RawFd>,
+
     /// Path to AF_UNIX socket for console pseudo-terminal master (OCI --console-socket).
     pub console_socket: Option<PathBuf>,
 
@@ -1024,6 +1033,7 @@ impl ContainerConfig {
             landlock_policy_sha256: None,
             hooks: None,
             pid_file: None,
+            start_fd: None,
             console_socket: None,
             terminal: false,
             console_size: ConsoleSize::default(),
@@ -1476,6 +1486,16 @@ impl ContainerConfig {
         self
     }
 
+    /// Arm the opt-in start gate on an inherited descriptor.
+    ///
+    /// The descriptor must be readable, open, and greater than 2 (stdio stays
+    /// reserved for the workload); `validate_runtime_support` rejects the rest.
+    #[must_use]
+    pub fn with_start_fd(mut self, fd: RawFd) -> Self {
+        self.start_fd = Some(fd);
+        self
+    }
+
     #[must_use]
     pub fn with_pid_file(mut self, path: PathBuf) -> Self {
         self.pid_file = Some(path);
@@ -1734,6 +1754,22 @@ impl ContainerConfig {
     /// Validate runtime-specific feature support.
     pub fn validate_runtime_support(&self) -> crate::error::Result<()> {
         self.limits.validate_runtime_sanity()?;
+        if let Some(fd) = self.start_fd {
+            if fd <= libc::STDERR_FILENO {
+                return Err(crate::error::NucleusError::ConfigError(format!(
+                    "--start-fd must be greater than 2 to keep the start gate separate from \
+                     the workload's stdio, got {}",
+                    fd
+                )));
+            }
+            // SAFETY: fcntl(F_GETFD) only reads descriptor flags.
+            if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+                return Err(crate::error::NucleusError::ConfigError(format!(
+                    "--start-fd {} is not an open descriptor in this process",
+                    fd
+                )));
+            }
+        }
         if self.use_gvisor
             && self.hooks.as_ref().is_some_and(|h| {
                 !h.create_runtime.is_empty()
@@ -2063,6 +2099,7 @@ pub fn validate_hostname(hostname: &str) -> crate::error::Result<()> {
 mod tests {
     use super::*;
     use crate::network::NetworkMode;
+    use std::os::fd::AsRawFd;
 
     fn broker_socket_fixture() -> (tempfile::TempDir, crate::filesystem::BrokerSocket) {
         let dir = tempfile::tempdir().unwrap();
@@ -3332,5 +3369,31 @@ mod tests {
         assert!(!env
             .iter()
             .any(|(k, _)| *k == "__EGL_VENDOR_LIBRARY_FILENAMES"));
+    }
+
+    #[test]
+    fn start_fd_rejects_stdio_and_closed_descriptors() {
+        let config = ContainerConfig::try_new(None, vec!["/bin/sh".into()])
+            .unwrap()
+            .with_start_fd(2);
+        let err = config.validate_runtime_support().unwrap_err().to_string();
+        assert!(err.contains("--start-fd must be greater than 2"), "{err}");
+
+        // 93 is not open in the test process (RLIMIT_NOFILE default keeps it
+        // far above any descriptor the harness holds).
+        let config = ContainerConfig::try_new(None, vec!["/bin/sh".into()])
+            .unwrap()
+            .with_start_fd(93);
+        let err = config.validate_runtime_support().unwrap_err().to_string();
+        assert!(err.contains("not an open descriptor"), "{err}");
+
+        // An open, non-stdio descriptor passes.
+        let file =
+            std::fs::File::create(std::env::temp_dir().join("nucleus-start-fd-probe")).unwrap();
+        let config = ContainerConfig::try_new(None, vec!["/bin/sh".into()])
+            .unwrap()
+            .with_start_fd(file.as_raw_fd());
+        config.validate_runtime_support().unwrap();
+        let _ = std::fs::remove_file(std::env::temp_dir().join("nucleus-start-fd-probe"));
     }
 }

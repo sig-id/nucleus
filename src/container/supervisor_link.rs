@@ -26,6 +26,7 @@ use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicI32, Ordering};
+use tracing::error;
 
 /// Read end of the lifeline in a container setup process, or -1.
 static SUPERVISOR_LINK: AtomicI32 = AtomicI32::new(-1);
@@ -304,6 +305,12 @@ pub(crate) fn die_with_supervisor() -> Result<()> {
         NucleusError::ExecError(format!("Failed to set the parent-death signal: {e}"))
     })?;
     if supervisor_is_gone(link) {
+        // Loud on purpose: a silent exit here is undebuggable from the
+        // supervisor, which only sees the sync pipes reach EOF.
+        error!(
+            "Supervisor lifeline closed before container setup completed; \
+                 exiting without running the workload"
+        );
         std::process::exit(1);
     }
     Ok(())
