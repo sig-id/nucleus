@@ -382,6 +382,18 @@ mod tests {
         gate_writer: Option<std::fs::File>,
         events_path: std::path::PathBuf,
         state_root: std::path::PathBuf,
+        /// Drained in the background so debug logging cannot fill the pipe;
+        /// printed when a launch fails so CI failures are diagnosable.
+        stderr_tail: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        stderr_drain: Option<std::thread::JoinHandle<()>>,
+    }
+
+    /// Wait for the background stderr drain to finish and return the tail.
+    fn finish_stderr_tail(launch: &mut GatedLaunch) -> String {
+        if let Some(handle) = launch.stderr_drain.take() {
+            let _ = handle.join();
+        }
+        String::from_utf8_lossy(&launch.stderr_tail.lock().unwrap().clone()).into_owned()
     }
 
     /// Spawn `nucleus --events-fd 4 run --start-fd 3 ...` with the gate pipe
@@ -423,7 +435,10 @@ mod tests {
             ])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            // Quiet mode (implied by --events-fd) would hide the launch's own
+            // diagnostics; explicit RUST_LOG keeps them for failures.
+            .env("RUST_LOG", "nucleus=debug");
         // SAFETY: the closure only calls async-signal-safe fcntl/dup2/close.
         unsafe {
             cmd.pre_exec(move || {
@@ -446,7 +461,32 @@ mod tests {
             });
         }
 
-        let child = cmd.spawn().unwrap();
+        let mut child = cmd.spawn().unwrap();
+        // Drain the supervisor's stderr in the background so the debug logs
+        // below cannot fill the pipe and block the launch; keep a tail for
+        // failure diagnostics.
+        let stderr_tail = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut stderr_drain = None;
+        if let Some(mut stderr) = child.stderr.take() {
+            let tail = stderr_tail.clone();
+            stderr_drain = Some(std::thread::spawn(move || {
+                use std::io::Read;
+                let mut chunk = [0u8; 4096];
+                loop {
+                    match stderr.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            let mut tail = tail.lock().unwrap();
+                            tail.extend_from_slice(&chunk[..n]);
+                            let len = tail.len();
+                            if len > 24 * 1024 {
+                                tail.drain(..len - 24 * 1024);
+                            }
+                        }
+                    }
+                }
+            }));
+        }
         // The parent ("orchestrator") keeps only the write end; the child
         // inherited the read end as fd 3.
         drop(gate_reader);
@@ -455,6 +495,8 @@ mod tests {
             gate_writer: Some(gate_writer.into()),
             events_path,
             state_root: state_root.to_path_buf(),
+            stderr_tail,
+            stderr_drain,
         }
     }
 
@@ -474,17 +516,7 @@ mod tests {
                 }
             }
             if let Some(status) = launch.child.try_wait().unwrap() {
-                let stderr = launch
-                    .child
-                    .stderr
-                    .take()
-                    .map(|mut pipe| {
-                        let mut text = String::new();
-                        std::io::Read::read_to_string(&mut pipe, &mut text)
-                            .map(|_| text)
-                            .unwrap_or_default()
-                    })
-                    .unwrap_or_default();
+                let stderr = finish_stderr_tail(launch);
                 if stderr.contains("Failed to create namespace")
                     || stderr.contains("Operation not permitted")
                 {
@@ -600,10 +632,10 @@ mod tests {
         // is torn down and Nucleus exits non-zero without running anything.
         drop(launch.gate_writer.take().expect("gate writer held"));
 
+        let stderr = finish_stderr_tail(&mut launch);
         let output = launch.child.wait_with_output().unwrap();
         assert_eq!(output.status.code(), Some(1));
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
             !stdout.contains("WORKLOAD-RAN"),
             "the workload must not run when the gate reaches EOF: {stdout}"
