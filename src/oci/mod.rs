@@ -308,6 +308,23 @@ pub struct OciIntelRdt {
 /// A single OCI lifecycle hook entry.
 ///
 /// Spec: <https://github.com/opencontainers/runtime-spec/blob/main/config.md#posix-platform-hooks>
+/// Where a hook's path resolves and whose owners can be verified there.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum HookNamespace {
+    /// Runtime namespace: owners must be root or the caller.
+    Runtime,
+    /// Container namespaces: owners outside the user namespace are also trusted.
+    Container,
+}
+
+/// A runtime-namespace hook validated before entering the container namespaces.
+#[derive(Debug)]
+pub(crate) struct PreparedHook {
+    hook: OciHook,
+    executable: PathBuf,
+    identity: (u64, u64),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OciHook {
     /// Absolute path to the hook binary.
@@ -384,13 +401,26 @@ impl OciHooks {
     ///
     /// If any hook exits non-zero, an error is returned immediately (remaining hooks are skipped).
     pub fn run_hooks(hooks: &[OciHook], state: &OciContainerState, phase: &str) -> Result<()> {
-        let state_json = serde_json::to_string(state).map_err(|e| {
-            NucleusError::HookError(format!(
-                "Failed to serialize container state for hook: {}",
-                e
-            ))
-        })?;
+        Self::run_hooks_in(hooks, state, phase, HookNamespace::Runtime)
+    }
 
+    /// Like [`Self::run_hooks`] for hooks resolved inside the container's
+    /// namespaces (createContainer, startContainer).
+    pub(crate) fn run_container_hooks(
+        hooks: &[OciHook],
+        state: &OciContainerState,
+        phase: &str,
+    ) -> Result<()> {
+        Self::run_hooks_in(hooks, state, phase, HookNamespace::Container)
+    }
+
+    fn run_hooks_in(
+        hooks: &[OciHook],
+        state: &OciContainerState,
+        phase: &str,
+        namespace: HookNamespace,
+    ) -> Result<()> {
+        let state_json = Self::state_json(state)?;
         for (i, hook) in hooks.iter().enumerate() {
             info!(
                 "Running {} hook [{}/{}]: {}",
@@ -399,10 +429,64 @@ impl OciHooks {
                 hooks.len(),
                 hook.path
             );
-            Self::execute_hook(hook, &state_json, phase)?;
+            let executable = Self::validate_hook(hook, phase, namespace)?;
+            Self::spawn_hook(&executable, hook, &state_json, phase)?;
         }
-
         Ok(())
+    }
+
+    /// Validate runtime-namespace hooks under the current credentials, before
+    /// entering a user namespace where host owners can no longer be verified.
+    pub(crate) fn prepare_hooks(hooks: &[OciHook], phase: &str) -> Result<Vec<PreparedHook>> {
+        hooks
+            .iter()
+            .map(|hook| {
+                let executable = Self::validate_hook(hook, phase, HookNamespace::Runtime)?;
+                let meta = fs::metadata(&executable)?;
+                Ok(PreparedHook {
+                    hook: hook.clone(),
+                    executable,
+                    identity: (meta.dev(), meta.ino()),
+                })
+            })
+            .collect()
+    }
+
+    /// Run hooks validated by [`Self::prepare_hooks`], refusing any whose
+    /// executable was replaced since.
+    pub(crate) fn run_prepared_hooks(
+        prepared: &[PreparedHook],
+        state: &OciContainerState,
+        phase: &str,
+    ) -> Result<()> {
+        let state_json = Self::state_json(state)?;
+        for (i, entry) in prepared.iter().enumerate() {
+            info!(
+                "Running {} hook [{}/{}]: {}",
+                phase,
+                i + 1,
+                prepared.len(),
+                entry.hook.path
+            );
+            let meta = fs::symlink_metadata(&entry.executable)?;
+            if !meta.is_file() || (meta.dev(), meta.ino()) != entry.identity {
+                return Err(NucleusError::HookError(format!(
+                    "{phase} hook {:?} changed after validation",
+                    entry.executable
+                )));
+            }
+            Self::spawn_hook(&entry.executable, &entry.hook, &state_json, phase)?;
+        }
+        Ok(())
+    }
+
+    fn state_json(state: &OciContainerState) -> Result<String> {
+        serde_json::to_string(state).map_err(|e| {
+            NucleusError::HookError(format!(
+                "Failed to serialize container state for hook: {}",
+                e
+            ))
+        })
     }
 
     /// Execute a list of hooks best-effort (log errors but don't fail).
@@ -436,6 +520,11 @@ impl OciHooks {
     }
 
     fn execute_hook(hook: &OciHook, state_json: &str, phase: &str) -> Result<()> {
+        let executable = Self::validate_hook(hook, phase, HookNamespace::Runtime)?;
+        Self::spawn_hook(&executable, hook, state_json, phase)
+    }
+
+    fn validate_hook(hook: &OciHook, phase: &str, namespace: HookNamespace) -> Result<PathBuf> {
         let hook_path = Path::new(&hook.path);
         if !hook_path.is_absolute() {
             return Err(NucleusError::HookError(format!(
@@ -478,14 +567,15 @@ impl OciHooks {
                 "Untrusted resolved {phase} hook {executable:?}"
             )));
         }
-        crate::filesystem::trusted_directory(
-            executable
-                .parent()
-                .expect("trusted executable has a parent"),
-            false,
-        )?;
-        Self::validate_hook_binary(&executable, phase)?;
-        Self::spawn_hook(&executable, hook, state_json, phase)
+        let parent = executable
+            .parent()
+            .expect("trusted executable has a parent");
+        match namespace {
+            HookNamespace::Runtime => crate::filesystem::trusted_directory(parent, false)?,
+            HookNamespace::Container => crate::filesystem::trusted_container_directory(parent)?,
+        };
+        Self::validate_hook_binary(&executable, phase, namespace)?;
+        Ok(executable)
     }
 
     fn spawn_hook(executable: &Path, hook: &OciHook, state_json: &str, phase: &str) -> Result<()> {
@@ -675,7 +765,7 @@ impl OciHooks {
     /// Rejects hooks that are world-writable or group-writable, or owned by
     /// a UID that doesn't match the effective UID or root. This prevents
     /// privilege escalation via tampered hook binaries.
-    fn validate_hook_binary(hook_path: &Path, phase: &str) -> Result<()> {
+    fn validate_hook_binary(hook_path: &Path, phase: &str, namespace: HookNamespace) -> Result<()> {
         // Use symlink_metadata (lstat) to inspect the hook path itself
         // rather than following symlinks, consistent with the rejection
         // of symlinked hooks above.
@@ -700,16 +790,23 @@ impl OciHooks {
             )));
         }
 
-        if crate::filesystem::owner_unmapped(uid) {
+        // Container-namespace hooks may belong to an owner outside the
+        // namespace, but only when that is provable: if the namespace maps
+        // the overflow UID, a user inside it could own this file.
+        let outside = namespace == HookNamespace::Container
+            && crate::filesystem::owner_outside_namespace(uid);
+        if crate::filesystem::owner_unmapped(uid) && !outside {
             return Err(NucleusError::HookError(format!(
-                "{} hook {} is owned by a user outside this user namespace – refusing to execute",
+                "{} hook {} has an owner that cannot be verified from this user namespace \
+                 – refusing to execute",
                 phase,
                 hook_path.display()
             )));
         }
 
-        // Reject hooks owned by arbitrary UIDs – must be root or effective UID
-        if uid != 0 && uid != effective_uid {
+        // Reject hooks owned by arbitrary UIDs – must be root or effective UID,
+        // or (for container-namespace hooks) an owner outside the namespace.
+        if uid != 0 && uid != effective_uid && !outside {
             return Err(NucleusError::HookError(format!(
                 "{} hook {} is owned by UID {} (expected 0 or {}) – refusing to execute",
                 phase,
@@ -2680,6 +2777,98 @@ mod tests {
             env: vec![],
             timeout: Some(5),
         }
+    }
+
+    fn in_unmapped_user_namespace(check: impl FnOnce()) {
+        // unshare(CLONE_NEWUSER) requires a single-threaded caller.
+        match unsafe { nix::unistd::fork().unwrap() } {
+            nix::unistd::ForkResult::Parent { child } => assert_eq!(
+                nix::sys::wait::waitpid(child, None).unwrap(),
+                nix::sys::wait::WaitStatus::Exited(child, 0)
+            ),
+            nix::unistd::ForkResult::Child => {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWUSER).unwrap();
+                    check();
+                }));
+                unsafe { libc::_exit(i32::from(result.is_err())) };
+            }
+        }
+    }
+
+    fn creating_state() -> OciContainerState {
+        OciContainerState {
+            oci_version: "1.0.2".to_string(),
+            id: "test".to_string(),
+            status: OciStatus::Creating,
+            pid: 1,
+            bundle: String::new(),
+        }
+    }
+
+    #[test]
+    fn prepared_runtime_hook_runs_after_entering_user_namespace() {
+        let hooks = [bash_hook("exit 0")];
+        let prepared = OciHooks::prepare_hooks(&hooks, "createRuntime").unwrap();
+        in_unmapped_user_namespace(move || {
+            let err = OciHooks::run_hooks(&hooks, &creating_state(), "createRuntime")
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("not mapped into this user namespace"), "{err}");
+            OciHooks::run_prepared_hooks(&prepared, &creating_state(), "createRuntime").unwrap();
+        });
+    }
+
+    #[test]
+    fn container_hooks_trust_owners_outside_the_user_namespace() {
+        in_unmapped_user_namespace(|| {
+            OciHooks::run_container_hooks(
+                &[bash_hook("exit 0")],
+                &creating_state(),
+                "startContainer",
+            )
+            .unwrap();
+        });
+    }
+
+    #[test]
+    fn container_hooks_refuse_an_owner_the_namespace_could_hold() {
+        // A 65,536-ID mapping (root remapping) makes the overflow UID a real
+        // user inside the namespace, so an overflow-UID owner proves nothing.
+        let uid = nix::unistd::Uid::current();
+        let overflow = std::fs::read_to_string("/proc/sys/kernel/overflowuid")
+            .unwrap()
+            .trim()
+            .to_owned();
+        in_unmapped_user_namespace(move || {
+            // Hosts that confine unprivileged user namespaces (AppArmor on
+            // Ubuntu) refuse the map write; nothing to check there.
+            if std::fs::write("/proc/self/uid_map", format!("{overflow} {uid} 1")).is_err() {
+                return;
+            }
+            let err = OciHooks::run_container_hooks(
+                &[bash_hook("exit 0")],
+                &creating_state(),
+                "startContainer",
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains("cannot be verified") || err.contains("Cannot verify directory"),
+                "{err}"
+            );
+        });
+    }
+
+    #[test]
+    fn prepared_hook_rejects_replaced_executable() {
+        let hook = bash_hook("exit 0");
+        let mut prepared = OciHooks::prepare_hooks(&[hook], "createRuntime").unwrap();
+        prepared[0].identity.1 ^= 1;
+        let err = OciHooks::run_prepared_hooks(&prepared, &creating_state(), "createRuntime")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("changed after validation"), "{err}");
     }
 
     #[test]
