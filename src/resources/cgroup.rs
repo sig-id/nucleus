@@ -17,6 +17,10 @@ use tracing::{debug, info, warn};
 const CGROUP_V2_ROOT: &str = "/sys/fs/cgroup";
 const CGROUP2_SUPER_MAGIC: libc::c_long = 0x6367_7270;
 const NUCLEUS_CGROUP_ROOT_ENV: &str = "NUCLEUS_CGROUP_ROOT";
+/// Controllers behind the limits Nucleus can set.
+const LIMIT_CONTROLLERS: &[&str] = &["cpu", "io", "memory", "pids"];
+/// Leaf a supervisor moves into when it starts directly in its delegated cgroup.
+const SUPERVISOR_LEAF: &str = "nucleus-supervisor";
 const CGROUP_CLEANUP_RETRIES: usize = 50;
 const CGROUP_CLEANUP_SLEEP: Duration = Duration::from_millis(20);
 const CGROUP_FREEZE_RETRIES: usize = 100;
@@ -30,6 +34,8 @@ pub struct Cgroup {
     path: PathBuf,
     state: CgroupState,
     cleanup_on_drop: bool,
+    /// Why the parent could not enable resource controllers, if it could not.
+    controllers_error: Option<String>,
 }
 
 /// RAII guard for a frozen cgroup v2 subtree.
@@ -63,17 +69,176 @@ impl Cgroup {
 
         Self::validate_cgroup_directory(&path)?;
 
+        // Without controllers the cgroup still tracks and kills the
+        // workload; the reason is reported if a limit later cannot be set.
+        let controllers_error = Self::enable_controllers(root)
+            .inspect_err(|e| debug!("{e}"))
+            .err()
+            .map(|e| e.to_string());
+
         Ok(Self {
             path,
             state,
             cleanup_on_drop: true,
+            controllers_error,
         })
     }
 
+    /// Pick the parent for container cgroups.
+    ///
+    /// An explicit `NUCLEUS_CGROUP_ROOT` wins. Otherwise a subtree the service
+    /// manager delegated to this caller is used, so an unprivileged
+    /// orchestrator running in a `Delegate=yes` unit gets real resource
+    /// enforcement. The cgroup filesystem root remains the fallback; only
+    /// host root can create cgroups there.
     fn root_path() -> Result<PathBuf> {
-        let path = Self::root_path_from_override(std::env::var_os(NUCLEUS_CGROUP_ROOT_ENV))?;
+        let path = match std::env::var_os(NUCLEUS_CGROUP_ROOT_ENV) {
+            Some(raw) if !raw.is_empty() => Self::root_path_from_override(Some(raw))?,
+            _ => match Self::delegated_root() {
+                Some(delegated) => {
+                    debug!("Using delegated cgroup subtree {:?}", delegated);
+                    delegated
+                }
+                None => PathBuf::from(CGROUP_V2_ROOT),
+            },
+        };
         Self::validate_root_path(&path)?;
         Ok(path)
+    }
+
+    /// The cgroup this process is a member of, as a path on the v2 mount.
+    fn own_cgroup_path() -> Option<PathBuf> {
+        let membership = fs::read_to_string("/proc/self/cgroup").ok()?;
+        Self::own_cgroup_path_from(&membership, Path::new(CGROUP_V2_ROOT))
+    }
+
+    fn own_cgroup_path_from(membership: &str, mount: &Path) -> Option<PathBuf> {
+        // The unified hierarchy is the entry with hierarchy ID 0 and no
+        // controller list: "0::/user.slice/...".
+        let relative = membership
+            .lines()
+            .find_map(|line| line.strip_prefix("0::"))?
+            .trim_end_matches(" (deleted)");
+        let relative = Path::new(relative).strip_prefix("/").ok()?;
+        if relative
+            .components()
+            .any(|part| !matches!(part, Component::Normal(_)))
+        {
+            return None;
+        }
+        Some(mount.join(relative))
+    }
+
+    /// Find the subtree delegated to this process, if any.
+    ///
+    /// Ownership alone does not identify one: every cgroup below a systemd
+    /// user manager is owned by the user, yet belongs to that manager. The
+    /// manager marks the boundary of a `Delegate=` unit with a `delegate`
+    /// extended attribute, so only a marked cgroup is treated as ours.
+    ///
+    /// Two layouts are recognised: this process sits directly in the
+    /// delegated cgroup, or in a direct child of it (`DelegateSubgroup=`, the
+    /// layout that leaves the delegated cgroup free of member processes).
+    /// Deeper arrangements must name the root with `NUCLEUS_CGROUP_ROOT`.
+    fn delegated_root() -> Option<PathBuf> {
+        let own = Self::own_cgroup_path()?;
+        Self::delegated_root_for(
+            &own,
+            Path::new(CGROUP_V2_ROOT),
+            Self::is_delegated_to_caller,
+        )
+    }
+
+    fn delegated_root_for(
+        own: &Path,
+        mount: &Path,
+        is_delegated: impl Fn(&Path) -> bool,
+    ) -> Option<PathBuf> {
+        [Some(own), own.parent()]
+            .into_iter()
+            .flatten()
+            .filter(|candidate| candidate.starts_with(mount) && *candidate != mount)
+            .find(|candidate| is_delegated(candidate))
+            .map(Path::to_path_buf)
+    }
+
+    fn is_delegated_to_caller(path: &Path) -> bool {
+        let marked = ["user.delegate", "trusted.delegate"]
+            .iter()
+            .any(|name| Self::read_xattr(path, name).as_deref() == Some(b"1".as_slice()));
+        marked
+            && [path.to_path_buf(), path.join("cgroup.subtree_control")]
+                .iter()
+                .all(|needed| nix::unistd::access(needed, nix::unistd::AccessFlags::W_OK).is_ok())
+    }
+
+    fn read_xattr(path: &Path, name: &str) -> Option<Vec<u8>> {
+        let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
+        let c_name = CString::new(name).ok()?;
+        let mut value = [0u8; 16];
+        // SAFETY: both strings are NUL-terminated and `value` is valid for
+        // `value.len()` bytes of writes.
+        let len = unsafe {
+            libc::getxattr(
+                c_path.as_ptr(),
+                c_name.as_ptr(),
+                value.as_mut_ptr().cast(),
+                value.len(),
+            )
+        };
+        usize::try_from(len).ok().map(|len| value[..len].to_vec())
+    }
+
+    /// Make the resource controllers available to children of `root`.
+    ///
+    /// The cgroup filesystem root is left to the service manager. In a
+    /// delegated subtree nobody else enables controllers for us.
+    fn enable_controllers(root: &Path) -> Result<()> {
+        if root == Path::new(CGROUP_V2_ROOT) {
+            return Ok(());
+        }
+        let available = Self::read_value_at(root, "cgroup.controllers")?;
+        let enabled = Self::read_value_at(root, "cgroup.subtree_control")?;
+        let missing: Vec<&str> = LIMIT_CONTROLLERS
+            .iter()
+            .copied()
+            .filter(|wanted| available.split_whitespace().any(|name| name == *wanted))
+            .filter(|wanted| !enabled.split_whitespace().any(|name| name == *wanted))
+            .collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let request = missing
+            .iter()
+            .map(|name| format!("+{name}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        if Self::write_value_at(root, "cgroup.subtree_control", &request).is_ok() {
+            return Ok(());
+        }
+        // A cgroup cannot both hold processes and distribute controllers. If
+        // the only obstacle is this process, step into a leaf and retry;
+        // other members are the delegatee's to place, not ours.
+        if Self::own_cgroup_path().as_deref() == Some(root) {
+            let leaf = root.join(SUPERVISOR_LEAF);
+            match fs::create_dir(&leaf) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => {
+                    return Err(NucleusError::CgroupError(format!(
+                        "Failed to create supervisor cgroup {leaf:?}: {e}"
+                    )))
+                }
+            }
+            Self::join_existing(&leaf)?;
+        }
+        Self::write_value_at(root, "cgroup.subtree_control", &request).map_err(|e| {
+            NucleusError::CgroupError(format!(
+                "cannot enable controllers ({request}) in {root:?}: {e}. A cgroup that has member \
+                 processes cannot enable controllers for its children; run the caller in a \
+                 sub-cgroup of the delegated unit (systemd DelegateSubgroup=)"
+            ))
+        })
     }
 
     fn root_path_from_override(raw: Option<OsString>) -> Result<PathBuf> {
@@ -336,7 +501,10 @@ impl Cgroup {
 
     /// Write a value to a cgroup file
     fn write_value(&self, file: &str, value: &str) -> Result<()> {
-        Self::write_value_at(&self.path, file, value)
+        Self::write_value_at(&self.path, file, value).map_err(|e| match &self.controllers_error {
+            Some(reason) => NucleusError::CgroupError(format!("{e} ({reason})")),
+            None => e,
+        })
     }
 
     fn write_value_at(path: &Path, file: &str, value: &str) -> Result<()> {
@@ -718,6 +886,64 @@ mod tests {
     }
 
     #[test]
+    fn own_cgroup_is_read_from_the_unified_hierarchy_entry() {
+        let mount = Path::new("/sys/fs/cgroup");
+        let own = |membership| Cgroup::own_cgroup_path_from(membership, mount);
+        assert_eq!(
+            own("0::/system.slice/mitos.service/supervisor\n"),
+            Some(PathBuf::from(
+                "/sys/fs/cgroup/system.slice/mitos.service/supervisor"
+            ))
+        );
+        // Hybrid hosts list v1 hierarchies first.
+        assert_eq!(
+            own("12:pids:/user.slice\n1:name=systemd:/x\n0::/unit.scope\n"),
+            Some(PathBuf::from("/sys/fs/cgroup/unit.scope"))
+        );
+        assert_eq!(own("0::/\n"), Some(mount.to_path_buf()));
+        assert_eq!(own("1:name=systemd:/x\n"), None);
+        assert_eq!(own("0::/../escape\n"), None);
+    }
+
+    #[test]
+    fn delegated_root_is_the_marked_cgroup_or_its_parent() {
+        let mount = Path::new("/sys/fs/cgroup");
+        let unit = mount.join("system.slice/mitos.service");
+        let leaf = unit.join("supervisor");
+        let marked = |target: PathBuf| move |candidate: &Path| candidate == target;
+
+        // DelegateSubgroup= layout: the process sits one level below.
+        assert_eq!(
+            Cgroup::delegated_root_for(&leaf, mount, marked(unit.clone())),
+            Some(unit.clone())
+        );
+        // The process sits directly in the delegated cgroup.
+        assert_eq!(
+            Cgroup::delegated_root_for(&unit, mount, marked(unit.clone())),
+            Some(unit.clone())
+        );
+        // A marked grandparent belongs to whoever manages the levels between.
+        assert_eq!(
+            Cgroup::delegated_root_for(&leaf.join("deeper"), mount, marked(unit.clone())),
+            None
+        );
+        assert_eq!(Cgroup::delegated_root_for(&leaf, mount, |_| false), None);
+        // The filesystem root is never treated as a delegated subtree.
+        assert_eq!(
+            Cgroup::delegated_root_for(&mount.join("top"), mount, |_| true),
+            Some(mount.join("top"))
+        );
+        assert_eq!(Cgroup::delegated_root_for(mount, mount, |_| true), None);
+    }
+
+    #[test]
+    fn unmarked_cgroups_are_not_delegated() {
+        // The cgroup root carries no delegation marker.
+        assert!(!Cgroup::is_delegated_to_caller(Path::new(CGROUP_V2_ROOT)));
+        assert!(!Cgroup::is_delegated_to_caller(Path::new("/nonexistent")));
+    }
+
+    #[test]
     fn test_cgroup_name_must_be_single_path_component() {
         assert!(Cgroup::validate_cgroup_name("nucleus-abc123").is_ok());
         assert!(Cgroup::validate_cgroup_name("").is_err());
@@ -785,6 +1011,7 @@ mod tests {
 
         let cgroup = Cgroup {
             cleanup_on_drop: true,
+            controllers_error: None,
             path,
             state: CgroupState::Removed,
         };
@@ -803,6 +1030,7 @@ mod tests {
 
         let cgroup = Cgroup {
             cleanup_on_drop: true,
+            controllers_error: None,
             path,
             state: CgroupState::Removed,
         };

@@ -251,11 +251,41 @@ impl Container {
         if !self.config.volumes.is_empty() {
             let offset = oci_config.mounts.len();
             oci_config = oci_config.with_volume_mounts(&self.config.volumes)?;
+            // Staging re-pins each source under the policy its volume was
+            // declared with; OCI mounts only carry the source path.
+            let caller_owned: std::collections::HashMap<_, _> = self
+                .config
+                .volumes
+                .iter()
+                .filter_map(|volume| match &volume.source {
+                    super::VolumeSource::Bind {
+                        source,
+                        caller_owned,
+                    } => Some((source.as_path(), caller_owned.as_ref())),
+                    super::VolumeSource::Tmpfs { .. } => None,
+                })
+                .collect();
             stage_bind_sources(
                 &artifact_dir,
                 offset,
                 &mut oci_config.mounts[offset..],
-                crate::filesystem::pin_volume_source,
+                |source| {
+                    crate::filesystem::pin_bind_volume_source(
+                        source,
+                        caller_owned.get(source).copied().flatten(),
+                    )
+                },
+            )?;
+        }
+
+        if let Some(broker) = &self.config.broker_socket {
+            let offset = oci_config.mounts.len();
+            oci_config = oci_config.with_broker_socket_mount(broker);
+            stage_bind_sources(
+                &artifact_dir,
+                offset,
+                &mut oci_config.mounts[offset..],
+                |_| broker.pin(),
             )?;
         }
 
@@ -409,6 +439,7 @@ impl Container {
                 require_supervisor_exec_policy,
                 platform,
                 console_socket: self.config.console_socket.clone(),
+                host_uds_open: self.config.broker_socket.is_some(),
             },
         )?;
 
@@ -435,8 +466,13 @@ impl Container {
                     normalized, e
                 ))
             })?;
-            let file = mount.mount_type == "bind" && std::path::Path::new(&mount.source).is_file();
-            crate::filesystem::mount_target(rootfs, relative, !file)?;
+            // A bind source that is not a directory (a regular file, or the
+            // broker's unix socket) needs a file mountpoint.
+            let directory = mount.mount_type != "bind"
+                || std::path::Path::new(&mount.source)
+                    .metadata()
+                    .is_ok_and(|source| source.is_dir());
+            crate::filesystem::mount_target(rootfs, relative, directory)?;
         }
 
         Ok(())

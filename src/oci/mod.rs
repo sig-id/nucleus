@@ -1231,6 +1231,19 @@ impl OciConfig {
         Ok(self)
     }
 
+    /// Expose the egress broker's host socket at its fixed container path.
+    pub fn with_broker_socket_mount(mut self, socket: &crate::filesystem::BrokerSocket) -> Self {
+        self.mounts.push(OciMount {
+            destination: crate::filesystem::BROKER_SOCKET_CONTAINER_PATH.to_string(),
+            source: socket.host_path().to_string_lossy().to_string(),
+            mount_type: "bind".to_string(),
+            options: ["bind", "ro", "nosuid", "nodev", "noexec"]
+                .map(String::from)
+                .to_vec(),
+        });
+        self
+    }
+
     /// Add bind or tmpfs volume mounts.
     pub fn with_volume_mounts(mut self, volumes: &[crate::container::VolumeMount]) -> Result<Self> {
         use crate::container::VolumeSource;
@@ -1238,8 +1251,11 @@ impl OciConfig {
         for volume in volumes {
             let dest = normalize_volume_destination(&volume.dest)?;
             match &volume.source {
-                VolumeSource::Bind { source } => {
-                    crate::filesystem::validate_bind_mount_source(source)?;
+                VolumeSource::Bind {
+                    source,
+                    caller_owned,
+                } => {
+                    crate::filesystem::pin_bind_volume_source(source, caller_owned.as_ref())?;
                     let mut options = vec![
                         "bind".to_string(),
                         "nosuid".to_string(),
@@ -2382,6 +2398,7 @@ mod tests {
                 crate::container::VolumeMount {
                     source: crate::container::VolumeSource::Bind {
                         source: tmp.path().to_path_buf(),
+                        caller_owned: None,
                     },
                     dest: std::path::PathBuf::from("/var/lib/app"),
                     read_only: true,
@@ -2508,6 +2525,7 @@ mod tests {
             .with_volume_mounts(&[crate::container::VolumeMount {
                 source: crate::container::VolumeSource::Bind {
                     source: std::path::PathBuf::from("/proc/sys"),
+                    caller_owned: None,
                 },
                 dest: std::path::PathBuf::from("/host-proc"),
                 read_only: true,
@@ -2524,6 +2542,7 @@ mod tests {
             .with_volume_mounts(&[crate::container::VolumeMount {
                 source: crate::container::VolumeSource::Bind {
                     source: tmp.path().to_path_buf(),
+                    caller_owned: None,
                 },
                 dest: std::path::PathBuf::from("/usr/bin"),
                 read_only: true,

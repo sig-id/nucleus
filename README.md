@@ -282,6 +282,85 @@ env_vars = ["RUST_LOG=info"]
 seccomp_log_denied = true
 ```
 
+### Embedding in an Orchestrator
+
+An orchestrator that launches Nucleus per task, reads the workload's stdio as
+data and may be killed at any time needs a few guarantees beyond a plain CLI
+run.
+
+**Clean stdio.** `--quiet` keeps Nucleus off the workload's streams: the
+container ID is not printed on stdout, and stderr logging defaults to errors.
+`--events-fd` and `create --config-fd` imply it. The ID is reported in the
+`container_started` and `container_summary` events; with `--config-fd` and no
+event stream it is still printed, since nothing else would carry it. `RUST_LOG`
+and `--log <file>` keep full logging available.
+
+```bash
+nucleus --events-fd 5 run --config-fd 4 4<request.json 5>events.jsonl
+```
+
+**No orphans.** The container dies with its supervisor. Every setup process
+arms a parent-death signal, so killing only the `nucleus` process (SIGKILL, OOM)
+takes the container's init, and with it the PID namespace or the gVisor
+sandbox, down too. When the container has a cgroup, a small detached reaper
+kills and removes that cgroup once the supervisor is gone.
+
+**Caller-owned volumes.** `--volume` refuses every source under `/home`, `/tmp`,
+`/run` and `/var/lib`. Add the `caller-owned` option to mount a directory you
+own there, such as a per-attempt directory:
+
+```bash
+nucleus run --volume /var/lib/mitos/attempts/42:/attempt:rw,caller-owned -- ./agent
+```
+
+The directory must be owned by the calling user and not world-writable. Whole
+home and runtime directories (`/home/alice`, `/run/user/1000`), the shared
+parents themselves, system trees such as `/etc` and `/proc`, and Nucleus' own
+state stay refused.
+
+**Brokered egress without a network.** `--broker-socket PATH` gives a workload
+one way out: a host unix socket, mounted read-only at `/run/nucleus/broker.sock`
+and named in `NUCLEUS_BROKER_SOCKET`. It requires `--network none` and works
+rootless. The container keeps its private network namespace with loopback as
+the only interface, and IP sockets are allowed so that a forwarder inside the
+container can listen on `127.0.0.1` for `HTTPS_PROXY` clients and relay through
+the socket. The host-side broker owns policy, credentials and auditing.
+
+```bash
+nucleus run --broker-socket /run/mitos/relay.sock \
+  --env HTTPS_PROXY=http://127.0.0.1:3128 -- ./agent
+```
+
+The socket must be owned by the calling user. Under the native runtime,
+Landlock (kernel ABI 9 or later) confines pathname socket connections to the
+broker socket; on older kernels the mount namespace is the limit. Under gVisor
+the socket is passed with `--host-uds=open`, which has no per-socket form: the
+sandbox can connect to any host socket inside the paths you mount, so do not
+mount directories that contain other sockets.
+
+**Resource limits without root.** Container cgroups are created in the subtree
+delegated to the caller when there is one, so strict modes work for an
+unprivileged service:
+
+```ini
+# mitos.service
+[Service]
+User=mitos
+Delegate=cpu io memory pids
+DelegateSubgroup=supervisor
+```
+
+Nucleus recognises the delegation marker that systemd's system manager sets
+on a `Delegate=` unit, when it runs in that cgroup or in a direct child of it
+(`DelegateSubgroup=`), and enables the controllers it needs there. A delegated
+cgroup that still has member processes cannot hand controllers to its children:
+keep the orchestrator in a subgroup. A lone `nucleus` moves itself into a
+`nucleus-supervisor` leaf. systemd's user manager does not set the marker, and
+other layouts are not guessed: name the subtree with `NUCLEUS_CGROUP_ROOT`.
+Without root or a delegated subtree, strict modes fail rather than run
+unlimited. The effective cgroup is reported as `container.cgroup_path` in the
+event stream.
+
 ### Workspace
 
 `--workspace <host-path>` mounts the host project tree at `/workspace`. The
@@ -1236,7 +1315,7 @@ permissions must exclude group and other writes. Host root uses
 
 ## Machine-Readable Events
 
-Use `--events-jsonl <path>` to write control-plane lifecycle events as JSON Lines, or `--events-fd <fd>` to write them to an inherited file descriptor. The stream is separate from workload stdout/stderr and PTY bytes; operators can consume it without parsing user process output. `--events-fd` rejects stdio descriptors and is not available with `--detach`; use `--events-jsonl` for detached containers.
+Use `--events-jsonl <path>` to write control-plane lifecycle events as JSON Lines, or `--events-fd <fd>` to write them to an inherited file descriptor. The stream is separate from workload stdout/stderr and PTY bytes; operators can consume it without parsing user process output. `--events-fd` rejects stdio descriptors and is not available with `--detach`; use `--events-jsonl` for detached containers. `--events-fd` also implies `--quiet`, so the container ID and informational logs stay off the workload's stdout and stderr.
 
 Events include a container start record and a final summary record. The records carry the container ID, PID, cgroup path, workspace/context mount, network mode, seccomp mode, Landlock status, capability status, resource limits, exit status, resource stats, and whether cleanup succeeded.
 

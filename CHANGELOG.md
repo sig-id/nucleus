@@ -7,7 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `--quiet` keeps Nucleus off the workload's stdio: the container ID is not
+  printed on stdout and stderr logging defaults to errors. `--events-fd` and
+  `create --config-fd` imply it; the ID is reported in the event stream.
+- `--broker-socket PATH` for rootless brokered egress: one host unix socket is
+  mounted at `/run/nucleus/broker.sock` (`NUCLEUS_BROKER_SOCKET`) in a container
+  that keeps `--network none`. Loopback is raised and IP sockets are allowed so
+  an in-container proxy forwarder can listen on `127.0.0.1`. Under the native
+  runtime Landlock confines pathname socket connections to that socket (kernel
+  ABI 9 or later); gVisor is started with `--host-uds=open`.
+- Bind volumes accept a `caller-owned` option (`SOURCE:DEST:rw,caller-owned`)
+  that admits a directory owned by the calling user under `/home`, `/tmp`,
+  `/run` or `/var/lib`.
+- Container cgroups are created in the caller's delegated subtree when systemd
+  marks one (`Delegate=`, optionally `DelegateSubgroup=`), and the needed
+  controllers are enabled there, so strict modes get resource enforcement
+  without root. `NUCLEUS_CGROUP_ROOT` roots get the same controller setup.
+
+### Changed
+- `--events-fd` no longer prints the container ID on stdout, and `--events-fd`
+  and `create --config-fd` log only errors to stderr by default. Set `RUST_LOG`
+  or `--log` for the previous verbosity.
+- The `network_mode` field of control events is `broker-socket` in that mode.
+
 ### Fixed
+- Killing only the supervisor no longer orphans the workload. Container setup
+  processes die with their parent, and a detached reaper kills and removes the
+  container cgroup when the supervisor is gone.
+- gVisor bind mounts of non-regular files (such as sockets) get a file
+  mountpoint instead of a directory.
 - OCI hooks run in user-namespaced native containers (rootless, and root-run
   production containers, which are root-remapped). Their trust checks ran
   after entering the user namespace, where host-root-owned binaries and

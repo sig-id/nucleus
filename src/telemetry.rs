@@ -18,9 +18,14 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 /// RUST_LOG is respected but capped at `debug` to prevent `trace`-level
 /// output from leaking sensitive runtime data (syscall args, memory
 /// contents, etc.) in production.
-pub fn init_tracing(log: Option<&Path>, log_format: &str) -> Result<()> {
+///
+/// `quiet` lowers the default to `error` when diagnostics share stderr with
+/// the workload. An explicit `RUST_LOG` or a `--log` file keeps full output:
+/// neither one mixes runtime chatter into the stream a caller is parsing.
+pub fn init_tracing(log: Option<&Path>, log_format: &str, quiet: bool) -> Result<()> {
     let env_filter = match tracing_subscriber::EnvFilter::try_from_default_env() {
         Ok(filter) => filter,
+        Err(_) if quiet && log.is_none() => tracing_subscriber::EnvFilter::new("error"),
         Err(_) => tracing_subscriber::EnvFilter::new("info")
             .add_directive("nucleus=debug".parse().expect("valid tracing directive")),
     };
@@ -306,7 +311,12 @@ impl ContainerEventMetadata {
                     allow_execute: config.workspace.allow_execute,
                 }
             }),
-            network_mode: network_mode_label(&config.network).to_string(),
+            network_mode: if config.broker_socket.is_some() {
+                "broker-socket"
+            } else {
+                network_mode_label(&config.network)
+            }
+            .to_string(),
         }
     }
 }

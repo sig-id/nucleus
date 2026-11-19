@@ -976,6 +976,313 @@ pub(crate) fn pin_provider_source(source: &Path) -> Result<OwnedFd> {
     pin_checked_source(source, reject_denied_provider_config_source)
 }
 
+/// Host subtrees that stay off limits even for a caller-owned volume.
+///
+/// The shared and per-user data trees (`/home`, `/tmp`, `/run`, `/var/lib`)
+/// are deliberately absent: a caller-owned volume may live under them.
+const DENIED_CALLER_OWNED_SOURCE_PREFIXES: &[&str] = &[
+    "/boot",
+    "/dev",
+    "/etc",
+    "/proc",
+    "/root",
+    "/sys",
+    "/var/log",
+    "/var/run",
+    "/var/spool",
+    "/nix/var",
+    // Nucleus' own state when run as root: container records, runtime
+    // mounts, signing keys. Rootless locations are resolved at run time by
+    // `nucleus_private_paths`.
+    "/var/lib/nucleus",
+    "/run/nucleus",
+    "/run/nucleus-gvisor",
+];
+
+/// Where this caller's Nucleus keeps state that a workload must never see:
+/// container records, gVisor artifacts, and the image and checkpoint keys.
+///
+/// These are the rootless counterparts of the fixed `/var/lib/nucleus` and
+/// `/run/nucleus` entries. They live in directories the caller owns, so the
+/// ownership test alone would admit them.
+fn nucleus_private_paths() -> Vec<PathBuf> {
+    let uid = nix::unistd::Uid::effective().as_raw();
+    let mut paths = vec![
+        PathBuf::from(format!("/tmp/nucleus-{uid}")),
+        std::env::temp_dir().join(format!("nucleus-gvisor-{uid}")),
+        PathBuf::from("/tmp/nucleus-checkpoint-hmac.key"),
+    ];
+    if let Some(runtime) = dirs::runtime_dir() {
+        paths.extend([runtime.join("nucleus"), runtime.join("nucleus-gvisor")]);
+    }
+    if let Some(data) = dirs::data_local_dir() {
+        paths.push(data.join("nucleus"));
+    }
+    if let Some(home) = dirs::home_dir() {
+        paths.push(home.join(".nucleus"));
+    }
+    // Operator-chosen locations for the same state.
+    paths.extend(
+        [
+            "NUCLEUS_STATE_DIR",
+            "NUCLEUS_GVISOR_ARTIFACT_BASE",
+            crate::image::IMAGE_SIGNING_KEY_ENV,
+            crate::image::IMAGE_VERIFY_KEY_ENV,
+        ]
+        .into_iter()
+        .filter_map(std::env::var_os)
+        .filter(|value| !value.is_empty())
+        .filter_map(|value| std::path::absolute(value).ok()),
+    );
+    // Match however the caller spelled the source: compare the resolved
+    // form of each location as well.
+    let resolved: Vec<_> = paths
+        .iter()
+        .filter_map(|path| path.canonicalize().ok())
+        .collect();
+    paths.extend(resolved);
+    paths
+}
+
+/// Refuse a caller-owned volume that would expose `private`, or part of it.
+pub(crate) fn reject_overlap_with_private_path(source: &Path, private: &Path) -> Result<()> {
+    if private.starts_with(source) || source.starts_with(private) {
+        return Err(NucleusError::ConfigError(format!(
+            "Caller-owned volume source '{}' would expose Nucleus state at '{}'",
+            source.display(),
+            private.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Shared parents whose own contents belong to many owners. A caller-owned
+/// volume must be a directory strictly below them.
+const SHARED_CALLER_OWNED_SOURCE_PARENTS: &[&str] =
+    &["/home", "/tmp", "/var/tmp", "/var/lib", "/run/user"];
+
+/// Parents whose direct children are a whole user's files (a home directory,
+/// an XDG runtime directory with its session sockets), never one mount.
+const PER_USER_ROOT_PARENTS: &[&str] = &["/home", "/run/user"];
+
+/// Proof that a bind source was verified as a directory the caller owns.
+///
+/// Only [`verify_caller_owned_volume_source`] creates it, in the launching
+/// process, where the caller's host identity is still visible. Later stages
+/// run inside a user namespace that renumbers owners, so they match the
+/// pinned inode against this record instead of repeating the ownership check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CallerOwnedDir {
+    dev: u64,
+    ino: u64,
+}
+
+fn reject_denied_caller_owned_source(source: &Path) -> Result<()> {
+    for denied in DENIED_CALLER_OWNED_SOURCE_PREFIXES {
+        let denied_path = Path::new(denied);
+        if denied_path.starts_with(source) || source.starts_with(denied_path) {
+            return Err(NucleusError::ConfigError(format!(
+                "Bind mount source '{}' is under sensitive host path '{}' and cannot be mounted into containers",
+                source.display(),
+                denied
+            )));
+        }
+    }
+    for private in nucleus_private_paths() {
+        reject_overlap_with_private_path(source, &private)?;
+    }
+    for shared in SHARED_CALLER_OWNED_SOURCE_PARENTS {
+        if Path::new(shared).starts_with(source) {
+            return Err(NucleusError::ConfigError(format!(
+                "Caller-owned volume source '{}' is a shared host directory; mount a directory you own below it",
+                source.display()
+            )));
+        }
+    }
+    let per_user_root = PER_USER_ROOT_PARENTS
+        .iter()
+        .any(|parent| source.parent() == Some(Path::new(parent)))
+        || dirs::home_dir().is_some_and(|home| home == source);
+    if per_user_root {
+        return Err(NucleusError::ConfigError(format!(
+            "Caller-owned volume source '{}' is a whole home or runtime directory; mount a specific subdirectory",
+            source.display()
+        )));
+    }
+    Ok(())
+}
+
+fn pin_caller_owned_dir(source: &Path) -> Result<(OwnedFd, libc::stat)> {
+    reject_denied_caller_owned_source(&normalize_bind_mount_source_for_policy(source)?)?;
+    let fd = open(
+        source,
+        OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| {
+        NucleusError::ConfigError(format!(
+            "Caller-owned volume source {source:?} must be an existing directory: {e}"
+        ))
+    })?;
+    // The descriptor, not the name, is what gets mounted: apply the policy to
+    // where it actually resolved.
+    reject_denied_caller_owned_source(&std::fs::read_link(fd_path(&fd))?)?;
+    let stat = fstat(&fd)?;
+    Ok((fd, stat))
+}
+
+/// Verify an explicitly caller-owned bind volume source.
+///
+/// Generic volumes refuse everything under `/home`, `/tmp`, `/run` and
+/// `/var/lib`, because those trees mix many owners' data. A caller that marks
+/// a volume `caller-owned` vouches for one directory of its own there, such
+/// as an orchestrator's per-attempt directory. The directory must be owned by
+/// the calling user, must not be world-writable, and must not be a whole home
+/// or runtime directory; system trees stay denied as for every volume.
+pub fn verify_caller_owned_volume_source(source: &Path) -> Result<CallerOwnedDir> {
+    let (_fd, stat) = pin_caller_owned_dir(source)?;
+    let caller = nix::unistd::Uid::current();
+    if stat.st_uid != caller.as_raw() {
+        return Err(NucleusError::ConfigError(format!(
+            "Caller-owned volume source {source:?} is owned by uid {}, not the calling uid {caller}",
+            stat.st_uid
+        )));
+    }
+    if stat.st_mode & 0o002 != 0 {
+        return Err(NucleusError::ConfigError(format!(
+            "Caller-owned volume source {source:?} is world-writable"
+        )));
+    }
+    Ok(CallerOwnedDir {
+        dev: stat.st_dev,
+        ino: stat.st_ino,
+    })
+}
+
+/// Pin a bind volume source under the policy its mount was declared with.
+pub(crate) fn pin_bind_volume_source(
+    source: &Path,
+    caller_owned: Option<&CallerOwnedDir>,
+) -> Result<OwnedFd> {
+    let Some(verified) = caller_owned else {
+        return pin_volume_source(source);
+    };
+    let (fd, stat) = pin_caller_owned_dir(source)?;
+    if (stat.st_dev, stat.st_ino) != (verified.dev, verified.ino) {
+        return Err(NucleusError::ConfigError(format!(
+            "Caller-owned volume source {source:?} changed after it was verified"
+        )));
+    }
+    Ok(fd)
+}
+
+/// Where the broker socket appears inside the container.
+pub const BROKER_SOCKET_CONTAINER_PATH: &str = "/run/nucleus/broker.sock";
+
+/// A host unix socket handed to the workload as its only way out.
+///
+/// In broker-socket mode the container keeps a private, interface-less
+/// network namespace. The workload reaches the outside world solely by
+/// connecting to this one socket, behind which a host-side broker applies
+/// its own policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrokerSocket {
+    host_path: PathBuf,
+    dev: u64,
+    ino: u64,
+}
+
+impl BrokerSocket {
+    /// Verify that `host_path` is a unix socket owned by the calling user.
+    ///
+    /// The inode is recorded so that later launch stages, which run inside a
+    /// user namespace, mount exactly the socket verified here.
+    pub fn verify(host_path: &Path) -> Result<Self> {
+        let (_fd, stat) = Self::open(host_path)?;
+        let caller = nix::unistd::Uid::current();
+        if stat.st_uid != caller.as_raw() {
+            return Err(NucleusError::ConfigError(format!(
+                "Broker socket {host_path:?} is owned by uid {}, not the calling uid {caller}",
+                stat.st_uid
+            )));
+        }
+        Ok(Self {
+            host_path: host_path.to_path_buf(),
+            dev: stat.st_dev,
+            ino: stat.st_ino,
+        })
+    }
+
+    pub fn host_path(&self) -> &Path {
+        &self.host_path
+    }
+
+    fn open(host_path: &Path) -> Result<(OwnedFd, libc::stat)> {
+        let denied = |path: &Path| {
+            DENIED_CALLER_OWNED_SOURCE_PREFIXES
+                .iter()
+                .find(|denied| path.starts_with(denied))
+                .map_or(Ok(()), |denied| {
+                    Err(NucleusError::ConfigError(format!(
+                        "Broker socket '{}' is under sensitive host path '{}'",
+                        path.display(),
+                        denied
+                    )))
+                })
+        };
+        denied(&normalize_bind_mount_source_for_policy(host_path)?)?;
+        let fd = open(host_path, OFlag::O_PATH | OFlag::O_CLOEXEC, Mode::empty()).map_err(|e| {
+            NucleusError::ConfigError(format!("Cannot open broker socket {host_path:?}: {e}"))
+        })?;
+        denied(&std::fs::read_link(fd_path(&fd))?)?;
+        let stat = fstat(&fd)?;
+        if SFlag::from_bits_truncate(stat.st_mode) & SFlag::S_IFMT != SFlag::S_IFSOCK {
+            return Err(NucleusError::ConfigError(format!(
+                "Broker socket {host_path:?} is not a unix socket"
+            )));
+        }
+        Ok((fd, stat))
+    }
+
+    /// Pin the socket verified at launch.
+    pub(crate) fn pin(&self) -> Result<OwnedFd> {
+        let (fd, stat) = Self::open(&self.host_path)?;
+        if (stat.st_dev, stat.st_ino) != (self.dev, self.ino) {
+            return Err(NucleusError::ConfigError(format!(
+                "Broker socket {:?} changed after it was verified",
+                self.host_path
+            )));
+        }
+        Ok(fd)
+    }
+
+    /// Bind the socket into the container root.
+    ///
+    /// The mount is read-only: connecting needs write permission on the
+    /// socket inode, not a writable mount, and nothing else belongs here.
+    pub fn mount(&self, root: &Path) -> Result<()> {
+        let pinned = self.pin()?;
+        let relative = Path::new(BROKER_SOCKET_CONTAINER_PATH)
+            .strip_prefix("/")
+            .expect("broker socket path is absolute");
+        let target = mount_target(root, relative, false)?;
+        bind_tree(
+            &fd_path(&pinned),
+            &target,
+            false,
+            libc::MOUNT_ATTR_RDONLY
+                | libc::MOUNT_ATTR_NODEV
+                | libc::MOUNT_ATTR_NOSUID
+                | libc::MOUNT_ATTR_NOEXEC,
+        )?;
+        info!(
+            "Mounted broker socket {:?} -> {}",
+            self.host_path, BROKER_SOCKET_CONTAINER_PATH
+        );
+        Ok(())
+    }
+}
+
 fn pin_checked_source(source: &Path, check: fn(&Path) -> Result<()>) -> Result<OwnedFd> {
     let fd = open(source, OFlag::O_PATH | OFlag::O_CLOEXEC, Mode::empty())?;
     let resolved = std::fs::read_link(fd_path(&fd))?;
@@ -1100,8 +1407,11 @@ pub fn mount_volumes(root: &Path, volumes: &[crate::container::VolumeMount]) -> 
         let dest = resolve_volume_destination(root, &volume.dest)?;
 
         match &volume.source {
-            VolumeSource::Bind { source } => {
-                let pinned = pin_volume_source(source)?;
+            VolumeSource::Bind {
+                source,
+                caller_owned,
+            } => {
+                let pinned = pin_bind_volume_source(source, caller_owned.as_ref())?;
                 let recursive = fd_path(&pinned).is_dir();
                 let target = mount_target(
                     root,
@@ -1796,6 +2106,167 @@ mod tests {
                 assert_eq!(*path, "/nix/store");
             }
         }
+    }
+
+    /// A caller-owned scratch directory under a tree generic volumes refuse.
+    fn caller_owned_scratch() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir();
+        let dir = tempfile::Builder::new()
+            .prefix("nucleus-owned-")
+            .tempdir_in(&base)
+            .unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        dir
+    }
+
+    #[test]
+    fn caller_owned_volume_admits_a_directory_the_caller_owns() {
+        let dir = caller_owned_scratch();
+        let source = dir.path().canonicalize().unwrap();
+        let verified = verify_caller_owned_volume_source(&source).unwrap();
+        pin_bind_volume_source(&source, Some(&verified)).unwrap();
+        if source.starts_with("/tmp") {
+            // The same directory stays refused without the explicit option.
+            assert!(pin_bind_volume_source(&source, None).is_err());
+        }
+    }
+
+    #[test]
+    fn caller_owned_volume_still_refuses_shared_and_system_paths() {
+        let uid = nix::unistd::Uid::current();
+        let runtime_dir = format!("/run/user/{uid}");
+        for path in [
+            "/",
+            "/home",
+            "/home/alice",
+            "/tmp",
+            "/var",
+            "/var/lib",
+            "/run",
+            "/run/user",
+            runtime_dir.as_str(),
+            "/etc/ssl",
+            "/proc/self",
+            "/root/work",
+            "/var/lib/nucleus/containers",
+            "/run/nucleus/x",
+            "/var/log/app",
+        ] {
+            assert!(
+                verify_caller_owned_volume_source(Path::new(path)).is_err(),
+                "{path} must not be accepted as a caller-owned volume"
+            );
+        }
+        if let Some(home) = dirs::home_dir() {
+            assert!(verify_caller_owned_volume_source(&home).is_err());
+        }
+    }
+
+    #[test]
+    fn caller_owned_volume_refuses_rootless_nucleus_state() {
+        // Rootless state lives in directories the caller owns, so only the
+        // explicit exclusion keeps it out of a workload's reach.
+        let private = nucleus_private_paths();
+        let uid = nix::unistd::Uid::effective().as_raw();
+        assert!(private.contains(&PathBuf::from(format!("/tmp/nucleus-{uid}"))));
+        for dir in [dirs::runtime_dir(), dirs::data_local_dir()]
+            .into_iter()
+            .flatten()
+        {
+            assert!(private.contains(&dir.join("nucleus")), "{dir:?}");
+        }
+        if let Some(home) = dirs::home_dir() {
+            assert!(private.contains(&home.join(".nucleus")));
+        }
+
+        let state = Path::new("/srv/agent/nucleus-state");
+        for source in [
+            "/srv/agent/nucleus-state",
+            "/srv/agent/nucleus-state/containers",
+            // An ancestor exposes the state just as well.
+            "/srv/agent",
+        ] {
+            let err = reject_overlap_with_private_path(Path::new(source), state).unwrap_err();
+            assert!(err.to_string().contains("Nucleus state"), "{err}");
+        }
+        reject_overlap_with_private_path(Path::new("/srv/agent/attempts/1"), state).unwrap();
+        reject_overlap_with_private_path(Path::new("/srv/agent/nucleus-state-2"), state).unwrap();
+    }
+
+    #[test]
+    fn caller_owned_volume_refuses_a_real_state_directory() {
+        let dir = caller_owned_scratch();
+        let state = dir.path().join("state");
+        std::fs::create_dir(&state).unwrap();
+        let attempt = dir.path().join("attempt");
+        std::fs::create_dir(&attempt).unwrap();
+        let state = state.canonicalize().unwrap();
+
+        // Exercised through the same check the verifier runs for each
+        // resolved private path.
+        let records = state.join("records");
+        std::fs::create_dir(&records).unwrap();
+        assert!(reject_overlap_with_private_path(&records, &state).is_err());
+        assert!(reject_overlap_with_private_path(&attempt.canonicalize().unwrap(), &state).is_ok());
+    }
+
+    #[test]
+    fn caller_owned_volume_requires_a_private_directory() {
+        let dir = caller_owned_scratch();
+        let file = dir.path().join("file");
+        std::fs::write(&file, b"x").unwrap();
+        let err = verify_caller_owned_volume_source(&file).unwrap_err();
+        assert!(err.to_string().contains("existing directory"), "{err}");
+
+        let open = dir.path().join("open");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::os::unix::fs::PermissionsExt::from_mode(0o777))
+            .unwrap();
+        let err = verify_caller_owned_volume_source(&open).unwrap_err();
+        assert!(err.to_string().contains("world-writable"), "{err}");
+
+        if !nix::unistd::Uid::current().is_root() && Path::new("/var/empty").is_dir() {
+            // Not ours: ownership is what the option vouches for.
+            assert!(verify_caller_owned_volume_source(Path::new("/var/empty")).is_err());
+        }
+    }
+
+    #[test]
+    fn caller_owned_volume_is_pinned_to_the_verified_directory() {
+        let dir = caller_owned_scratch();
+        let source = dir.path().join("attempt");
+        std::fs::create_dir(&source).unwrap();
+        let verified = verify_caller_owned_volume_source(&source).unwrap();
+
+        std::fs::rename(&source, dir.path().join("moved")).unwrap();
+        std::fs::create_dir(&source).unwrap();
+        let err = pin_bind_volume_source(&source, Some(&verified)).unwrap_err();
+        assert!(err.to_string().contains("changed after"), "{err}");
+    }
+
+    #[test]
+    fn broker_socket_must_be_a_socket_and_stay_the_same_one() {
+        let dir = caller_owned_scratch();
+        let path = dir.path().join("relay.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let socket = BrokerSocket::verify(&path).unwrap();
+        assert_eq!(socket.host_path(), path);
+        socket.pin().unwrap();
+
+        let file = dir.path().join("not-a-socket");
+        std::fs::write(&file, b"x").unwrap();
+        let err = BrokerSocket::verify(&file).unwrap_err();
+        assert!(err.to_string().contains("not a unix socket"), "{err}");
+        assert!(BrokerSocket::verify(&dir.path().join("missing")).is_err());
+        assert!(BrokerSocket::verify(Path::new("/proc/self/exe")).is_err());
+
+        std::fs::remove_file(&path).unwrap();
+        let _replacement = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        // The listener above still holds the original inode, so the new
+        // socket is guaranteed to be a different one.
+        let err = socket.pin().unwrap_err();
+        assert!(err.to_string().contains("changed after"), "{err}");
     }
 
     #[test]

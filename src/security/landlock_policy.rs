@@ -39,22 +39,56 @@ use std::path::{Path, PathBuf};
 pub struct LandlockTcp {
     pub bind: Option<Vec<u16>>,
     pub connect: Option<Vec<u16>>,
+    /// The only pathname unix socket outside the sandbox that the workload
+    /// may connect to. Derived from the launch (broker-socket mode), never
+    /// read from a policy file.
+    #[serde(skip)]
+    broker_socket: Option<PathBuf>,
 }
 
+/// First ABI that can mediate connections to pathname unix sockets.
+const RESOLVE_UNIX_ABI: u8 = 9;
+
 impl LandlockTcp {
-    fn for_network(&self, mode: &NetworkMode) -> Self {
-        match mode {
-            NetworkMode::None => Self {
+    fn for_launch(&self, config: &crate::container::ContainerConfig) -> Self {
+        let broker_socket = config
+            .broker_socket
+            .as_ref()
+            .map(|_| PathBuf::from(crate::filesystem::BROKER_SOCKET_CONTAINER_PATH));
+        match (&config.network, broker_socket) {
+            (NetworkMode::None, None) => Self {
                 bind: Some(vec![]),
                 connect: Some(vec![]),
+                broker_socket: None,
             },
-            _ => self.clone(),
+            // In broker-socket mode the namespace has no interface but
+            // loopback, so TCP needs no port list to stay inside the sandbox.
+            (_, broker_socket) => Self {
+                broker_socket,
+                ..self.clone()
+            },
         }
     }
 
     pub(super) fn create_workload_ruleset(&self) -> Result<RulesetCreated> {
+        let mut handled_fs = AccessFs::from_all(TARGET_ABI);
+        // Scope pathname sockets to the broker where the kernel can. Older
+        // kernels still confine the workload to sockets that are mounted
+        // into its root, which the broker socket is and host services are not.
+        let scoped_socket = self
+            .broker_socket
+            .as_deref()
+            .filter(|_| require_abi(RESOLVE_UNIX_ABI).is_ok());
+        if scoped_socket.is_some() {
+            handled_fs |= AccessFs::ResolveUnix;
+        } else if self.broker_socket.is_some() {
+            warn!(
+                "Kernel Landlock ABI is below {RESOLVE_UNIX_ABI}: unix socket connections are \
+                 limited by the mount namespace only"
+            );
+        }
         let mut builder = Ruleset::default()
-            .handle_access(AccessFs::from_all(TARGET_ABI))
+            .handle_access(handled_fs)
             .map_err(ll_err)?
             .scope(Scope::Signal | Scope::AbstractUnixSocket)
             .map_err(ll_err)?;
@@ -74,6 +108,14 @@ impl LandlockTcp {
                     .add_rule(NetPort::new(*port, right))
                     .map_err(ll_err)?;
             }
+        }
+        if let Some(socket) = scoped_socket {
+            let fd = PathFd::new(socket).map_err(|e| {
+                NucleusError::LandlockError(format!("Cannot open broker socket {socket:?}: {e}"))
+            })?;
+            ruleset = ruleset
+                .add_rule(PathBeneath::new(fd, AccessFs::ResolveUnix))
+                .map_err(ll_err)?;
         }
         Ok(ruleset)
     }
@@ -132,13 +174,13 @@ impl NativeLandlock {
             Self::Custom(policy) => policy.apply_with_handoff(
                 best_effort,
                 Some(handoff),
-                &policy.tcp.for_network(&config.network),
+                &policy.tcp.for_launch(config),
                 config.service_mode == crate::container::ServiceMode::Production,
             ),
             Self::Default(settings) => settings.clone().apply_with_handoff(
                 best_effort,
                 Some(handoff),
-                &LandlockTcp::default().for_network(&config.network),
+                &LandlockTcp::default().for_launch(config),
             ),
         }
     }
@@ -403,13 +445,85 @@ mod tests {
     #[test]
     fn network_mode_can_only_narrow_explicit_tcp_rules() {
         let tcp: LandlockTcp = toml::from_str("connect = [443]").unwrap();
-        let isolated = tcp.for_network(&NetworkMode::None);
+        let mut config =
+            crate::container::ContainerConfig::try_new(None, vec!["/bin/true".into()]).unwrap();
+        let isolated = tcp.for_launch(&config);
         assert_eq!(isolated.bind, Some(vec![]));
         assert_eq!(isolated.connect, Some(vec![]));
-        let host = tcp.for_network(&NetworkMode::Host);
+        config.network = NetworkMode::Host;
+        let host = tcp.for_launch(&config);
         assert_eq!(host.bind, None);
         assert_eq!(host.connect, Some(vec![443]));
         assert!(toml::from_str::<LandlockTcp>("conect = [443]").is_err());
+    }
+
+    #[test]
+    fn broker_socket_mode_keeps_tcp_and_scopes_unix_sockets() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("relay.sock");
+        drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+        let config = crate::container::ContainerConfig::try_new(None, vec!["/bin/true".into()])
+            .unwrap()
+            .with_broker_socket(crate::filesystem::BrokerSocket::verify(&path).unwrap());
+
+        // Loopback is the only interface, so TCP is not port-restricted.
+        let launch = LandlockTcp::default().for_launch(&config);
+        assert_eq!((launch.bind, launch.connect), (None, None));
+        assert_eq!(
+            launch.broker_socket.as_deref(),
+            Some(Path::new(crate::filesystem::BROKER_SOCKET_CONTAINER_PATH))
+        );
+        // A policy file cannot name the socket.
+        assert!(toml::from_str::<LandlockTcp>("broker_socket = \"/x\"").is_err());
+    }
+
+    #[test]
+    #[ignore = "requires Landlock ABI 9; restricts the test process"]
+    fn kernel_scopes_pathname_sockets_to_the_broker() {
+        use std::os::unix::net::UnixListener;
+        let dir = tempfile::tempdir().unwrap();
+        let (broker, other) = (
+            dir.path().join("broker.sock"),
+            dir.path().join("other.sock"),
+        );
+        let (_broker, _other) = (
+            UnixListener::bind(&broker).unwrap(),
+            UnixListener::bind(&other).unwrap(),
+        );
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "--ignored", "--nocapture"])
+            .arg("security::landlock_policy::tests::kernel_scopes_pathname_sockets_child")
+            .env("NUCLEUS_TEST_BROKER", &broker)
+            .env("NUCLEUS_TEST_OTHER", &other)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[test]
+    #[ignore = "helper for kernel_scopes_pathname_sockets_to_the_broker"]
+    fn kernel_scopes_pathname_sockets_child() {
+        use std::os::unix::net::UnixStream;
+        let (Some(broker), Some(other)) = (
+            std::env::var_os("NUCLEUS_TEST_BROKER"),
+            std::env::var_os("NUCLEUS_TEST_OTHER"),
+        ) else {
+            return;
+        };
+        let tcp = LandlockTcp {
+            bind: None,
+            connect: None,
+            broker_socket: Some(PathBuf::from(&broker)),
+        };
+        let status = tcp
+            .create_workload_ruleset()
+            .unwrap()
+            .restrict_self()
+            .unwrap();
+        assert_eq!(status.ruleset, RulesetStatus::FullyEnforced);
+        UnixStream::connect(&broker).unwrap();
+        let denied = UnixStream::connect(&other).unwrap_err();
+        assert_eq!(denied.kind(), std::io::ErrorKind::PermissionDenied);
     }
 
     #[test]
@@ -436,6 +550,7 @@ mod tests {
                 tcp: LandlockTcp {
                     bind: Some(vec![0]),
                     connect: Some(vec![allowed]),
+                    broker_socket: None,
                 },
             };
             assert!(policy.apply(false).unwrap());
