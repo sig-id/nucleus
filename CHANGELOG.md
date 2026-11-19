@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 - No unreleased changes.
 
+## [0.5.1] - 2026-11-19
+
+### Fixed
+- The Nix flake package builds again: its test phase now skips the four tests
+  that need host semantics the Nix build sandbox withholds (setid `chmod`, a
+  root-owned `/nix` for hook trust checks). CI still runs them, and now also
+  builds the flake package so a sandbox-only failure blocks the merge.
+- The Nix package version comes from `Cargo.toml` instead of a stale `0.4.0`.
+
 ## [0.5.0] - 2026-11-19
 
 ### Security
