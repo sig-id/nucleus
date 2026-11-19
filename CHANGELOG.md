@@ -6,7 +6,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
-- No unreleased changes.
+
+### Fixed
+- The strict-agent native seccomp profile no longer kills the workload with
+  `SIGSYS` when it probes an opt-in syscall that was not requested with
+  `--seccomp-allow` (#45). Un-requested opt-in calls now return `ENOSYS`,
+  indistinguishable from a kernel that lacks the call, so runtimes and libc
+  fall back or report a normal error: Codex's config watcher (`inotify_init1`),
+  `utimensat` from `touch`, `tar` and `git`, Go's and tokio's `pidfd_open`,
+  V8's `pkey_alloc`, libuv's `io_uring_setup` probe (Node 22+/26+),
+  `sysinfo`, and the `splice`/`tee`/`sendfile` transfers that already
+  degraded this way. `SECURITY_CRITICAL_DENIED_SYSCALLS` and
+  `PRIVILEGED_SYSCALLS` keep the `KILL_PROCESS` default. The whole-syscall
+  `ENOSYS` denials compile into a second bitmap, so the filter's O(1)
+  dispatch is unchanged, and a syscall that is both unconditionally allowed
+  and unconditionally denied is now rejected at compile time.
+- `sendto`, `recvfrom`, `sendmsg` and `recvmsg` are argument-filtered in
+  every network mode instead of being killed with networking denied
+  (#45). Socket creation is already family-filtered per mode, so the
+  transfer calls add no reach beyond `read`/`write` on descriptors the
+  workload already holds; Unix datagram IPC (Codex's signal thread) keeps
+  working under `network = none`. `MSG_OOB` stays denied everywhere and
+  `setsockopt` remains network-only.
+- `--seccomp-allow sync_file_range` and `--seccomp-allow io_cancel` were
+  rejected as unknown syscall names because both were missing from the
+  name-to-number table while already being on the opt-in list; production
+  mode failed the launch outright (#45).
 
 ## [0.6.0] - 2026-11-19
 
