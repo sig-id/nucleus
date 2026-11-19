@@ -44,6 +44,7 @@ use tempfile::Builder;
 use tracing::{debug, error, info, info_span, warn};
 
 use super::console::{NativeConsoleRelay, NativePty};
+use super::supervisor_link::{die_with_supervisor, Lifeline};
 
 /// Container runtime that orchestrates all isolation mechanisms
 ///
@@ -80,6 +81,8 @@ pub struct CreatedContainer {
     pub(super) native_console_master: Option<OwnedFd>,
     pub(super) event_sink: Option<EventSink>,
     pub(super) _lifecycle_span: tracing::Span,
+    /// Open for as long as the supervisor lives; see `supervisor_link`.
+    _lifeline: OwnedFd,
 }
 
 const CREDENTIAL_BROKER_CONNECT_TIMEOUT: Duration = Duration::from_millis(750);
@@ -955,7 +958,8 @@ impl Container {
                     {
                         warn!(
                             "Running in rootless mode: requested resource limits cannot be \
-                             enforced – cgroup creation requires root ({})",
+                             enforced – cgroup creation requires root or a delegated cgroup \
+                             subtree ({})",
                             e
                         );
                     } else {
@@ -1062,6 +1066,16 @@ impl Container {
             .then(std::os::unix::net::UnixStream::pair)
             .transpose()?;
         Self::assert_single_threaded_for_fork("container create fork")?;
+        // The container must not outlive this process, however it ends.
+        let lifeline = Lifeline::new()?;
+        if let Some(cgroup) = &cgroup_opt {
+            if let Err(e) = lifeline.spawn_cgroup_reaper(cgroup.path()) {
+                if config.service_mode.requires_cgroup_enforcement() {
+                    return Err(e);
+                }
+                warn!("Container cgroup will not be reaped if the supervisor is killed: {e}");
+            }
+        }
         // From the fork onward the container lifecycle owns the FIFO. Setup
         // failures before this point (including GPU enforcement) remove it.
         let exec_fifo = exec_fifo
@@ -1086,6 +1100,7 @@ impl Container {
                     drop(pty.slave.take());
                     pty.master.take()
                 });
+                let lifeline = lifeline.hold();
                 info!("Forked child process: {}", child);
 
                 // Use a closure so that on any error we kill the forked child.
@@ -1288,6 +1303,7 @@ impl Container {
                         native_console_master,
                         event_sink,
                         _lifecycle_span: lifecycle_span.clone(),
+                        _lifeline: lifeline,
                     })
                 };
 
@@ -1300,6 +1316,11 @@ impl Container {
                 })
             }
             ForkResult::Child => {
+                lifeline.adopt_in_child();
+                if let Err(e) = die_with_supervisor() {
+                    error!("Container setup failed: {}", e);
+                    std::process::exit(1);
+                }
                 drop(ready_read);
                 drop(parent_setup_write);
                 let (userns_request_write, userns_ack_read) =
@@ -1455,6 +1476,9 @@ impl Container {
                 userns_request_pipe.as_ref(),
                 userns_ack_pipe.as_ref(),
             )?;
+            // Entering the handoff namespace changed credentials, which
+            // clears the parent-death signal.
+            die_with_supervisor()?;
             if let (Some(dir), true) = (handoff_bundle, gvisor_precreated_userns) {
                 // Namespace-relative chown to container ID 0: the mapped
                 // supervisor owns the bundle for the upcoming create.
@@ -1531,6 +1555,12 @@ impl Container {
             }
         }
         namespace_mgr.unshare_namespaces()?;
+        if self.config.broker_socket.is_some() {
+            // The in-container forwarder listens on loopback, which a new
+            // network namespace leaves down. Raise it while this process
+            // still holds CAP_NET_ADMIN over the namespace it just created.
+            crate::network::netlink::set_link_up("lo")?;
+        }
         if self.config.user_ns_config.is_some() {
             let request_fd = userns_request_pipe.as_ref().ok_or_else(|| {
                 NucleusError::ExecError(
@@ -1553,6 +1583,8 @@ impl Container {
                 "Failed waiting for parent to finish user namespace mappings",
             )?;
             Self::become_userns_root_for_setup(None, workload_caps.as_ref())?;
+            // The identity switch cleared the parent-death signal.
+            die_with_supervisor()?;
         }
 
         let overlay_dirs = self
@@ -1590,6 +1622,9 @@ impl Container {
                     std::process::exit(Self::wait_for_pid_namespace_child(child));
                 }
                 ForkResult::Child => {
+                    // PID 1 follows the intermediate process, which in turn
+                    // follows the supervisor.
+                    die_with_supervisor()?;
                     if let Some(fd) = parent_setup_pipe.as_ref() {
                         Self::wait_for_sync_byte(
                             fd,
@@ -1801,6 +1836,11 @@ impl Container {
         // 7d. Mount persistent or ephemeral volumes over the base filesystem.
         mount_volumes(&container_root, &self.config.volumes)?;
 
+        // 7d'. Broker-socket mode: expose the one host socket.
+        if let Some(broker) = &self.config.broker_socket {
+            broker.mount(&container_root)?;
+        }
+
         // 7e. Write resolv.conf for bridge networking.
         // When rootfs is mounted, /etc is read-only, so we bind-mount a writable
         // resolv.conf over the top (same technique as secrets).
@@ -1942,6 +1982,9 @@ impl Container {
             );
         }
         sec_state = sec_state.transition(SecurityState::CapabilitiesDropped)?;
+        // Last credential change before the workload: re-arm the parent-death
+        // signal it cleared. The setting survives the exec that follows.
+        die_with_supervisor()?;
 
         // 12b. RLIMIT backstop: defense-in-depth against fork bombs and fd exhaustion.
         // Must be applied BEFORE seccomp, since SYS_setrlimit is not in the allowlist.
@@ -2027,7 +2070,7 @@ impl Container {
         // 13. Apply seccomp filter (trace, profile-from-file, or built-in allowlist)
         // Security: CapabilitiesDropped -> SeccompApplied
         use crate::container::config::SeccompMode;
-        let allow_network = !matches!(self.config.network, NetworkMode::None);
+        let allow_network = self.config.allows_ip_sockets();
         if let Some(path) = self
             .config
             .seccomp_profile

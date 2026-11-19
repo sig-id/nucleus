@@ -1,7 +1,6 @@
 use super::seccomp_bpf::ErrnoRule;
 use crate::container::{ContainerConfig, SeccompMode};
 use crate::error::{NucleusError, Result};
-use crate::network::NetworkMode;
 #[cfg(any(
     target_arch = "x86_64",
     target_arch = "aarch64",
@@ -32,7 +31,7 @@ impl NativeSeccomp {
             SeccompManager::compile_profile(path, config.seccomp_profile_sha256.as_deref())?
         } else {
             SeccompManager::compile_builtin(
-                !matches!(config.network, NetworkMode::None),
+                config.allows_ip_sockets(),
                 &config.seccomp_allow_syscalls,
                 config.gpu.is_some(),
             )?

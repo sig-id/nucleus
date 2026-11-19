@@ -15,7 +15,7 @@ use nucleus::filesystem::{
     normalize_container_destination, normalize_provider_config_destination,
     normalize_volume_destination, validate_agent_toolchain_rootfs_path, validate_bind_mount_source,
     validate_production_rootfs_path, validate_provider_config_source, validate_workspace_host_path,
-    ContextMode,
+    verify_caller_owned_volume_source, BrokerSocket, ContextMode,
 };
 use nucleus::image::{self, ImageCommitOptions};
 use nucleus::isolation::{ContainerAttach, NamespaceConfig};
@@ -618,6 +618,12 @@ struct Cli {
     #[arg(long, global = true)]
     events_jsonl: Option<PathBuf>,
 
+    /// Keep Nucleus off the workload's stdio: do not print the container ID
+    /// on stdout (it is reported in the event stream) and log only errors to
+    /// stderr. Implied by --events-fd and by `create --config-fd`.
+    #[arg(long, global = true)]
+    quiet: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -676,6 +682,7 @@ const RUN_CONFIG_PATH_CONFLICTS: &[&str] = &[
     "egress_udp_ports",
     "credential_broker",
     "credential_broker_no_proxy_env",
+    "broker_socket",
     "dns",
     "nat_backend",
     "bridge_name",
@@ -773,6 +780,7 @@ const RUN_CONFIG_FD_CONFLICTS: &[&str] = &[
     "egress_udp_ports",
     "credential_broker",
     "credential_broker_no_proxy_env",
+    "broker_socket",
     "dns",
     "nat_backend",
     "bridge_name",
@@ -1051,6 +1059,14 @@ enum Commands {
         #[arg(long = "credential-broker-no-proxy-env", alias = "no-broker-proxy-env")]
         credential_broker_no_proxy_env: bool,
 
+        /// Host unix socket of an egress broker, exposed to the workload at
+        /// /run/nucleus/broker.sock (NUCLEUS_BROKER_SOCKET). The container
+        /// keeps a private network namespace with only loopback, so an
+        /// in-container proxy forwarder can listen on 127.0.0.1 and relay
+        /// through the socket. Requires --network none.
+        #[arg(long = "broker-socket", value_name = "PATH")]
+        broker_socket: Option<String>,
+
         /// DNS servers (repeatable). Required for bridge mode in production.
         #[arg(long)]
         dns: Vec<String>,
@@ -1103,7 +1119,10 @@ enum Commands {
         #[arg(long = "systemd-credential")]
         systemd_credentials: Vec<String>,
 
-        /// Mount a host path as a bind volume: SOURCE:DEST[:ro|rw] (repeatable)
+        /// Mount a host path as a bind volume: SOURCE:DEST[:OPTIONS] (repeatable).
+        /// OPTIONS is a comma-separated list of `ro`, `rw` and `caller-owned`.
+        /// `caller-owned` admits a directory you own under /home, /tmp, /run
+        /// or /var/lib, which generic volumes refuse.
         #[arg(long = "volume")]
         volumes: Vec<String>,
 
@@ -1532,6 +1551,7 @@ struct RunConfig {
     egress_udp_ports: Vec<u16>,
     credential_broker: Option<String>,
     credential_broker_no_proxy_env: bool,
+    broker_socket: Option<String>,
     dns: Vec<String>,
     nat_backend: NatBackend,
     bridge_name: String,
@@ -1636,6 +1656,7 @@ impl Default for RunConfig {
             egress_udp_ports: Vec::new(),
             credential_broker: None,
             credential_broker_no_proxy_env: false,
+            broker_socket: None,
             dns: Vec::new(),
             nat_backend: NatBackend::Auto,
             bridge_name: "nucleus0".into(),
@@ -1689,6 +1710,93 @@ impl Default for RunConfig {
 }
 
 /// Truncate a container ID to 12 chars for display.
+/// How much of Nucleus' own output shares the workload's stdio.
+///
+/// An orchestrator that drives Nucleus over inherited descriptors reads the
+/// workload's stdout and stderr as data, so the runtime must not write there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OutputMode {
+    /// Print the container ID on stdout before the workload starts.
+    print_container_id: bool,
+    /// Default stderr logging to errors only.
+    quiet_logs: bool,
+}
+
+impl OutputMode {
+    fn from_cli(cli: &Cli) -> Self {
+        let config_fd = matches!(
+            &cli.command,
+            Commands::Create {
+                config_fd: Some(_),
+                ..
+            }
+        );
+        Self::resolve(
+            cli.quiet,
+            cli.events_fd.is_some(),
+            cli.events_jsonl.is_some(),
+            config_fd,
+        )
+    }
+
+    fn resolve(quiet: bool, events_fd: bool, events_jsonl: bool, config_fd: bool) -> Self {
+        let quiet_logs = quiet || events_fd || config_fd;
+        // The ID stays on stdout when no event stream would otherwise carry
+        // it, unless the caller asked for silence outright.
+        let id_in_event_stream = events_fd || events_jsonl;
+        Self {
+            print_container_id: !(quiet || (quiet_logs && id_in_event_stream)),
+            quiet_logs,
+        }
+    }
+}
+
+struct BindVolumeSpec<'a> {
+    source: &'a str,
+    dest: &'a str,
+    read_only: bool,
+    caller_owned: bool,
+}
+
+/// Parse `SOURCE:DEST[:OPTIONS]`, where OPTIONS is a comma-separated list of
+/// `ro`, `rw` and `caller-owned`.
+fn parse_bind_volume_spec(spec: &str) -> Result<BindVolumeSpec<'_>> {
+    let invalid = || {
+        NucleusError::ConfigError(format!(
+            "Invalid volume format '{}', expected SOURCE:DEST[:OPTIONS] with OPTIONS from ro, rw, caller-owned",
+            spec
+        ))
+    };
+    let parts: Vec<&str> = spec.split(':').collect();
+    let (source, dest, options) = match parts.as_slice() {
+        [source, dest] => (*source, *dest, ""),
+        [source, dest, options] if !options.is_empty() => (*source, *dest, *options),
+        _ => return Err(invalid()),
+    };
+    let mut access = None;
+    let mut caller_owned = false;
+    for option in options.split(',').filter(|option| !option.is_empty()) {
+        let read_only = match option {
+            "ro" => true,
+            "rw" => false,
+            "caller-owned" if !caller_owned => {
+                caller_owned = true;
+                continue;
+            }
+            _ => return Err(invalid()),
+        };
+        if access.replace(read_only).is_some() {
+            return Err(invalid());
+        }
+    }
+    Ok(BindVolumeSpec {
+        source,
+        dest,
+        read_only: access.unwrap_or(false),
+        caller_owned,
+    })
+}
+
 fn truncate_id(id: &str) -> &str {
     if id.len() > 12 {
         &id[..12]
@@ -1759,8 +1867,9 @@ fn try_main() -> Result<i32> {
     let log_format = cli.log_format.clone();
     let events_fd = cli.events_fd;
     let events_jsonl = cli.events_jsonl.clone();
+    let output = OutputMode::from_cli(&cli);
 
-    nucleus::telemetry::init_tracing(log_path.as_deref(), &log_format)?;
+    nucleus::telemetry::init_tracing(log_path.as_deref(), &log_format, output.quiet_logs)?;
 
     match cli.command {
         Commands::State { container, all } => {
@@ -2151,6 +2260,7 @@ fn try_main() -> Result<i32> {
             egress_udp_ports,
             credential_broker,
             credential_broker_no_proxy_env,
+            broker_socket,
             dns,
             nat_backend,
             bridge_name,
@@ -2268,6 +2378,7 @@ fn try_main() -> Result<i32> {
                     egress_udp_ports,
                     credential_broker,
                     credential_broker_no_proxy_env,
+                    broker_socket,
                     dns,
                     nat_backend,
                     bridge_name,
@@ -2475,6 +2586,7 @@ fn try_main() -> Result<i32> {
                 egress_udp_ports,
                 credential_broker,
                 credential_broker_no_proxy_env,
+                broker_socket,
                 dns,
                 nat_backend,
                 bridge_name,
@@ -2814,6 +2926,16 @@ fn try_main() -> Result<i32> {
                 config = config.with_landlock_policy_sha256(sha256);
             }
 
+            if let Some(socket) = broker_socket {
+                let socket = std::fs::canonicalize(&socket).map_err(|e| {
+                    NucleusError::ConfigError(format!(
+                        "Broker socket '{}' cannot be resolved: {}",
+                        socket, e
+                    ))
+                })?;
+                config = config.with_broker_socket(BrokerSocket::verify(&socket)?);
+            }
+
             // Hostinet cannot enforce a workload-local firewall.
             let gvisor_host_network = matches!(config.network, NetworkMode::GVisorHost);
             if let Some(endpoint) = credential_broker {
@@ -2949,28 +3071,30 @@ fn try_main() -> Result<i32> {
 
             // Bind volumes
             for spec in &volumes {
-                let parts: Vec<&str> = spec.split(':').collect();
-                let (source_raw, dest_raw, read_only) = match parts.as_slice() {
-                    [source, dest] => (*source, *dest, false),
-                    [source, dest, mode] if *mode == "ro" => (*source, *dest, true),
-                    [source, dest, mode] if *mode == "rw" => (*source, *dest, false),
-                    _ => {
-                        return Err(NucleusError::ConfigError(format!(
-                            "Invalid volume format '{}', expected SOURCE:DEST[:ro|rw]",
-                            spec
-                        )));
-                    }
-                };
+                let BindVolumeSpec {
+                    source: source_raw,
+                    dest: dest_raw,
+                    read_only,
+                    caller_owned,
+                } = parse_bind_volume_spec(spec)?;
                 let source = std::fs::canonicalize(source_raw).map_err(|e| {
                     NucleusError::ConfigError(format!(
                         "Volume source '{}' cannot be resolved: {}",
                         source_raw, e
                     ))
                 })?;
-                validate_bind_mount_source(&source)?;
+                let caller_owned = if caller_owned {
+                    Some(verify_caller_owned_volume_source(&source)?)
+                } else {
+                    validate_bind_mount_source(&source)?;
+                    None
+                };
                 normalize_volume_destination(Path::new(dest_raw))?;
                 config = config.with_volume(VolumeMount {
-                    source: VolumeSource::Bind { source },
+                    source: VolumeSource::Bind {
+                        source,
+                        caller_owned,
+                    },
                     dest: PathBuf::from(dest_raw),
                     read_only,
                 });
@@ -3109,7 +3233,7 @@ fn try_main() -> Result<i32> {
                 config = config.with_state_root(root.clone());
             }
 
-            if !quiet_id {
+            if !quiet_id && output.print_container_id {
                 println!("{}", config.id);
             }
 
@@ -3401,6 +3525,7 @@ mod tests {
             egress_udp_ports: vec![53],
             credential_broker: Some("10.0.42.1:8080".to_string()),
             credential_broker_no_proxy_env: true,
+            broker_socket: None,
             dns: vec!["8.8.8.8".to_string()],
             nat_backend: NatBackend::Kernel,
             bridge_name: "nucleus0".into(),
@@ -3523,6 +3648,7 @@ mod tests {
             egress_udp_ports: Vec::new(),
             credential_broker: None,
             credential_broker_no_proxy_env: false,
+            broker_socket: None,
             dns: Vec::new(),
             nat_backend: NatBackend::Auto,
             bridge_name: "nucleus0".into(),
@@ -3717,6 +3843,97 @@ service_mode = "strict-agent"
             ServiceMode::StrictAgent
         );
         assert!(resolve_service_mode(ServiceMode::Production, true).is_err());
+    }
+
+    #[test]
+    fn machine_callers_get_clean_stdio() {
+        let interactive = OutputMode::resolve(false, false, false, false);
+        assert!(interactive.print_container_id && !interactive.quiet_logs);
+
+        // An event stream carries the ID, so stdout stays the workload's.
+        let events = OutputMode::resolve(false, true, false, false);
+        assert!(!events.print_container_id && events.quiet_logs);
+
+        // --config-fd alone quiets logging but has nowhere else to put the ID.
+        let config_fd = OutputMode::resolve(false, false, false, true);
+        assert!(config_fd.print_container_id && config_fd.quiet_logs);
+        let config_fd_with_file = OutputMode::resolve(false, false, true, true);
+        assert!(!config_fd_with_file.print_container_id);
+
+        // A plain events file does not change an interactive invocation.
+        let events_file = OutputMode::resolve(false, false, true, false);
+        assert!(events_file.print_container_id && !events_file.quiet_logs);
+
+        let quiet = OutputMode::resolve(true, false, false, false);
+        assert!(!quiet.print_container_id && quiet.quiet_logs);
+    }
+
+    #[test]
+    fn output_mode_is_derived_from_the_parsed_command_line() {
+        let cli =
+            Cli::try_parse_from(["nucleus", "--events-fd", "5", "create", "--", "true"]).unwrap();
+        assert!(!OutputMode::from_cli(&cli).print_container_id);
+        let cli =
+            Cli::try_parse_from(["nucleus", "create", "--config-fd", "4", "--quiet"]).unwrap();
+        let mode = OutputMode::from_cli(&cli);
+        assert!(mode.quiet_logs && !mode.print_container_id);
+        let cli = Cli::try_parse_from(["nucleus", "create", "--", "true"]).unwrap();
+        assert!(OutputMode::from_cli(&cli).print_container_id);
+    }
+
+    #[test]
+    fn bind_volume_spec_accepts_access_and_ownership_options() {
+        let plain = parse_bind_volume_spec("/src:/dst").unwrap();
+        assert_eq!((plain.source, plain.dest), ("/src", "/dst"));
+        assert!(!plain.read_only && !plain.caller_owned);
+
+        assert!(parse_bind_volume_spec("/src:/dst:ro").unwrap().read_only);
+        assert!(!parse_bind_volume_spec("/src:/dst:rw").unwrap().read_only);
+
+        let owned = parse_bind_volume_spec("/src:/dst:caller-owned").unwrap();
+        assert!(owned.caller_owned && !owned.read_only);
+        for spec in ["/src:/dst:ro,caller-owned", "/src:/dst:caller-owned,ro"] {
+            let both = parse_bind_volume_spec(spec).unwrap();
+            assert!(both.caller_owned && both.read_only, "{spec}");
+        }
+
+        for spec in [
+            "/src",
+            "/src:/dst:",
+            "/src:/dst:ro,rw",
+            "/src:/dst:ro,ro",
+            "/src:/dst:caller-owned,caller-owned",
+            "/src:/dst:exec",
+            "/src:/dst:ro:caller-owned",
+        ] {
+            assert!(parse_bind_volume_spec(spec).is_err(), "{spec}");
+        }
+    }
+
+    #[test]
+    fn broker_socket_flag_is_accepted_by_create_and_run_config() {
+        let cli = Cli::try_parse_from([
+            "nucleus",
+            "create",
+            "--broker-socket",
+            "/run/relay.sock",
+            "--",
+            "true",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Create { broker_socket, .. } => {
+                assert_eq!(broker_socket.as_deref(), Some("/run/relay.sock"))
+            }
+            _ => panic!("expected create"),
+        }
+        let config = parse_run_config(
+            "broker_socket = \"/run/relay.sock\"\ncommand = [\"true\"]\n",
+            "test",
+            Some(RunConfigFormat::Toml),
+        )
+        .unwrap();
+        assert_eq!(config.broker_socket.as_deref(), Some("/run/relay.sock"));
     }
 
     #[test]

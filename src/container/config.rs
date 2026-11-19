@@ -17,6 +17,8 @@ use std::time::Duration;
 pub const DEFAULT_HOME_PATH: &str = "/home/agent";
 pub const CREDENTIAL_BROKER_CONTAINER_ID_ENV: &str = "NUCLEUS_CONTAINER_ID";
 pub const CREDENTIAL_BROKER_TOKEN_ENV: &str = "NUCLEUS_CREDENTIAL_BROKER_TOKEN";
+/// Tells the workload where the egress broker's unix socket is mounted.
+pub const BROKER_SOCKET_ENV: &str = "NUCLEUS_BROKER_SOCKET";
 
 #[must_use]
 fn is_credential_broker_identity_env(key: &str) -> bool {
@@ -410,7 +412,13 @@ impl Default for ConsoleSize {
 #[derive(Debug, Clone)]
 pub enum VolumeSource {
     /// Bind mount a host path into the container.
-    Bind { source: PathBuf },
+    Bind {
+        source: PathBuf,
+        /// Set when the caller vouched for a directory it owns under an
+        /// otherwise denied host tree. See
+        /// [`crate::filesystem::verify_caller_owned_volume_source`].
+        caller_owned: Option<crate::filesystem::CallerOwnedDir>,
+    },
     /// Mount a fresh tmpfs at the destination.
     Tmpfs { size: Option<String> },
 }
@@ -772,6 +780,10 @@ pub struct ContainerConfig {
     /// host-side broker can authenticate and attribute requests.
     pub credential_broker_token: String,
 
+    /// Host unix socket that is the workload's only way out of an otherwise
+    /// network-less container. See [`ContainerConfig::with_broker_socket`].
+    pub broker_socket: Option<crate::filesystem::BrokerSocket>,
+
     /// Health check configuration for long-running services.
     pub health_check: Option<HealthCheck>,
 
@@ -975,6 +987,7 @@ impl ContainerConfig {
             egress_policy: None,
             credential_broker: None,
             credential_broker_token,
+            broker_socket: None,
             health_check: None,
             readiness_probe: None,
             secrets: Vec::new(),
@@ -1141,6 +1154,61 @@ impl ContainerConfig {
     pub fn with_egress_policy(mut self, policy: EgressPolicy) -> Self {
         self.egress_policy = Some(policy);
         self
+    }
+
+    /// Route all egress through a host-side broker reached over one unix
+    /// socket.
+    ///
+    /// The socket is mounted at
+    /// [`BROKER_SOCKET_CONTAINER_PATH`](crate::filesystem::BROKER_SOCKET_CONTAINER_PATH)
+    /// and advertised in `NUCLEUS_BROKER_SOCKET`. The container keeps its
+    /// private network namespace with loopback as the only interface; IP
+    /// sockets are permitted so that a forwarder inside the container can
+    /// listen on loopback (for `HTTPS_PROXY`) and relay through the socket.
+    /// Nothing but loopback is routable, and under the native runtime
+    /// Landlock confines pathname socket connections to this one socket.
+    #[must_use]
+    pub fn with_broker_socket(mut self, socket: crate::filesystem::BrokerSocket) -> Self {
+        self.broker_socket = Some(socket);
+        self.upsert_derived_env(
+            BROKER_SOCKET_ENV,
+            crate::filesystem::BROKER_SOCKET_CONTAINER_PATH.to_string(),
+        );
+        self
+    }
+
+    /// Whether the workload may create IP sockets at all. Without a network
+    /// (and without a broker forwarder to host) only local IPC is allowed.
+    pub(crate) fn allows_ip_sockets(&self) -> bool {
+        !matches!(self.network, crate::network::NetworkMode::None) || self.broker_socket.is_some()
+    }
+
+    fn validate_broker_socket(&self) -> crate::error::Result<()> {
+        if self.broker_socket.is_none() {
+            return Ok(());
+        }
+        let conflict = if !matches!(self.network, crate::network::NetworkMode::None) {
+            Some("--broker-socket requires --network none: the broker is the only egress path")
+        } else if !self.namespaces.net {
+            Some("--broker-socket requires a private network namespace")
+        } else if self.credential_broker.is_some() {
+            Some("--broker-socket and --credential-broker are mutually exclusive")
+        } else {
+            None
+        };
+        if let Some(message) = conflict {
+            return Err(crate::error::NucleusError::ConfigError(message.into()));
+        }
+        let reserved = std::path::Path::new(crate::filesystem::BROKER_SOCKET_CONTAINER_PATH)
+            .parent()
+            .expect("broker socket path has a parent");
+        if self.volumes.iter().any(|v| v.dest.starts_with(reserved)) {
+            return Err(crate::error::NucleusError::ConfigError(format!(
+                "Volume destinations under {} are reserved for --broker-socket",
+                reserved.display()
+            )));
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -1490,7 +1558,7 @@ impl ContainerConfig {
         }
 
         if !self.seccomp_allow_syscalls.is_empty() {
-            let allow_network = !matches!(self.network, crate::network::NetworkMode::None);
+            let allow_network = self.allows_ip_sockets();
             crate::security::SeccompManager::validate_extra_syscalls_for_production(
                 allow_network,
                 &self.seccomp_allow_syscalls,
@@ -1711,7 +1779,10 @@ impl ContainerConfig {
                 ));
             }
             match &volume.source {
-                VolumeSource::Bind { source } => {
+                VolumeSource::Bind {
+                    source,
+                    caller_owned,
+                } => {
                     if !source.is_absolute() {
                         return Err(crate::error::NucleusError::ConfigError(format!(
                             "Volume source must be absolute: {:?}",
@@ -1724,7 +1795,7 @@ impl ContainerConfig {
                             source
                         )));
                     }
-                    crate::filesystem::validate_bind_mount_source(source)?;
+                    crate::filesystem::pin_bind_volume_source(source, caller_owned.as_ref())?;
                 }
                 VolumeSource::Tmpfs { .. } => {}
             }
@@ -1745,6 +1816,7 @@ impl ContainerConfig {
             ));
         }
         self.validate_credential_broker()?;
+        self.validate_broker_socket()?;
         if self.use_gvisor
             && matches!(self.network, crate::network::NetworkMode::Bridge(_))
             && self.egress_policy.is_some()
@@ -1922,6 +1994,59 @@ pub fn validate_hostname(hostname: &str) -> crate::error::Result<()> {
 mod tests {
     use super::*;
     use crate::network::NetworkMode;
+
+    fn broker_socket_fixture() -> (tempfile::TempDir, crate::filesystem::BrokerSocket) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("relay.sock");
+        // Binding leaves the socket file behind after the listener closes.
+        drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+        let socket = crate::filesystem::BrokerSocket::verify(&path).unwrap();
+        (dir, socket)
+    }
+
+    #[test]
+    fn broker_socket_mode_opens_ip_sockets_without_a_network() {
+        let (_dir, socket) = broker_socket_fixture();
+        let plain = ContainerConfig::try_new(None, vec!["/bin/true".to_string()]).unwrap();
+        assert!(!plain.allows_ip_sockets());
+
+        let brokered = plain.with_broker_socket(socket);
+        assert!(matches!(brokered.network, NetworkMode::None));
+        assert!(brokered.allows_ip_sockets());
+        assert!(brokered.derived_environment.contains(&(
+            BROKER_SOCKET_ENV.to_string(),
+            crate::filesystem::BROKER_SOCKET_CONTAINER_PATH.to_string()
+        )));
+        brokered.validate_broker_socket().unwrap();
+    }
+
+    #[test]
+    fn broker_socket_mode_rejects_other_egress_paths() {
+        let (_dir, socket) = broker_socket_fixture();
+        let base = || {
+            ContainerConfig::try_new(None, vec!["/bin/true".to_string()])
+                .unwrap()
+                .with_broker_socket(socket.clone())
+        };
+
+        let mut bridged = base();
+        bridged.network = NetworkMode::Bridge(crate::network::BridgeConfig::default());
+        let err = bridged.validate_broker_socket().unwrap_err();
+        assert!(err.to_string().contains("--network none"), "{err}");
+
+        let mut shared_netns = base();
+        shared_netns.namespaces.net = false;
+        assert!(shared_netns.validate_broker_socket().is_err());
+
+        let mut shadowed = base();
+        shadowed.volumes.push(VolumeMount {
+            source: VolumeSource::Tmpfs { size: None },
+            dest: PathBuf::from("/run/nucleus"),
+            read_only: false,
+        });
+        let err = shadowed.validate_broker_socket().unwrap_err();
+        assert!(err.to_string().contains("reserved"), "{err}");
+    }
 
     #[test]
     fn test_generate_container_id_is_32_hex_chars() {
@@ -2672,6 +2797,7 @@ mod tests {
             .with_volume(VolumeMount {
                 source: VolumeSource::Bind {
                     source: PathBuf::from("/tmp/definitely-missing-nucleus-volume"),
+                    caller_owned: None,
                 },
                 dest: PathBuf::from("/var/lib/app"),
                 read_only: false,
@@ -2688,6 +2814,7 @@ mod tests {
             .with_volume(VolumeMount {
                 source: VolumeSource::Bind {
                     source: PathBuf::from("/proc/sys"),
+                    caller_owned: None,
                 },
                 dest: PathBuf::from("/host-proc"),
                 read_only: true,
@@ -2705,6 +2832,7 @@ mod tests {
             .with_volume(VolumeMount {
                 source: VolumeSource::Bind {
                     source: dir.path().to_path_buf(),
+                    caller_owned: None,
                 },
                 dest: PathBuf::from("var/lib/app"),
                 read_only: false,
@@ -2722,6 +2850,7 @@ mod tests {
             .with_volume(VolumeMount {
                 source: VolumeSource::Bind {
                     source: dir.path().to_path_buf(),
+                    caller_owned: None,
                 },
                 dest: PathBuf::from("/etc"),
                 read_only: false,
@@ -2780,6 +2909,7 @@ mod tests {
             .with_volume(VolumeMount {
                 source: VolumeSource::Bind {
                     source: dir.path().to_path_buf(),
+                    caller_owned: None,
                 },
                 dest: PathBuf::from("/workspace"),
                 read_only: false,
@@ -2797,6 +2927,7 @@ mod tests {
             .with_volume(VolumeMount {
                 source: VolumeSource::Bind {
                     source: dir.path().to_path_buf(),
+                    caller_owned: None,
                 },
                 dest: PathBuf::from(DEFAULT_HOME_PATH),
                 read_only: false,
