@@ -10,6 +10,13 @@ pub(super) const SYS_FADVISE64: i64 = 223;
 #[cfg(target_arch = "aarch64")]
 pub(super) const SYS_SENDFILE: i64 = 71;
 
+// fchmodat2 is part of the generic syscall table (nr 452), but the pinned
+// libc does not expose a SYS_fchmodat2 constant for aarch64 or riscv64.
+#[cfg(target_arch = "x86_64")]
+pub(super) const SYS_FCHMODAT2: i64 = libc::SYS_fchmodat2;
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+pub(super) const SYS_FCHMODAT2: i64 = 452;
+
 #[cfg(all(
     test,
     any(
@@ -26,6 +33,7 @@ mod tests {
     fn generic_file_syscalls_have_current_arch_numbers() {
         assert!(SYS_FADVISE64 > 0);
         assert!(SYS_SENDFILE > 0);
+        assert!(SYS_FCHMODAT2 > 0);
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -33,5 +41,6 @@ mod tests {
     fn aarch64_generic_file_syscalls_match_kernel_table() {
         assert_eq!(SYS_SENDFILE, 71);
         assert_eq!(SYS_FADVISE64, 223);
+        assert_eq!(SYS_FCHMODAT2, 452);
     }
 }
