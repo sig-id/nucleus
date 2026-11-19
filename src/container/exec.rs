@@ -219,7 +219,11 @@ impl Container {
             }
         }
 
-        nix::unistd::execve(&program, &args, &env)?
+        let Err(e) = nix::unistd::execve(&program, &args, &env);
+        Err(NucleusError::ExecError(format!(
+            "Failed to execute {}: {}",
+            self.config.command[0], e
+        )))
     }
 
     /// Run as a minimal PID 1 init process inside the container.
