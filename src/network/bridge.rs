@@ -850,6 +850,21 @@ table bridge {table} {{
             ))
         })?;
 
+        // The bind exposes this inode's permissions to the workload. It must
+        // stay readable after the runtime drops to the configured non-root
+        // uid, matching write_resolv_conf's 0644.
+        use std::os::unix::fs::PermissionsExt as _;
+        staging
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o644))
+            .map_err(|e| {
+                NucleusError::NetworkError(format!(
+                    "Failed to relax permissions on temporary resolv.conf staging file {:?}: {}",
+                    staging.path(),
+                    e
+                ))
+            })?;
+
         Ok(staging)
     }
 }
@@ -900,6 +915,16 @@ mod tests {
         assert!(
             !staging.path().starts_with(&root),
             "staging file must not be created under the container root"
+        );
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            std::fs::metadata(staging.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644,
+            "staging file must be readable by the non-root workload identity"
         );
     }
 
@@ -967,6 +992,18 @@ mod tests {
                         std::fs::read_to_string(root.join("etc/resolv.conf")).unwrap(),
                         "nameserver 203.0.113.53\n",
                         "bind must shadow the underlying file"
+                    );
+                    // The bind preserves the source inode's mode, so it must
+                    // stay readable for a workload running as a non-root uid
+                    // (the staging fallback creates the file as 0600 first).
+                    use std::os::unix::fs::PermissionsExt as _;
+                    let mode = std::fs::metadata(root.join("etc/resolv.conf"))
+                        .unwrap()
+                        .permissions()
+                        .mode();
+                    assert!(
+                        mode & 0o004 != 0,
+                        "resolv.conf bind must be world-readable (mode {mode:o})"
                     );
                     let err = std::fs::write(root.join("etc/resolv.conf"), b"x").unwrap_err();
                     assert_eq!(
