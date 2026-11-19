@@ -20,7 +20,19 @@ use tracing::{debug, info, warn};
 pub struct NativeSeccomp {
     instructions: Vec<(u16, u8, u8, u32)>,
     log: bool,
+    /// Set `PR_SET_MDWE` before installing the filter. Saved with the filter
+    /// so attached processes and probes, which are not descendants of the
+    /// container's init and so do not inherit the flag, get the launch's
+    /// memory policy as well. Absent in state written by older versions.
+    #[serde(default)]
+    deny_exec_gain: bool,
 }
+
+// uapi/linux/prctl.h. Not every libc version the crate builds against
+// exports these, so they are spelled out.
+const PR_SET_MDWE: libc::c_int = 65;
+const PR_GET_MDWE: libc::c_int = 66;
+const PR_MDWE_REFUSE_EXEC_GAIN: libc::c_ulong = 1;
 
 impl NativeSeccomp {
     pub(crate) fn from_config(config: &ContainerConfig) -> Result<Self> {
@@ -44,10 +56,61 @@ impl NativeSeccomp {
         Ok(Self {
             instructions: program.iter().map(|i| (i.code, i.jt, i.jf, i.k)).collect(),
             log: trace || config.seccomp_log_denied,
+            deny_exec_gain: config.memory_deny_write_execute,
         })
     }
 
+    /// Whether the running kernel provides `PR_SET_MDWE` (Linux 6.3).
+    pub fn mdwe_supported() -> bool {
+        // SAFETY: PR_GET_MDWE reads a flag of the calling process and takes
+        // no pointers. Older kernels reject the option with EINVAL.
+        unsafe { libc::prctl(PR_GET_MDWE, 0, 0, 0, 0) >= 0 }
+    }
+
+    /// Whether the launch asked for `PR_SET_MDWE`.
+    pub(crate) fn denies_exec_gain(&self) -> bool {
+        self.deny_exec_gain
+    }
+
+    /// Make the kernel refuse executable memory this process wrote itself.
+    ///
+    /// With `PR_MDWE_REFUSE_EXEC_GAIN` the kernel denies a mapping that is
+    /// writable and executable at once, and denies adding `PROT_EXEC` to a
+    /// mapping that was created without it. The flag is inherited across
+    /// fork and exec and cannot be cleared. Loading a library still works:
+    /// that maps a file executable from the start.
+    ///
+    /// A no-op unless the launch asked for it. It has to run before the
+    /// filter is installed, because the filter does not let a workload call
+    /// this prctl. Failure is never degraded: the caller asked for the
+    /// protection by name.
+    pub(crate) fn deny_exec_gain(&self) -> Result<()> {
+        if !self.deny_exec_gain {
+            return Ok(());
+        }
+        // SAFETY: the prctl takes integer arguments only and affects the
+        // calling process, which is about to exec the workload.
+        let rc = unsafe { libc::prctl(PR_SET_MDWE, PR_MDWE_REFUSE_EXEC_GAIN, 0, 0, 0) };
+        if rc != 0 {
+            return Err(NucleusError::SeccompError(format!(
+                "Failed to set PR_SET_MDWE (needs Linux 6.3 or later): {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Apply the saved memory policy and install the saved filter.
     pub(crate) fn apply(&self) -> Result<()> {
+        self.deny_exec_gain()?;
+        self.install_filter()
+    }
+
+    /// Install the saved filter without touching the memory policy. The
+    /// launch path calls `deny_exec_gain` separately so that a degraded
+    /// launch, which tolerates a filter that cannot be installed, still
+    /// fails when the memory policy cannot be set.
+    pub(crate) fn install_filter(&self) -> Result<()> {
         if self.instructions.is_empty() || self.instructions.len() > 4096 {
             return Err(NucleusError::SeccompError(
                 "Invalid saved seccomp program length".into(),
@@ -2175,10 +2238,105 @@ mod tests {
         assert_eq!(status.signal(), Some(libc::SIGSYS));
         assert!(NativeSeccomp {
             instructions: Vec::new(),
-            log: false
+            log: false,
+            deny_exec_gain: false,
         }
         .apply()
         .is_err());
+    }
+
+    #[test]
+    fn saved_policy_from_an_older_version_has_no_memory_policy() {
+        // State written before the field existed must keep loading, and
+        // must not start refusing executable memory on attach.
+        let legacy: NativeSeccomp =
+            serde_json::from_str(r#"{"instructions":[[6,0,0,2147418112]],"log":false}"#).unwrap();
+        assert!(!legacy.denies_exec_gain());
+
+        let config = ContainerConfig::try_new(None, vec![])
+            .unwrap()
+            .with_memory_deny_write_execute(true);
+        let saved = NativeSeccomp::from_config(&config).unwrap();
+        let round_trip: NativeSeccomp =
+            serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+        assert!(round_trip.denies_exec_gain());
+    }
+
+    #[test]
+    fn kernel_refuses_write_then_execute_under_the_memory_policy() {
+        // #16, enforced by the real kernel. The seccomp rule only refuses a
+        // mapping that is writable and executable in one request, so a
+        // workload can write a page and then make it executable. With the
+        // memory policy the kernel refuses that second step as well.
+        // Runs in fork children so nothing touches the test runner.
+        use nix::sys::wait::{waitpid, WaitStatus};
+        use nix::unistd::{fork, pipe, read, write, ForkResult};
+
+        if !NativeSeccomp::mdwe_supported() {
+            eprintln!("skipping: this kernel has no PR_SET_MDWE");
+            return;
+        }
+
+        // Returns the errno of mmap(RW) followed by mprotect(RX), and of a
+        // library-style mapping that is executable from the start.
+        let probe = |deny: bool| -> [u8; 2] {
+            let config = ContainerConfig::try_new(None, vec![])
+                .unwrap()
+                .with_memory_deny_write_execute(deny);
+            let policy = NativeSeccomp::from_config(&config).unwrap();
+            let (read_fd, write_fd) = pipe().unwrap();
+            // SAFETY: fork in a test process; the child only issues direct
+            // syscalls and exits without unwinding.
+            match unsafe { fork() }.unwrap() {
+                ForkResult::Parent { child } => {
+                    drop(write_fd);
+                    let mut buf = [0xffu8; 2];
+                    assert_eq!(read(&read_fd, &mut buf).unwrap(), 2);
+                    assert_eq!(waitpid(child, None).unwrap(), WaitStatus::Exited(child, 0));
+                    buf
+                }
+                ForkResult::Child => {
+                    drop(read_fd);
+                    policy.apply().unwrap();
+                    let errno = || std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                    // SAFETY: anonymous private mappings of one page; the
+                    // pointers are only passed back to mprotect.
+                    let (flip, exec_from_start) = unsafe {
+                        let page = libc::mmap(
+                            std::ptr::null_mut(),
+                            4096,
+                            libc::PROT_READ | libc::PROT_WRITE,
+                            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                            -1,
+                            0,
+                        );
+                        let flip =
+                            if libc::mprotect(page, 4096, libc::PROT_READ | libc::PROT_EXEC) == 0 {
+                                0
+                            } else {
+                                errno()
+                            };
+                        let exec = libc::mmap(
+                            std::ptr::null_mut(),
+                            4096,
+                            libc::PROT_READ | libc::PROT_EXEC,
+                            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                            -1,
+                            0,
+                        );
+                        (flip, if exec == libc::MAP_FAILED { errno() } else { 0 })
+                    };
+                    let _ = write(&write_fd, &[flip as u8, exec_from_start as u8]);
+                    std::process::exit(0);
+                }
+            }
+        };
+
+        // Default: the filter alone lets the write-then-execute flip through.
+        assert_eq!(probe(false), [0, 0]);
+        // With the policy the flip is refused, and a mapping that was
+        // executable from the start (how libraries load) still works.
+        assert_eq!(probe(true), [libc::EACCES as u8, 0]);
     }
 
     #[test]

@@ -880,6 +880,17 @@ pub struct ContainerConfig {
     /// `SHM_EXEC`) stays denied.
     pub seccomp_allow_jit: bool,
 
+    /// Set `PR_SET_MDWE` on the workload, attached processes and probes.
+    ///
+    /// The seccomp W^X rule only refuses a mapping that is writable and
+    /// executable in one request; a workload can still write a mapping and
+    /// make it executable afterwards. With this set the kernel refuses that
+    /// too, so no code the workload wrote itself can run. JIT runtimes do
+    /// exactly that and stop working, which is why it is opt-in and cannot
+    /// be combined with the JIT allowance. Needs Linux 6.3; the launch fails
+    /// on an older kernel instead of running without the protection.
+    pub memory_deny_write_execute: bool,
+
     /// Path to capability policy file (TOML).
     pub caps_policy: Option<PathBuf>,
 
@@ -1038,6 +1049,7 @@ impl ContainerConfig {
             seccomp_trace_log: None,
             seccomp_allow_syscalls: Vec::new(),
             seccomp_allow_jit: false,
+            memory_deny_write_execute: false,
             caps_policy: None,
             caps_policy_sha256: None,
             landlock_policy: None,
@@ -1476,6 +1488,12 @@ impl ContainerConfig {
     #[must_use]
     pub fn with_seccomp_allow_jit(mut self, allow_jit: bool) -> Self {
         self.seccomp_allow_jit = allow_jit;
+        self
+    }
+
+    #[must_use]
+    pub fn with_memory_deny_write_execute(mut self, enabled: bool) -> Self {
+        self.memory_deny_write_execute = enabled;
         self
     }
 
@@ -1963,7 +1981,22 @@ impl ContainerConfig {
             }
         }
 
+        if self.memory_deny_write_execute && self.seccomp_allow_jit {
+            return Err(crate::error::NucleusError::ConfigError(
+                "--memory-deny-write-execute and --allow-jit are opposites: a JIT runtime \
+                 writes code and then executes it, which is what MDWE refuses"
+                    .to_string(),
+            ));
+        }
+
         if !self.use_gvisor {
+            if self.memory_deny_write_execute && !crate::security::NativeSeccomp::mdwe_supported() {
+                return Err(crate::error::NucleusError::ConfigError(
+                    "--memory-deny-write-execute needs PR_SET_MDWE (Linux 6.3 or later), which \
+                     this kernel does not provide"
+                        .to_string(),
+                ));
+            }
             return Ok(());
         }
 
@@ -1991,6 +2024,13 @@ impl ContainerConfig {
         if self.seccomp_allow_jit {
             return Err(crate::error::NucleusError::ConfigError(
                 "gVisor runtime does not support --allow-jit; use --runtime native".to_string(),
+            ));
+        }
+
+        if self.memory_deny_write_execute {
+            return Err(crate::error::NucleusError::ConfigError(
+                "gVisor runtime does not support --memory-deny-write-execute; use --runtime native"
+                    .to_string(),
             ));
         }
 
@@ -2962,6 +3002,41 @@ mod tests {
 
         let err = cfg.validate_runtime_support().unwrap_err();
         assert!(err.to_string().contains("seccomp-allow"));
+    }
+
+    #[test]
+    fn test_memory_deny_write_execute_validation() {
+        let base = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()]).unwrap();
+        assert!(!base.memory_deny_write_execute);
+
+        // gVisor has its own memory policy; the flag is native-only.
+        let err = base
+            .clone()
+            .with_memory_deny_write_execute(true)
+            .validate_runtime_support()
+            .unwrap_err();
+        assert!(err.to_string().contains("--memory-deny-write-execute"));
+
+        // A JIT runtime is exactly what MDWE refuses.
+        let err = base
+            .clone()
+            .with_gvisor(false)
+            .with_memory_deny_write_execute(true)
+            .with_seccomp_allow_jit(true)
+            .validate_runtime_support()
+            .unwrap_err();
+        assert!(err.to_string().contains("opposites"));
+
+        // Native: accepted exactly when the kernel provides PR_SET_MDWE, and
+        // refused otherwise instead of launching without the protection.
+        let native = base
+            .with_gvisor(false)
+            .with_memory_deny_write_execute(true)
+            .validate_runtime_support();
+        assert_eq!(
+            native.is_ok(),
+            crate::security::NativeSeccomp::mdwe_supported()
+        );
     }
 
     #[test]

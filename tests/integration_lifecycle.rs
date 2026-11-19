@@ -585,6 +585,45 @@ mod tests {
     }
 
     #[test]
+    fn memory_policy_is_reported_in_container_started() {
+        use std::io::Write;
+        // #16: `--memory-deny-write-execute` sets PR_SET_MDWE on the
+        // workload. An orchestrator attests the posture from
+        // container_started, so the event must carry it, and it must be off
+        // by default (the jit_allowance test covers the default launch).
+        // SAFETY: PR_GET_MDWE (66) reads a flag and takes no pointers.
+        if unsafe { libc::prctl(66, 0, 0, 0, 0) } < 0 {
+            eprintln!("skipping: this kernel has no PR_SET_MDWE");
+            return;
+        }
+        let state = tempfile::tempdir().unwrap();
+        let mut launch = spawn_gated_with(
+            &["--memory-deny-write-execute".to_string()],
+            "exit 0",
+            state.path(),
+        );
+        wait_for_event(&mut launch, "container_started");
+        let started = event_records(&launch.events_path)
+            .into_iter()
+            .find(|event| event["type"] == "container_started")
+            .expect("container_started event");
+        assert_eq!(started["security"]["memory_deny_write_execute"], true);
+        assert_eq!(started["security"]["allow_jit"], false);
+        assert_eq!(started["security"]["seccomp_status"], "installed");
+
+        launch
+            .gate_writer
+            .take()
+            .expect("gate writer held")
+            .write_all(b"go")
+            .unwrap();
+        // The shell still starts and exits cleanly: loading libraries maps
+        // files executable from the start, which the policy permits.
+        let output = launch.child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(0));
+    }
+
+    #[test]
     fn jit_allowance_is_reported_in_container_started() {
         use std::io::Write;
         // #46: `--allow-jit` is a per-launch opt-out of the native W^X
@@ -619,6 +658,7 @@ mod tests {
             .find(|event| event["type"] == "container_started")
             .expect("container_started event");
         assert_eq!(started["security"]["allow_jit"], false);
+        assert_eq!(started["security"]["memory_deny_write_execute"], false);
         drop(launch.gate_writer.take());
         let _ = launch.child.wait();
     }

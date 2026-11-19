@@ -713,6 +713,7 @@ const RUN_CONFIG_PATH_CONFLICTS: &[&str] = &[
     "seccomp_log_denied",
     "seccomp_allow",
     "allow_jit",
+    "memory_deny_write_execute",
     "caps_policy",
     "caps_policy_sha256",
     "landlock_policy",
@@ -815,6 +816,7 @@ const RUN_CONFIG_FD_CONFLICTS: &[&str] = &[
     "seccomp_log_denied",
     "seccomp_allow",
     "allow_jit",
+    "memory_deny_write_execute",
     "caps_policy",
     "caps_policy_sha256",
     "landlock_policy",
@@ -1228,6 +1230,15 @@ enum Commands {
         #[arg(long = "allow-jit")]
         allow_jit: bool,
 
+        /// Refuse executable memory the workload wrote itself: set
+        /// PR_SET_MDWE so the kernel denies mappings that are writable and
+        /// executable at once and denies making a mapping executable after
+        /// the fact (write, then mprotect to executable). Stops injected
+        /// native code; breaks JIT runtimes, so it conflicts with
+        /// --allow-jit. Native runtime only; needs Linux 6.3 or later.
+        #[arg(long = "memory-deny-write-execute", conflicts_with = "allow_jit")]
+        memory_deny_write_execute: bool,
+
         /// Path to capability policy file (TOML)
         #[arg(long = "caps-policy")]
         caps_policy: Option<String>,
@@ -1629,6 +1640,8 @@ struct RunConfig {
     seccomp_allow: Vec<String>,
     #[serde(default)]
     allow_jit: bool,
+    #[serde(default)]
+    memory_deny_write_execute: bool,
     caps_policy: Option<String>,
     caps_policy_sha256: Option<String>,
     landlock_policy: Option<String>,
@@ -1736,6 +1749,7 @@ impl Default for RunConfig {
             seccomp_log_denied: false,
             seccomp_allow: Vec::new(),
             allow_jit: false,
+            memory_deny_write_execute: false,
             caps_policy: None,
             caps_policy_sha256: None,
             landlock_policy: None,
@@ -2344,6 +2358,7 @@ fn try_main() -> Result<i32> {
             seccomp_log_denied,
             seccomp_allow,
             allow_jit,
+            memory_deny_write_execute,
             caps_policy,
             caps_policy_sha256,
             landlock_policy,
@@ -2466,6 +2481,7 @@ fn try_main() -> Result<i32> {
                     seccomp_log_denied,
                     seccomp_allow,
                     allow_jit,
+                    memory_deny_write_execute,
                     caps_policy,
                     caps_policy_sha256,
                     landlock_policy,
@@ -2692,6 +2708,7 @@ fn try_main() -> Result<i32> {
                 seccomp_log_denied,
                 seccomp_allow,
                 allow_jit,
+                memory_deny_write_execute,
                 caps_policy,
                 caps_policy_sha256,
                 landlock_policy,
@@ -2981,6 +2998,10 @@ fn try_main() -> Result<i32> {
 
             if allow_jit {
                 config = config.with_seccomp_allow_jit(true);
+            }
+
+            if memory_deny_write_execute {
+                config = config.with_memory_deny_write_execute(true);
             }
 
             // Capability policy
@@ -3661,6 +3682,7 @@ mod tests {
             seccomp_log_denied: false,
             seccomp_allow: vec!["io_uring_setup".to_string(), "--detach".to_string()],
             allow_jit: true,
+            memory_deny_write_execute: false,
             caps_policy: Some("/tmp/caps.toml".to_string()),
             caps_policy_sha256: Some("efgh".to_string()),
             landlock_policy: Some("/tmp/landlock.toml".to_string()),
@@ -3789,6 +3811,7 @@ mod tests {
             seccomp_log_denied: false,
             seccomp_allow: Vec::new(),
             allow_jit: false,
+            memory_deny_write_execute: false,
             caps_policy: None,
             caps_policy_sha256: None,
             landlock_policy: None,
