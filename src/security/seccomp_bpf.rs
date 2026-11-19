@@ -120,6 +120,14 @@ pub(super) struct ErrnoRule {
     /// Test the low 32 bits of seccomp_data.args[1] (second argument, e.g. an
     /// `ioctl` request code).
     pub arg1: Option<ArgMatch>,
+    /// Test the low 32 bits of seccomp_data.args[2] (third argument, e.g. a
+    /// `mprotect` protection mask).
+    pub arg2: Option<ArgMatch>,
+    /// Additional argument tests ANDed with the fixed fields above. Several
+    /// tests may target the same index: W^X needs both the PROT_WRITE and
+    /// PROT_EXEC bits of a protection mask set, which is two AnyBit tests on
+    /// argument 2.
+    pub extra_args: &'static [(u8, ArgMatch)],
     pub errno: i32,
 }
 
@@ -182,10 +190,17 @@ pub(super) fn compile_bitmap_bpf_with_errno_syscalls(
     // === Section 1b: Exact-match errno denies ===
     for rule in errno_syscalls {
         prog.push(bpf_stmt(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_NR_OFFSET));
-        let tests: Vec<(u32, ArgMatch)> = [(0, rule.arg0), (1, rule.arg1)]
+        let mut tests: Vec<(u32, ArgMatch)> = [(0u32, rule.arg0), (1, rule.arg1), (2, rule.arg2)]
             .into_iter()
             .filter_map(|(index, test)| test.map(|test| (index, test)))
             .collect();
+        // Extra tests may repeat an argument index (W^X tests two bits of
+        // the same protection mask).
+        tests.extend(
+            rule.extra_args
+                .iter()
+                .map(|(index, test)| (*index as u32, *test)),
+        );
         // Each argument test is a load and a jump; a failed test skips the
         // remaining tests and the RET.
         let skip = 2 * tests.len() as u8 + 1;
@@ -532,6 +547,8 @@ mod tests {
                 arg0: None,
                 arg1: None,
                 errno: libc::ENOSYS,
+                arg2: None,
+                extra_args: &[],
             }],
             SeccompAction::KillProcess,
             SeccompAction::Allow,
@@ -563,6 +580,8 @@ mod tests {
                 arg0: None,
                 arg1: Some(ArgMatch::Eq(libc::FICLONE as u32)),
                 errno: libc::EOPNOTSUPP,
+                arg2: None,
+                extra_args: &[],
             }],
             SeccompAction::KillProcess,
             SeccompAction::Allow,
@@ -790,6 +809,8 @@ mod tests {
                 arg0: Some(ArgMatch::AnyBit(0b1100)),
                 arg1: Some(ArgMatch::Eq(7)),
                 errno: libc::EPERM,
+                arg2: None,
+                extra_args: &[],
             }],
             SeccompAction::KillProcess,
             SeccompAction::Allow,
@@ -1056,6 +1077,121 @@ mod tests {
     }
 
     #[test]
+    fn test_builtin_prctl_allows_pr_set_vma_anon_name() {
+        // V8 and abseil name every anonymous region they map (Node 26 calls
+        // this during startup); killing it took down every Node 26 workload
+        // with SIGSYS before user code ran.
+        let rules = crate::security::SeccompManager::minimal_filter_for_test(true, &[]);
+        let prog = compile_bitmap_bpf_with_errno_syscalls(
+            rules,
+            crate::security::SeccompManager::errno_denied_syscalls_for_test(),
+            SeccompAction::KillProcess,
+            SeccompAction::Allow,
+            TargetArch::x86_64,
+        )
+        .unwrap();
+
+        // uapi: PR_SET_VMA = 0x53564d41 ("SVMA"), PR_SET_VMA_ANON_NAME = 0.
+        const PR_SET_VMA: u64 = 0x5356_4d41;
+        let name_vma = make_seccomp_data(
+            libc::SYS_prctl as u32,
+            AUDIT_ARCH_X86_64,
+            [PR_SET_VMA, 0, 0x1000, 4096, 0x7f00_0000_dead, 0],
+        );
+        assert_eq!(bpf_eval(&prog, &name_vma), RET_ALLOW);
+
+        // Only the ANON_NAME (0) subcommand is allowed; PR_SET_VMA_ANON_VMA
+        // (1) and unknown subcommands still hit the default deny.
+        for subcommand in [1u64, 2] {
+            let data = make_seccomp_data(
+                libc::SYS_prctl as u32,
+                AUDIT_ARCH_X86_64,
+                [PR_SET_VMA, subcommand, 0, 0, 0, 0],
+            );
+            assert_eq!(
+                bpf_eval(&prog, &data),
+                RET_KILL,
+                "PR_SET_VMA subcommand {} must be denied",
+                subcommand
+            );
+        }
+    }
+
+    #[test]
+    fn test_io_uring_degrades_to_enosys_unless_opted_in() {
+        // libuv (Node >= 26) probes io_uring once per event loop at startup
+        // and falls back to its thread pool on ENOSYS; the default KillProcess
+        // took every Node 26 workload down with SIGSYS before user code ran.
+        use crate::security::SeccompManager;
+        let default = SeccompManager::compile_builtin(false, &[], false).unwrap();
+        let eval = |prog: &BpfProgram, nr: i64, prot: u64| {
+            bpf_eval(
+                prog,
+                &make_seccomp_data(
+                    nr as u32,
+                    arch_audit_value(std::env::consts::ARCH.try_into().unwrap()),
+                    [0, 4096, prot, 0, 0, 0],
+                ),
+            )
+        };
+        const PROT_RWX: u64 = (libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC) as u64;
+        for nr in [
+            libc::SYS_io_uring_setup,
+            libc::SYS_io_uring_enter,
+            libc::SYS_io_uring_register,
+        ] {
+            assert_eq!(
+                eval(&default, nr, 0),
+                libc::SECCOMP_RET_ERRNO | libc::ENOSYS as u32,
+                "io_uring syscall {nr} must degrade to ENOSYS, not SIGSYS"
+            );
+        }
+
+        // Opting in suppresses the override and yields the real syscall.
+        let extra = ["io_uring_setup", "io_uring_enter", "io_uring_register"].map(String::from);
+        let opted_in = SeccompManager::compile_builtin(false, &extra, false).unwrap();
+        for nr in [
+            libc::SYS_io_uring_setup,
+            libc::SYS_io_uring_enter,
+            libc::SYS_io_uring_register,
+        ] {
+            assert_eq!(eval(&opted_in, nr, 0), RET_ALLOW);
+        }
+
+        // capget (own credentials, read-only) is probed by Node 26 at
+        // startup and must be allowed by default.
+        assert_eq!(eval(&default, libc::SYS_capget, 0), RET_ALLOW);
+        // capset mutates credentials and stays denied.
+        assert_eq!(eval(&default, libc::SYS_capset, 0), RET_KILL);
+
+        // The Node >= 26 runbook: V8 needs its whole code range RWX (there
+        // is no degrade path — V8 fatals on any other errno), so the default
+        // filter returns ENOMEM, the only errno base::OS::SetPermissions
+        // accepts, and --seccomp-allow mmap/mprotect lifts the mask.
+        for nr in [libc::SYS_mmap, libc::SYS_mprotect, libc::SYS_pkey_mprotect] {
+            assert_eq!(
+                eval(&default, nr, PROT_RWX),
+                libc::SECCOMP_RET_ERRNO | libc::ENOMEM as u32,
+                "W^X request on {nr} must degrade to ENOMEM, not SIGSYS"
+            );
+        }
+        let rwx = ["mmap", "mprotect"].map(String::from);
+        let node26 = SeccompManager::compile_builtin(false, &rwx, false).unwrap();
+        assert_eq!(eval(&node26, libc::SYS_mmap, PROT_RWX), RET_ALLOW);
+        assert_eq!(eval(&node26, libc::SYS_mprotect, PROT_RWX), RET_ALLOW);
+        // The lift is per-syscall: pkey_mprotect keeps the mask.
+        assert_eq!(
+            eval(&node26, libc::SYS_pkey_mprotect, PROT_RWX),
+            libc::SECCOMP_RET_ERRNO | libc::ENOMEM as u32
+        );
+        // Ordinary protections are unaffected either way.
+        assert_eq!(
+            eval(&node26, libc::SYS_mprotect, libc::PROT_WRITE as u64),
+            RET_ALLOW
+        );
+    }
+
+    #[test]
     fn hardened_mapping_transfer_and_gpu_rules_survive_compilation() {
         use crate::security::SeccompManager;
         let action = |prog: &BpfProgram, nr: i64, args: [u64; 6]| {
@@ -1084,14 +1220,25 @@ mod tests {
         let custom = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(custom.path(), r#"{"defaultAction":"SCMP_ACT_KILL_PROCESS","architectures":[],"syscalls":[{"names":["mmap","mprotect","pkey_mprotect","shmat","personality","prctl","ioctl","mknodat","kcmp"],"action":"SCMP_ACT_ALLOW"}]}"#).unwrap();
         let profile = SeccompManager::compile_profile(custom.path(), None).unwrap();
-        for prog in [&gpu, &profile] {
+        for (prog_idx, prog) in [&gpu, &profile].iter().enumerate() {
+            // W^X is still a hard invariant for the built-in mask (only the
+            // ENOMEM errno changed so probing runtimes degrade instead of
+            // dying with SIGSYS). The gpu program opted into mmap and
+            // pkey_mprotect via --seccomp-allow, which lifts the mask for
+            // exactly those two; the custom profile keeps every mask.
+            let is_gpu = prog_idx == 0;
             for nr in [libc::SYS_mmap, libc::SYS_mprotect, libc::SYS_pkey_mprotect] {
+                let lifted = is_gpu && nr != libc::SYS_mprotect;
                 for (prot, expected) in [
                     (libc::PROT_READ | libc::PROT_WRITE, RET_ALLOW),
                     (libc::PROT_READ | libc::PROT_EXEC, RET_ALLOW),
                     (
                         libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
-                        RET_KILL,
+                        if lifted {
+                            RET_ALLOW
+                        } else {
+                            libc::SECCOMP_RET_ERRNO | libc::ENOMEM as u32
+                        },
                     ),
                 ] {
                     assert_eq!(action(prog, nr, [0, 4096, prot as u64, 0, 0, 0]), expected);

@@ -6,7 +6,37 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
-- No unreleased changes.
+
+### Fixed
+- Node 26 (and every other V8 14 runtime: Electron, Chromium, Deno) died
+  with `SIGSYS` before any user code ran. The built-in seccomp profile now
+  handles the four syscalls V8/libuv touch at startup:
+  - `prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, ...)` (V8/abseil name every
+    region they map) is allowed, argument-filtered to the read-only
+    VMA-naming subcommand.
+  - `capget` is allowed by default: a read-only query of the caller's own
+    capabilities (querying another process still requires `CAP_SYS_PTRACE`).
+    `capset` stays denied.
+  - `io_uring_setup`/`io_uring_enter`/`io_uring_register` return `ENOSYS`
+    instead of killing: libuv probes io_uring once per event loop and falls
+    back to its thread pool, exactly as on a pre-5.1 kernel. io_uring stays
+    out of the default allowlist (documented attack surface); PostgreSQL 18+
+    and friends keep opting in via `--seccomp-allow` or a custom profile,
+    which suppresses the override.
+  - W^X violations (`mmap`/`mprotect`/`pkey_mprotect` with both
+    `PROT_WRITE` and `PROT_EXEC`) now return `ENOMEM` instead of `SIGSYS`.
+    V8 reserves its entire 512 MB code range RWX and fatals on any other
+    errno, so the W^X invariant itself is unchanged — no RWX mapping can be
+    created — but probing runtimes degrade instead of dying. Running V8
+    runtimes requires lifting the mask per syscall:
+    `nucleus run --seccomp-allow mmap --seccomp-allow mprotect -- node app.js`
+    (each lift is logged with a warning; `pkey_mprotect` is liftable the
+    same way). Without it Node 26 now exits with V8's actionable
+    "Failed to reserve virtual memory for CodeRange" message instead of an
+    unexplained core dump.
+- `ErrnoRule` (the seccomp errno-override mechanism) can now test argument 2
+  and repeat tests on one argument, which is how the W^X (both
+  `PROT_WRITE` and `PROT_EXEC` set) denial is expressed.
 
 ## [0.6.0] - 2026-11-19
 
