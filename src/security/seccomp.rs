@@ -2763,10 +2763,23 @@ mod tests {
         let arg_filtered = SeccompManager::opt_in_arg_filtered();
         let mut names: Vec<&str> = SeccompManager::OPT_IN_SYSCALLS.to_vec();
         names.extend(arg_filtered.iter().map(String::as_str));
+        // The name table maps these only on x86_64. Elsewhere a missing
+        // mapping is expected, not a gap, and it must stay missing so this
+        // list cannot go stale.
+        const X86_64_ONLY: &[&str] = &[
+            "inotify_init",
+            "setrlimit",
+            "pause",
+            "alarm",
+            "time",
+            "mknod",
+        ];
         for name in names {
-            assert!(
+            let expect_mapping = cfg!(target_arch = "x86_64") || !X86_64_ONLY.contains(&name);
+            assert_eq!(
                 syscall_name_to_number(name).is_some(),
-                "opt-in syscall '{name}' needs a syscall_name_to_number entry"
+                expect_mapping,
+                "opt-in syscall '{name}': unexpected syscall_name_to_number result"
             );
         }
     }
