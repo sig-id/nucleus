@@ -2785,7 +2785,27 @@ mod tests {
         }
     }
 
-    fn in_unmapped_user_namespace(check: impl FnOnce()) {
+    const USERNS_TEST_CHILD_ENV: &str = "NUCLEUS_TEST_USERNS_CHILD";
+
+    /// Run `check` in an unmapped user namespace. `test` names the calling
+    /// test, which is re-run alone in a fresh test process: forking straight
+    /// from the parallel harness can copy a lock another test thread holds
+    /// (environment, output capture) into the child, which then hangs while
+    /// holding descriptors of other tests, such as a hook's stdin pipe.
+    fn in_unmapped_user_namespace(test: &str, check: impl FnOnce()) {
+        if std::env::var_os(USERNS_TEST_CHILD_ENV).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "--test-threads=1", "--nocapture"])
+                .arg(format!("oci::tests::{test}"))
+                .env(USERNS_TEST_CHILD_ENV, "1")
+                // Other tests change PATH while running; start from the
+                // original so the child finds bash.
+                .env("PATH", original_path())
+                .status()
+                .unwrap();
+            assert!(status.success(), "{test} failed in its own process");
+            return;
+        }
         // unshare(CLONE_NEWUSER) requires a single-threaded caller.
         match unsafe { nix::unistd::fork().unwrap() } {
             nix::unistd::ForkResult::Parent { child } => assert_eq!(
@@ -2816,25 +2836,32 @@ mod tests {
     fn prepared_runtime_hook_runs_after_entering_user_namespace() {
         let hooks = [bash_hook("exit 0")];
         let prepared = OciHooks::prepare_hooks(&hooks, "createRuntime").unwrap();
-        in_unmapped_user_namespace(move || {
-            let err = OciHooks::run_hooks(&hooks, &creating_state(), "createRuntime")
-                .unwrap_err()
-                .to_string();
-            assert!(err.contains("not mapped into this user namespace"), "{err}");
-            OciHooks::run_prepared_hooks(&prepared, &creating_state(), "createRuntime").unwrap();
-        });
+        in_unmapped_user_namespace(
+            "prepared_runtime_hook_runs_after_entering_user_namespace",
+            move || {
+                let err = OciHooks::run_hooks(&hooks, &creating_state(), "createRuntime")
+                    .unwrap_err()
+                    .to_string();
+                assert!(err.contains("not mapped into this user namespace"), "{err}");
+                OciHooks::run_prepared_hooks(&prepared, &creating_state(), "createRuntime")
+                    .unwrap();
+            },
+        );
     }
 
     #[test]
     fn container_hooks_trust_owners_outside_the_user_namespace() {
-        in_unmapped_user_namespace(|| {
-            OciHooks::run_container_hooks(
-                &[bash_hook("exit 0")],
-                &creating_state(),
-                "startContainer",
-            )
-            .unwrap();
-        });
+        in_unmapped_user_namespace(
+            "container_hooks_trust_owners_outside_the_user_namespace",
+            || {
+                OciHooks::run_container_hooks(
+                    &[bash_hook("exit 0")],
+                    &creating_state(),
+                    "startContainer",
+                )
+                .unwrap();
+            },
+        );
     }
 
     #[test]
@@ -2846,24 +2873,27 @@ mod tests {
             .unwrap()
             .trim()
             .to_owned();
-        in_unmapped_user_namespace(move || {
-            // Hosts that confine unprivileged user namespaces (AppArmor on
-            // Ubuntu) refuse the map write; nothing to check there.
-            if std::fs::write("/proc/self/uid_map", format!("{overflow} {uid} 1")).is_err() {
-                return;
-            }
-            let err = OciHooks::run_container_hooks(
-                &[bash_hook("exit 0")],
-                &creating_state(),
-                "startContainer",
-            )
-            .unwrap_err()
-            .to_string();
-            assert!(
-                err.contains("cannot be verified") || err.contains("Cannot verify directory"),
-                "{err}"
-            );
-        });
+        in_unmapped_user_namespace(
+            "container_hooks_refuse_an_owner_the_namespace_could_hold",
+            move || {
+                // Hosts that confine unprivileged user namespaces (AppArmor on
+                // Ubuntu) refuse the map write; nothing to check there.
+                if std::fs::write("/proc/self/uid_map", format!("{overflow} {uid} 1")).is_err() {
+                    return;
+                }
+                let err = OciHooks::run_container_hooks(
+                    &[bash_hook("exit 0")],
+                    &creating_state(),
+                    "startContainer",
+                )
+                .unwrap_err()
+                .to_string();
+                assert!(
+                    err.contains("cannot be verified") || err.contains("Cannot verify directory"),
+                    "{err}"
+                );
+            },
+        );
     }
 
     #[test]
