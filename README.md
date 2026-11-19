@@ -350,15 +350,30 @@ Delegate=cpu io memory pids
 DelegateSubgroup=supervisor
 ```
 
-Nucleus recognises the delegation marker that systemd's system manager sets
-on a `Delegate=` unit, when it runs in that cgroup or in a direct child of it
-(`DelegateSubgroup=`), and enables the controllers it needs there. A delegated
-cgroup that still has member processes cannot hand controllers to its children:
-keep the orchestrator in a subgroup. A lone `nucleus` moves itself into a
-`nucleus-supervisor` leaf. systemd's user manager does not set the marker, and
-other layouts are not guessed: name the subtree with `NUCLEUS_CGROUP_ROOT`.
+Nucleus recognises a `Delegate=` unit when it runs in that unit's cgroup or in
+a direct child of it (`DelegateSubgroup=`), and enables the controllers it
+needs there. For system units it reads the delegation marker the system manager
+sets. systemd's user manager sets no marker, so for a service or scope under
+`user@<uid>.service` Nucleus asks the user manager
+(`systemctl --user show -p Delegate`); this works for
+`systemd-run --user [--scope] -p Delegate=yes` and user services with
+`Delegate=yes`. A delegated cgroup that still has member processes cannot hand
+controllers to its children: keep the orchestrator in a subgroup. A lone
+`nucleus` moves itself into a `nucleus-supervisor` leaf.
+
+Other layouts are not guessed, and neither is a user-manager unit when
+`systemctl --user` cannot reach the manager (for example without
+`XDG_RUNTIME_DIR` or the user bus). In those cases name the delegated subtree
+with `NUCLEUS_CGROUP_ROOT`:
+
+```bash
+systemd-run --user --scope -p Delegate=yes sh -c \
+  'NUCLEUS_CGROUP_ROOT=/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup) \
+   exec nucleus run --strict-agent --memory 256M -- ./agent'
+```
+
 Without root or a delegated subtree, strict modes fail rather than run
-unlimited. The effective cgroup is reported as `container.cgroup_path` in the
+unlimited, and the error points to `Delegate=` and `NUCLEUS_CGROUP_ROOT`. The effective cgroup is reported as `container.cgroup_path` in the
 event stream.
 
 ### Workspace
@@ -683,6 +698,16 @@ nucleus run \
   --context ./ctx \
   -- ./agent
 ```
+
+#### Nested sandboxes
+
+Workloads cannot create namespaces under either runtime, so tools that sandbox
+their own subprocesses with namespaces (bubblewrap, `unshare`, the Codex CLI
+tool sandbox) do not work inside a container. The native runtime refuses
+`unshare`, `setns`, and `clone` with namespace flags with `EPERM`; gVisor
+refuses the user-namespace ID mapping. Disable the harness's own sandbox (for
+example Codex `--sandbox danger-full-access`) and rely on Nucleus as the single
+enforcing layer.
 
 ### Security Policy Files
 

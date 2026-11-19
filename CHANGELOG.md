@@ -6,7 +6,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
-- No unreleased changes.
+
+### Fixed
+- Delegated cgroups of the systemd user manager are detected. The user manager
+  sets no `delegate` xattr, so for a service or scope under
+  `user@<uid>.service` Nucleus reads the unit's `Delegate` property with
+  `systemctl --user show`. Strict modes now get resource enforcement under
+  `systemd-run --user [--scope] -p Delegate=yes` without `NUCLEUS_CGROUP_ROOT`.
+  The strict-mode cgroup error names `Delegate=` and `NUCLEUS_CGROUP_ROOT`, and
+  the README documents `NUCLEUS_CGROUP_ROOT` for layouts that are not detected
+  (#34).
+- A native workload whose command cannot be executed (for example a missing
+  binary) fails with `Failed to execute <command>: <errno>` and exit status 1.
+  Before, the setup process unwound into a tmpfs unmount after seccomp was
+  installed and was killed with `SIGSYS` (exit 159) without an error message.
+
+### Changed
+- The native seccomp filter refuses namespace creation (`unshare` or `clone`
+  with `CLONE_NEW*` flags, and `setns`) with `EPERM` instead of killing the
+  workload with `SIGSYS`, so nested sandboxes such as bubblewrap report an
+  error. The README documents that nested sandboxes do not work under either
+  runtime (#35).
 
 ## [0.5.3] - 2026-11-19
 
