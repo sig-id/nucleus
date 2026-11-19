@@ -37,6 +37,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   container cgroup when the supervisor is gone.
 - gVisor bind mounts of non-regular files (such as sockets) get a file
   mountpoint instead of a directory.
+- OCI hooks run in user-namespaced native containers (rootless, and root-run
+  production containers, which are root-remapped). Their trust checks ran
+  after entering the user namespace, where host-root-owned binaries and
+  directories appear unmapped, so every hook was refused.
+  - `createRuntime` hooks resolve in the runtime namespace: they are now
+    validated under the host credentials before the namespaces are created,
+    and refused at run time if the validated executable was replaced.
+  - `createContainer` and `startContainer` hooks resolve inside the
+    container. Their owner check now also trusts owners outside the
+    container's user namespace, which nothing inside it can act as; the
+    group/world-writable and setuid checks still apply. An owner is only
+    provably outside when the namespace leaves the overflow UID unmapped.
+    Under a mapping that includes it (root remapping and other 65,536-ID
+    maps), a host-owned hook is indistinguishable from one owned by a user
+    inside the namespace and is still refused.
 
 ## [0.5.2] - 2026-11-19
 
