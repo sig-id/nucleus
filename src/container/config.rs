@@ -784,6 +784,11 @@ pub struct ContainerConfig {
     /// network-less container. See [`ContainerConfig::with_broker_socket`].
     pub broker_socket: Option<crate::filesystem::BrokerSocket>,
 
+    /// Loopback address inside the container where the supervisor relays
+    /// TCP connections to `broker_socket`. When set, the socket itself is not
+    /// mounted. See [`ContainerConfig::with_broker_proxy_listen`].
+    pub broker_proxy_listen: Option<std::net::SocketAddr>,
+
     /// Health check configuration for long-running services.
     pub health_check: Option<HealthCheck>,
 
@@ -988,6 +993,7 @@ impl ContainerConfig {
             credential_broker: None,
             credential_broker_token,
             broker_socket: None,
+            broker_proxy_listen: None,
             health_check: None,
             readiness_probe: None,
             secrets: Vec::new(),
@@ -1170,11 +1176,43 @@ impl ContainerConfig {
     #[must_use]
     pub fn with_broker_socket(mut self, socket: crate::filesystem::BrokerSocket) -> Self {
         self.broker_socket = Some(socket);
-        self.upsert_derived_env(
-            BROKER_SOCKET_ENV,
-            crate::filesystem::BROKER_SOCKET_CONTAINER_PATH.to_string(),
-        );
+        if self.broker_proxy_listen.is_none() {
+            self.upsert_derived_env(
+                BROKER_SOCKET_ENV,
+                crate::filesystem::BROKER_SOCKET_CONTAINER_PATH.to_string(),
+            );
+        }
         self
+    }
+
+    /// Relay TCP connections to `addr` (loopback inside the container) to
+    /// the broker socket from the supervisor instead of mounting the socket.
+    /// The workload needs no forwarder of its own and never sees a host
+    /// socket. With `inject_proxy_env`, HTTP(S)_PROXY point at `addr`; values
+    /// the caller set explicitly win.
+    #[must_use]
+    pub fn with_broker_proxy_listen(
+        mut self,
+        addr: std::net::SocketAddr,
+        inject_proxy_env: bool,
+    ) -> Self {
+        self.broker_proxy_listen = Some(addr);
+        self.derived_environment
+            .retain(|(key, _)| key != BROKER_SOCKET_ENV);
+        if inject_proxy_env {
+            let url = format!("http://{addr}");
+            for key in ["HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"] {
+                if !self.environment.iter().any(|(existing, _)| existing == key) {
+                    self.upsert_derived_env(key, url.clone());
+                }
+            }
+        }
+        self
+    }
+
+    /// Whether the broker socket itself is mounted into the container.
+    pub(crate) fn mounts_broker_socket(&self) -> bool {
+        self.broker_socket.is_some() && self.broker_proxy_listen.is_none()
     }
 
     /// Whether the workload may create IP sockets at all. Without a network
@@ -1184,10 +1222,31 @@ impl ContainerConfig {
     }
 
     fn validate_broker_socket(&self) -> crate::error::Result<()> {
+        if let Some(addr) = self.broker_proxy_listen {
+            if self.broker_socket.is_none() {
+                return Err(crate::error::NucleusError::ConfigError(
+                    "--broker-proxy-listen requires --broker-socket".into(),
+                ));
+            }
+            if !addr.ip().is_loopback() || addr.port() == 0 {
+                return Err(crate::error::NucleusError::ConfigError(format!(
+                    "--broker-proxy-listen must be a loopback address with a port, got {addr}"
+                )));
+            }
+        }
         if self.broker_socket.is_none() {
             return Ok(());
         }
-        let conflict = if !matches!(self.network, crate::network::NetworkMode::None) {
+        let conflict = if self.use_gvisor {
+            // runsc can only reach a mounted host socket with --host-uds=open,
+            // which opens every host socket visible in the sandbox, not just
+            // the broker. Refuse rather than weaken the single-socket boundary.
+            Some(
+                "--broker-socket is not supported with the gVisor runtime: it cannot confine \
+                 connections to the broker socket. Use --runtime native (untrusted workloads \
+                 also need --trust-level trusted)",
+            )
+        } else if !matches!(self.network, crate::network::NetworkMode::None) {
             Some("--broker-socket requires --network none: the broker is the only egress path")
         } else if !self.namespaces.net {
             Some("--broker-socket requires a private network namespace")
@@ -2017,7 +2076,9 @@ mod tests {
     #[test]
     fn broker_socket_mode_opens_ip_sockets_without_a_network() {
         let (_dir, socket) = broker_socket_fixture();
-        let plain = ContainerConfig::try_new(None, vec!["/bin/true".to_string()]).unwrap();
+        let plain = ContainerConfig::try_new(None, vec!["/bin/true".to_string()])
+            .unwrap()
+            .with_gvisor(false);
         assert!(!plain.allows_ip_sockets());
 
         let brokered = plain.with_broker_socket(socket);
@@ -2036,6 +2097,7 @@ mod tests {
         let base = || {
             ContainerConfig::try_new(None, vec!["/bin/true".to_string()])
                 .unwrap()
+                .with_gvisor(false)
                 .with_broker_socket(socket.clone())
         };
 
@@ -2056,6 +2118,76 @@ mod tests {
         });
         let err = shadowed.validate_broker_socket().unwrap_err();
         assert!(err.to_string().contains("reserved"), "{err}");
+    }
+
+    #[test]
+    fn broker_socket_is_refused_under_gvisor() {
+        let (_dir, socket) = broker_socket_fixture();
+        let mut cfg = ContainerConfig::try_new(None, vec!["/bin/true".to_string()])
+            .unwrap()
+            .with_gvisor(false)
+            .with_broker_socket(socket);
+        cfg.use_gvisor = true;
+        let err = cfg.validate_broker_socket().unwrap_err();
+        assert!(err.to_string().contains("gVisor"), "{err}");
+    }
+
+    #[test]
+    fn broker_proxy_listen_replaces_the_socket_mount_with_proxy_env() {
+        let (_dir, socket) = broker_socket_fixture();
+        let addr: std::net::SocketAddr = "127.0.0.1:3128".parse().unwrap();
+        let cfg = ContainerConfig::try_new(None, vec!["/bin/true".to_string()])
+            .unwrap()
+            .with_gvisor(false)
+            .with_env("HTTP_PROXY".to_string(), "http://user-choice".to_string())
+            .with_broker_socket(socket)
+            .with_broker_proxy_listen(addr, true);
+        cfg.validate_broker_socket().unwrap();
+        assert!(!cfg.mounts_broker_socket());
+        assert!(cfg.allows_ip_sockets());
+        let derived = |key: &str| {
+            cfg.derived_environment
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(derived(BROKER_SOCKET_ENV), None);
+        assert_eq!(derived("HTTPS_PROXY"), Some("http://127.0.0.1:3128"));
+        assert_eq!(derived("HTTP_PROXY"), None, "explicit user env wins");
+
+        let (_dir, socket) = broker_socket_fixture();
+        let quiet = ContainerConfig::try_new(None, vec!["/bin/true".to_string()])
+            .unwrap()
+            .with_gvisor(false)
+            .with_broker_socket(socket)
+            .with_broker_proxy_listen(addr, false);
+        assert!(!quiet
+            .derived_environment
+            .iter()
+            .any(|(k, _)| k.ends_with("_PROXY") || k.ends_with("_proxy")));
+    }
+
+    #[test]
+    fn broker_proxy_listen_requires_a_loopback_port_and_a_socket() {
+        let (_dir, socket) = broker_socket_fixture();
+        let with = |addr: &str| {
+            ContainerConfig::try_new(None, vec!["/bin/true".to_string()])
+                .unwrap()
+                .with_gvisor(false)
+                .with_broker_socket(socket.clone())
+                .with_broker_proxy_listen(addr.parse().unwrap(), true)
+                .validate_broker_socket()
+        };
+        assert!(with("127.0.0.1:8080").is_ok());
+        assert!(with("[::1]:8080").is_ok());
+        assert!(with("0.0.0.0:8080").is_err());
+        assert!(with("10.0.0.1:8080").is_err());
+        assert!(with("127.0.0.1:0").is_err());
+        let orphan = ContainerConfig::try_new(None, vec!["/bin/true".to_string()])
+            .unwrap()
+            .with_gvisor(false)
+            .with_broker_proxy_listen("127.0.0.1:8080".parse().unwrap(), true);
+        assert!(orphan.validate_broker_socket().is_err());
     }
 
     #[test]

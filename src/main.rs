@@ -684,6 +684,7 @@ const RUN_CONFIG_PATH_CONFLICTS: &[&str] = &[
     "credential_broker",
     "credential_broker_no_proxy_env",
     "broker_socket",
+    "broker_proxy_listen",
     "dns",
     "nat_backend",
     "bridge_name",
@@ -783,6 +784,7 @@ const RUN_CONFIG_FD_CONFLICTS: &[&str] = &[
     "credential_broker",
     "credential_broker_no_proxy_env",
     "broker_socket",
+    "broker_proxy_listen",
     "dns",
     "nat_backend",
     "bridge_name",
@@ -1063,17 +1065,26 @@ enum Commands {
         #[arg(long = "credential-broker", value_name = "IP:PORT")]
         credential_broker: Option<String>,
 
-        /// Do not inject HTTP_PROXY/HTTPS_PROXY variables for --credential-broker.
+        /// Do not inject HTTP_PROXY/HTTPS_PROXY variables for
+        /// --credential-broker or --broker-proxy-listen.
         #[arg(long = "credential-broker-no-proxy-env", alias = "no-broker-proxy-env")]
         credential_broker_no_proxy_env: bool,
 
-        /// Host unix socket of an egress broker, exposed to the workload at
-        /// /run/nucleus/broker.sock (NUCLEUS_BROKER_SOCKET). The container
-        /// keeps a private network namespace with only loopback, so an
-        /// in-container proxy forwarder can listen on 127.0.0.1 and relay
-        /// through the socket. Requires --network none.
+        /// Host unix socket of an egress broker, the workload's only way out.
+        /// The container keeps a private network namespace with only
+        /// loopback. With --broker-proxy-listen the supervisor relays to the
+        /// socket; otherwise it is mounted at /run/nucleus/broker.sock
+        /// (NUCLEUS_BROKER_SOCKET) for an in-container forwarder. Requires
+        /// --network none and the native runtime.
         #[arg(long = "broker-socket", value_name = "PATH")]
         broker_socket: Option<String>,
+
+        /// Relay TCP connections to this loopback address inside the
+        /// container (e.g. 127.0.0.1:3128) to --broker-socket from the
+        /// supervisor, instead of mounting the socket. The workload needs no
+        /// forwarder; HTTP(S)_PROXY point here unless --no-broker-proxy-env.
+        #[arg(long = "broker-proxy-listen", value_name = "ADDR:PORT")]
+        broker_proxy_listen: Option<String>,
 
         /// DNS servers (repeatable). Required for bridge mode in production.
         #[arg(long)]
@@ -1561,6 +1572,7 @@ struct RunConfig {
     credential_broker: Option<String>,
     credential_broker_no_proxy_env: bool,
     broker_socket: Option<String>,
+    broker_proxy_listen: Option<String>,
     dns: Vec<String>,
     nat_backend: NatBackend,
     bridge_name: String,
@@ -1667,6 +1679,7 @@ impl Default for RunConfig {
             credential_broker: None,
             credential_broker_no_proxy_env: false,
             broker_socket: None,
+            broker_proxy_listen: None,
             dns: Vec::new(),
             nat_backend: NatBackend::Auto,
             bridge_name: "nucleus0".into(),
@@ -2272,6 +2285,7 @@ fn try_main() -> Result<i32> {
             credential_broker,
             credential_broker_no_proxy_env,
             broker_socket,
+            broker_proxy_listen,
             dns,
             nat_backend,
             bridge_name,
@@ -2391,6 +2405,7 @@ fn try_main() -> Result<i32> {
                     credential_broker,
                     credential_broker_no_proxy_env,
                     broker_socket,
+                    broker_proxy_listen,
                     dns,
                     nat_backend,
                     bridge_name,
@@ -2600,6 +2615,7 @@ fn try_main() -> Result<i32> {
                 credential_broker,
                 credential_broker_no_proxy_env,
                 broker_socket,
+                broker_proxy_listen,
                 dns,
                 nat_backend,
                 bridge_name,
@@ -2982,9 +2998,11 @@ fn try_main() -> Result<i32> {
                 config = config
                     .with_credential_broker(broker)
                     .with_egress_policy(policy);
-            } else if credential_broker_no_proxy_env {
+            } else if credential_broker_no_proxy_env && broker_proxy_listen.is_none() {
                 return Err(NucleusError::ConfigError(
-                    "--credential-broker-no-proxy-env requires --credential-broker".to_string(),
+                    "--credential-broker-no-proxy-env requires --credential-broker or \
+                     --broker-proxy-listen"
+                        .to_string(),
                 ));
             } else if !egress_allow.is_empty()
                 || !egress_domains.is_empty()
@@ -3200,6 +3218,15 @@ fn try_main() -> Result<i32> {
                     }
                 }
                 config = config.with_credential_broker_identity_env();
+            }
+            if let Some(addr) = &broker_proxy_listen {
+                // After user env, so explicit proxy variables win.
+                let addr = addr.parse().map_err(|e| {
+                    NucleusError::ConfigError(format!(
+                        "Invalid --broker-proxy-listen address '{addr}': {e}"
+                    ))
+                })?;
+                config = config.with_broker_proxy_listen(addr, !credential_broker_no_proxy_env);
             }
 
             // OCI lifecycle hooks
@@ -3545,6 +3572,7 @@ mod tests {
             credential_broker: Some("10.0.42.1:8080".to_string()),
             credential_broker_no_proxy_env: true,
             broker_socket: None,
+            broker_proxy_listen: None,
             dns: vec!["8.8.8.8".to_string()],
             nat_backend: NatBackend::Kernel,
             bridge_name: "nucleus0".into(),
@@ -3669,6 +3697,7 @@ mod tests {
             credential_broker: None,
             credential_broker_no_proxy_env: false,
             broker_socket: None,
+            broker_proxy_listen: None,
             dns: Vec::new(),
             nat_backend: NatBackend::Auto,
             bridge_name: "nucleus0".into(),
@@ -3937,23 +3966,34 @@ service_mode = "strict-agent"
             "create",
             "--broker-socket",
             "/run/relay.sock",
+            "--broker-proxy-listen",
+            "127.0.0.1:3128",
             "--",
             "true",
         ])
         .unwrap();
         match cli.command {
-            Commands::Create { broker_socket, .. } => {
-                assert_eq!(broker_socket.as_deref(), Some("/run/relay.sock"))
+            Commands::Create {
+                broker_socket,
+                broker_proxy_listen,
+                ..
+            } => {
+                assert_eq!(broker_socket.as_deref(), Some("/run/relay.sock"));
+                assert_eq!(broker_proxy_listen.as_deref(), Some("127.0.0.1:3128"));
             }
             _ => panic!("expected create"),
         }
         let config = parse_run_config(
-            "broker_socket = \"/run/relay.sock\"\ncommand = [\"true\"]\n",
+            "broker_socket = \"/run/relay.sock\"\nbroker_proxy_listen = \"127.0.0.1:3128\"\ncommand = [\"true\"]\n",
             "test",
             Some(RunConfigFormat::Toml),
         )
         .unwrap();
         assert_eq!(config.broker_socket.as_deref(), Some("/run/relay.sock"));
+        assert_eq!(
+            config.broker_proxy_listen.as_deref(),
+            Some("127.0.0.1:3128")
+        );
     }
 
     #[test]

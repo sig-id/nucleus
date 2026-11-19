@@ -285,7 +285,6 @@ impl Container {
             && config.workspace.mode != super::WorkspaceMode::CopyInOut)
             || !config.provider_configs.is_empty()
             || !config.secrets.is_empty()
-            || config.broker_socket.is_some()
             || config
                 .volumes
                 .iter()
@@ -1068,6 +1067,11 @@ impl Container {
         let landlock_channel = (!config.use_gvisor)
             .then(std::os::unix::net::UnixStream::pair)
             .transpose()?;
+        // The child hands the broker proxy listener to this process.
+        let broker_channel = config
+            .broker_proxy_listen
+            .map(|_| std::os::unix::net::UnixStream::pair())
+            .transpose()?;
         Self::assert_single_threaded_for_fork("container create fork")?;
         // The container must not outlive this process, however it ends.
         let lifeline = Lifeline::new()?;
@@ -1166,6 +1170,14 @@ impl Container {
 
                     let target_pid = Self::wait_for_namespace_ready(&ready_read, child)?;
                     target_pid_for_cleanup = Some(target_pid);
+
+                    if let (Some((parent_end, child_end)), Some(broker)) =
+                        (broker_channel, config.broker_socket.as_ref())
+                    {
+                        drop(child_end);
+                        let listener = crate::network::broker_forwarder::receive(&parent_end)?;
+                        crate::network::broker_forwarder::spawn(listener, broker)?;
+                    }
 
                     if !config.use_gvisor {
                         if let Some(ref socket_path) = config.console_socket {
@@ -1369,6 +1381,7 @@ impl Container {
                     native_seccomp.as_ref(),
                     native_landlock.as_ref(),
                     landlock_channel.map(|(_, child_end)| child_end),
+                    broker_channel.map(|(_, child_end)| child_end),
                     outcome_pipe.map(|(_, writer)| writer),
                     Some(ready_write),
                     userns_request_write,
@@ -1429,6 +1442,7 @@ impl Container {
         native_seccomp: Option<&NativeSeccomp>,
         native_landlock: Option<&NativeLandlock>,
         landlock_channel: Option<std::os::unix::net::UnixStream>,
+        broker_channel: Option<std::os::unix::net::UnixStream>,
         outcome_writer: Option<OwnedFd>,
         ready_pipe: Option<OwnedFd>,
         userns_request_pipe: Option<OwnedFd>,
@@ -1591,7 +1605,13 @@ impl Container {
             // network namespace leaves down. Raise it while this process
             // still holds CAP_NET_ADMIN over the namespace it just created.
             crate::network::netlink::set_link_up("lo")?;
+            if let (Some(addr), Some(channel)) =
+                (self.config.broker_proxy_listen, broker_channel.as_ref())
+            {
+                crate::network::broker_forwarder::bind_and_send(addr, channel)?;
+            }
         }
+        drop(broker_channel);
         if self.config.user_ns_config.is_some() {
             let request_fd = userns_request_pipe.as_ref().ok_or_else(|| {
                 NucleusError::ExecError(
@@ -1867,8 +1887,14 @@ impl Container {
         // 7d. Mount persistent or ephemeral volumes over the base filesystem.
         mount_volumes(&container_root, &self.config.volumes)?;
 
-        // 7d'. Broker-socket mode: expose the one host socket.
-        if let Some(broker) = &self.config.broker_socket {
+        // 7d'. Broker-socket mode: expose the one host socket, unless the
+        // supervisor relays to it from a loopback listener instead.
+        if let Some(broker) = self
+            .config
+            .broker_socket
+            .as_ref()
+            .filter(|_| self.config.mounts_broker_socket())
+        {
             broker.mount(&container_root)?;
         }
 

@@ -1231,19 +1231,6 @@ impl OciConfig {
         Ok(self)
     }
 
-    /// Expose the egress broker's host socket at its fixed container path.
-    pub fn with_broker_socket_mount(mut self, socket: &crate::filesystem::BrokerSocket) -> Self {
-        self.mounts.push(OciMount {
-            destination: crate::filesystem::BROKER_SOCKET_CONTAINER_PATH.to_string(),
-            source: socket.host_path().to_string_lossy().to_string(),
-            mount_type: "bind".to_string(),
-            options: ["bind", "ro", "nosuid", "nodev", "noexec"]
-                .map(String::from)
-                .to_vec(),
-        });
-        self
-    }
-
     /// Add bind or tmpfs volume mounts.
     pub fn with_volume_mounts(mut self, volumes: &[crate::container::VolumeMount]) -> Result<Self> {
         use crate::container::VolumeSource;

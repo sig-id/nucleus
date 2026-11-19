@@ -52,6 +52,16 @@ impl Container {
                 }
 
                 if !config.use_gvisor {
+                    if config.broker_socket.is_some() {
+                        // gVisor cannot confine connections to the broker
+                        // socket, and running natively is a trust decision.
+                        return Err(NucleusError::ConfigError(
+                            "--broker-socket is not supported with the gVisor runtime that \
+                             untrusted workloads require. Pass --trust-level trusted with \
+                             --runtime native to use the broker."
+                                .to_string(),
+                        ));
+                    }
                     if GVisorRuntime::is_available() {
                         info!(
                             "Untrusted workload: auto-enabling gVisor runtime \

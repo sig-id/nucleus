@@ -106,12 +106,6 @@ pub struct GVisorOciRunOptions {
     pub platform: GVisorPlatform,
     /// Optional OCI console socket that receives the terminal PTY master.
     pub console_socket: Option<PathBuf>,
-    /// Broker-socket mode: let the sandbox connect to host unix sockets that
-    /// are bind-mounted into it (`--host-uds=open`); the gofer refuses them
-    /// by default. runsc has no per-socket switch and its host processes
-    /// cannot run under Landlock (they mount), so this covers every socket
-    /// inside the container's mounts, not only the broker's.
-    pub host_uds_open: bool,
 }
 
 impl Default for GVisorOciRunOptions {
@@ -124,7 +118,6 @@ impl Default for GVisorOciRunOptions {
             require_supervisor_exec_policy: false,
             platform: GVisorPlatform::default(),
             console_socket: None,
-            host_uds_open: false,
         }
     }
 }
@@ -499,7 +492,6 @@ impl GVisorRuntime {
                 require_supervisor_exec_policy,
                 platform,
                 console_socket: None,
-                host_uds_open: false,
             },
         )
     }
@@ -1088,10 +1080,6 @@ impl GVisorRuntime {
             ]);
         }
 
-        if options.host_uds_open {
-            args.push("--host-uds=open".to_string());
-        }
-
         args.extend([
             "--network".to_string(),
             options.network_flag().to_string(),
@@ -1358,7 +1346,6 @@ mod tests {
                 require_supervisor_exec_policy: false,
                 platform: GVisorPlatform::Systrap,
                 console_socket: None,
-                host_uds_open: false,
             },
             None,
         );
@@ -1412,7 +1399,6 @@ mod tests {
                 require_supervisor_exec_policy: false,
                 platform: GVisorPlatform::Systrap,
                 console_socket: None,
-                host_uds_open: false,
             },
             None,
         );
@@ -1422,36 +1408,23 @@ mod tests {
     }
 
     #[test]
-    fn host_unix_sockets_are_opened_only_for_broker_socket_mode() {
+    fn host_unix_sockets_are_never_opened() {
+        // Broker-socket mode is refused under gVisor: --host-uds=open would
+        // expose every host socket in the sandbox's mounts.
         let rt = GVisorRuntime::with_path("/nix/store/fake-runsc/bin/runsc".to_string());
         let tmp = tempfile::tempdir().unwrap();
         let bundle = OciBundle::new(
             tmp.path().join("bundle"),
             OciConfig::new(vec!["/bin/true".to_string()], None),
         );
-        let args = |host_uds_open| {
-            rt.build_oci_run_args(
-                "container-id",
-                &bundle,
-                tmp.path(),
-                &GVisorOciRunOptions {
-                    host_uds_open,
-                    ..GVisorOciRunOptions::default()
-                },
-                None,
-            )
-        };
-
-        assert!(!args(false).iter().any(|arg| arg.starts_with("--host-uds")));
-        let brokered = args(true);
-        let flag = brokered
-            .iter()
-            .position(|arg| arg == "--host-uds=open")
-            .unwrap();
-        let run = brokered.iter().position(|arg| arg == "run").unwrap();
-        assert!(flag < run, "--host-uds is a global runsc flag");
-        // The sandbox still has no network device of its own.
-        assert!(brokered.windows(2).any(|w| w == ["--network", "none"]));
+        let args = rt.build_oci_run_args(
+            "container-id",
+            &bundle,
+            tmp.path(),
+            &GVisorOciRunOptions::default(),
+            None,
+        );
+        assert!(!args.iter().any(|arg| arg.starts_with("--host-uds")));
     }
 
     #[test]
@@ -1476,7 +1449,6 @@ mod tests {
                 require_supervisor_exec_policy: false,
                 platform: GVisorPlatform::Systrap,
                 console_socket: Some(console_socket.clone()),
-                host_uds_open: false,
             },
             None,
         );
@@ -1515,7 +1487,6 @@ mod tests {
                 require_supervisor_exec_policy: false,
                 platform: GVisorPlatform::Ptrace,
                 console_socket: None,
-                host_uds_open: false,
             },
             Some(&debug_dir),
         );

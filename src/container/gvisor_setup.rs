@@ -278,17 +278,6 @@ impl Container {
             )?;
         }
 
-        if let Some(broker) = &self.config.broker_socket {
-            let offset = oci_config.mounts.len();
-            oci_config = oci_config.with_broker_socket_mount(broker);
-            stage_bind_sources(
-                &artifact_dir,
-                offset,
-                &mut oci_config.mounts[offset..],
-                |_| broker.pin(),
-            )?;
-        }
-
         if let Some(context_dir) = &self.config.context_dir {
             if matches!(
                 self.config.context_mode,
@@ -439,7 +428,6 @@ impl Container {
                 require_supervisor_exec_policy,
                 platform,
                 console_socket: self.config.console_socket.clone(),
-                host_uds_open: self.config.broker_socket.is_some(),
             },
         )?;
 
