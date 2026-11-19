@@ -402,6 +402,15 @@ mod tests {
     /// SAFETY: `pre_exec` runs between fork and exec and only calls the
     /// async-signal-safe `fcntl(F_DUPFD)`, `dup2` and `close`.
     fn spawn_gated(workload: &str, state_root: &std::path::Path) -> GatedLaunch {
+        spawn_gated_with(&[], workload, state_root)
+    }
+
+    /// `spawn_gated` with extra launch flags inserted before the workload.
+    fn spawn_gated_with(
+        extra_flags: &[String],
+        workload: &str,
+        state_root: &std::path::Path,
+    ) -> GatedLaunch {
         use std::os::fd::AsRawFd;
         use std::os::unix::process::CommandExt;
         use std::process::Stdio;
@@ -428,11 +437,9 @@ mod tests {
                 "--rootless",
                 "--pids",
                 "0",
-                "--",
-                "/bin/sh",
-                "-c",
-                workload,
             ])
+            .args(extra_flags)
+            .args(["--", "/bin/sh", "-c", workload])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -575,6 +582,45 @@ mod tests {
             .lines()
             .filter_map(|line| serde_json::from_str(line).ok())
             .collect()
+    }
+
+    #[test]
+    fn jit_allowance_is_reported_in_container_started() {
+        use std::io::Write;
+        // #46: `--allow-jit` is a per-launch opt-out of the native W^X
+        // filter. An orchestrator attests the posture from container_started,
+        // so the event must carry the allowance (and it must stay off by
+        // default).
+        let state = tempfile::tempdir().unwrap();
+        let mut launch = spawn_gated_with(&["--allow-jit".to_string()], "exit 0", state.path());
+        wait_for_event(&mut launch, "container_started");
+        let started = event_records(&launch.events_path)
+            .into_iter()
+            .find(|event| event["type"] == "container_started")
+            .expect("container_started event");
+        assert_eq!(started["security"]["allow_jit"], true);
+        assert_eq!(started["security"]["seccomp_status"], "installed");
+
+        launch
+            .gate_writer
+            .take()
+            .expect("gate writer held")
+            .write_all(b"go")
+            .unwrap();
+        let output = launch.child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(0));
+
+        // Without the flag the same launch reports strict W^X.
+        let state = tempfile::tempdir().unwrap();
+        let mut launch = spawn_gated("exit 0", state.path());
+        wait_for_event(&mut launch, "container_started");
+        let started = event_records(&launch.events_path)
+            .into_iter()
+            .find(|event| event["type"] == "container_started")
+            .expect("container_started event");
+        assert_eq!(started["security"]["allow_jit"], false);
+        drop(launch.gate_writer.take());
+        let _ = launch.child.wait();
     }
 
     #[test]

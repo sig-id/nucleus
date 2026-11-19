@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `--allow-jit` (launch config `allow_jit`): a per-launch JIT allowance
+  for the native seccomp filter. JIT runtimes (V8/Node, JVM, PyPy, LuaJIT, .NET)
+  manage code ranges that are writable and executable at once; V8 has no
+  fallback for a denied RWX range, so the default W^X policy killed every
+  Node workload with `SIGSYS` before user code ran (#46). The allowance
+  permits write+execute mappings through `mmap`, `mprotect`, and
+  `pkey_mprotect` (no separate `--seccomp-allow pkey_mprotect` needed), keeps
+  every other memory guard enforced (executable `shmat` attachments,
+  `memfd_create`, device nodes), works with built-in and custom profiles, is
+  rejected under gVisor, and is recorded in the audit log and reported as
+  `security.allow_jit` in `container_started`/`container_summary` so callers
+  can attest the posture. W^X stays the default.
+
 ### Fixed
 - The strict-agent native seccomp profile no longer kills the workload with
   `SIGSYS` when it probes an opt-in syscall that was not requested with
