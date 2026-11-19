@@ -271,6 +271,8 @@
           "oci::tests::hook_receives_state_with_unprivileged_credentials"
           "oci::tests::test_oci_hook_nonzero_exit_is_error"
           "oci::tests::test_oci_hooks_best_effort_continues_on_failure"
+          "oci::tests::prepared_hook_rejects_replaced_executable"
+          "oci::tests::prepared_runtime_hook_runs_after_entering_user_namespace"
         ];
         sandboxNextestFilter =
           "-E 'not (" + lib.concatMapStringsSep " | " (test: "test(=${test})") sandboxIncompatibleTests + ")'";

@@ -7,6 +7,16 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Component, Path, PathBuf};
 
 pub(crate) fn trusted_directory(path: &Path, create: bool) -> Result<PathBuf> {
+    trusted_directory_with(path, create, false)
+}
+
+/// For paths resolved inside a container's user namespace: owners outside the
+/// namespace cannot be impersonated by anything in it, so they are trusted too.
+pub(crate) fn trusted_container_directory(path: &Path) -> Result<PathBuf> {
+    trusted_directory_with(path, false, true)
+}
+
+fn trusted_directory_with(path: &Path, create: bool, allow_unmapped: bool) -> Result<PathBuf> {
     let path = std::env::current_dir()?.join(path);
     let mut current = PathBuf::from("/");
     let uid = Uid::effective().as_raw();
@@ -31,14 +41,15 @@ pub(crate) fn trusted_directory(path: &Path, create: bool) -> Result<PathBuf> {
             }
             result => result?,
         };
-        if meta.is_dir() && owner_unmapped(meta.uid()) {
+        let unmapped = owner_unmapped(meta.uid());
+        if meta.is_dir() && unmapped && !allow_unmapped {
             return Err(NucleusError::FilesystemError(format!(
                 "Cannot verify directory {current:?}: its owner is not mapped into this \
                  user namespace; check it before entering the namespace"
             )));
         }
         if !meta.is_dir()
-            || (meta.uid() != 0 && meta.uid() != uid)
+            || (meta.uid() != 0 && meta.uid() != uid && !unmapped)
             || (meta.mode() & 0o022 != 0 && meta.mode() & libc::S_ISVTX == 0)
         {
             return Err(NucleusError::FilesystemError(format!(

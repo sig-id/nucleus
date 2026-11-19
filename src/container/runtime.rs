@@ -1516,6 +1516,13 @@ impl Container {
             None
         };
 
+        // createRuntime hooks resolve in the runtime namespace; verify them under
+        // the host credentials before the user namespace hides host owners.
+        let create_runtime_hooks = match self.config.hooks.as_ref() {
+            Some(hooks) => OciHooks::prepare_hooks(&hooks.create_runtime, "createRuntime")?,
+            None => Vec::new(),
+        };
+
         // 1. Create namespaces in child and optionally configure user mapping.
         let mut namespace_mgr = NamespaceManager::new(self.config.namespaces.clone());
         // unshare translates the current directory into the new mount namespace.
@@ -1845,17 +1852,15 @@ impl Container {
         mount_procfs(&container_root.join("proc"), self.config.proc_readonly)?;
 
         // 9c. Run createRuntime hooks (after namespaces created, before pivot_root)
-        if let Some(ref hooks) = self.config.hooks {
-            if !hooks.create_runtime.is_empty() {
-                let hook_state = OciContainerState {
-                    oci_version: "1.0.2".to_string(),
-                    id: self.config.id.clone(),
-                    status: OciStatus::Creating,
-                    pid: std::process::id(),
-                    bundle: String::new(),
-                };
-                OciHooks::run_hooks(&hooks.create_runtime, &hook_state, "createRuntime")?;
-            }
+        if !create_runtime_hooks.is_empty() {
+            let hook_state = OciContainerState {
+                oci_version: "1.0.2".to_string(),
+                id: self.config.id.clone(),
+                status: OciStatus::Creating,
+                pid: std::process::id(),
+                bundle: String::new(),
+            };
+            OciHooks::run_prepared_hooks(&create_runtime_hooks, &hook_state, "createRuntime")?;
         }
 
         // 10. Switch root filesystem
@@ -1883,7 +1888,11 @@ impl Container {
                     pid: std::process::id(),
                     bundle: String::new(),
                 };
-                OciHooks::run_hooks(&hooks.create_container, &hook_state, "createContainer")?;
+                OciHooks::run_container_hooks(
+                    &hooks.create_container,
+                    &hook_state,
+                    "createContainer",
+                )?;
             }
         }
 
@@ -2154,7 +2163,11 @@ impl Container {
                     pid: std::process::id(),
                     bundle: String::new(),
                 };
-                OciHooks::run_hooks(&hooks.start_container, &hook_state, "startContainer")?;
+                OciHooks::run_container_hooks(
+                    &hooks.start_container,
+                    &hook_state,
+                    "startContainer",
+                )?;
             }
         }
 
@@ -3964,6 +3977,18 @@ mod tests {
             vec![existing.join("a/b"), existing.join("a")],
             "ancestors are reported deepest-first, excluding existing prefixes"
         );
+    }
+
+    #[test]
+    fn test_native_hooks_are_verified_outside_the_container_user_namespace() {
+        let source = include_str!("runtime.rs");
+        let fn_body = extract_fn_body(source, "fn setup_and_exec");
+        let prepare = fn_body.find("OciHooks::prepare_hooks").unwrap();
+        let unshare = fn_body.find("namespace_mgr.unshare_namespaces()").unwrap();
+        assert!(prepare < unshare);
+        assert!(fn_body.contains("run_prepared_hooks(&create_runtime_hooks"));
+        assert!(!fn_body.contains("OciHooks::run_hooks("));
+        assert_eq!(fn_body.matches("OciHooks::run_container_hooks(").count(), 2);
     }
 
     #[test]

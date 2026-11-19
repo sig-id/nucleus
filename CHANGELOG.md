@@ -6,7 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
-- No unreleased changes.
+
+### Fixed
+- OCI hooks run in user-namespaced native containers (rootless, and root-run
+  production containers, which are root-remapped). Their trust checks ran
+  after entering the user namespace, where host-root-owned binaries and
+  directories appear unmapped, so every hook was refused.
+  - `createRuntime` hooks resolve in the runtime namespace: they are now
+    validated under the host credentials before the namespaces are created,
+    and refused at run time if the validated executable was replaced.
+  - `createContainer` and `startContainer` hooks resolve inside the
+    container. Their owner check now also trusts owners outside the
+    container's user namespace, which nothing inside it can act as; the
+    group/world-writable and setuid checks still apply.
 
 ## [0.5.2] - 2026-11-19
 
