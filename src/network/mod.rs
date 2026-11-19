@@ -1,4 +1,5 @@
 mod bridge;
+pub(crate) mod broker_forwarder;
 mod config;
 mod egress;
 mod firewall;

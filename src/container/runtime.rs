@@ -44,7 +44,7 @@ use tempfile::Builder;
 use tracing::{debug, error, info, info_span, warn};
 
 use super::console::{NativeConsoleRelay, NativePty};
-use super::supervisor_link::{die_with_supervisor, Lifeline};
+use super::supervisor_link::{die_with_supervisor, Lifeline, ReapedTree};
 
 /// Container runtime that orchestrates all isolation mechanisms
 ///
@@ -78,6 +78,8 @@ pub struct CreatedContainer {
     outcome_reader: Option<OwnedFd>,
     mapped_gvisor_base: Option<PathBuf>,
     _landlock_handoff: Option<crate::security::landlock_handoff::LandlockHandoff>,
+    /// Relays broker connections; dropping it stops and joins its threads.
+    broker_forwarder: Option<crate::network::broker_forwarder::BrokerForwarder>,
     pub(super) native_console_master: Option<OwnedFd>,
     pub(super) event_sink: Option<EventSink>,
     pub(super) _lifecycle_span: tracing::Span,
@@ -285,7 +287,6 @@ impl Container {
             && config.workspace.mode != super::WorkspaceMode::CopyInOut)
             || !config.provider_configs.is_empty()
             || !config.secrets.is_empty()
-            || config.broker_socket.is_some()
             || config
                 .volumes
                 .iter()
@@ -1068,11 +1069,35 @@ impl Container {
         let landlock_channel = (!config.use_gvisor)
             .then(std::os::unix::net::UnixStream::pair)
             .transpose()?;
+        // The child hands the broker proxy listener to this process.
+        let broker_channel = config
+            .broker_proxy_listen
+            .map(|_| std::os::unix::net::UnixStream::pair())
+            .transpose()?;
         Self::assert_single_threaded_for_fork("container create fork")?;
         // The container must not outlive this process, however it ends.
         let lifeline = Lifeline::new()?;
         if let Some(cgroup) = &cgroup_opt {
-            if let Err(e) = lifeline.spawn_cgroup_reaper(cgroup.path()) {
+            // Under gVisor the reaper also removes the runsc state and bundle
+            // directory, which the orderly teardown would otherwise remove.
+            let gvisor_state = if !config.use_gvisor {
+                None
+            } else if let Some(base) = runtime_base_override
+                .as_deref()
+                .filter(|_| is_root && gvisor_needs_precreated_userns)
+            {
+                Some(base.to_path_buf())
+            } else {
+                GVisorRuntime::prepare_artifact_base()?;
+                Some(GVisorRuntime::artifact_dir(&config.id)?)
+            };
+            let state = gvisor_state.as_deref().and_then(|dir| {
+                Some(ReapedTree {
+                    parent: dir.parent()?,
+                    name: dir.file_name()?,
+                })
+            });
+            if let Err(e) = lifeline.spawn_cgroup_reaper(cgroup.path(), state) {
                 if config.service_mode.requires_cgroup_enforcement() {
                     return Err(e);
                 }
@@ -1147,6 +1172,18 @@ impl Container {
 
                     let target_pid = Self::wait_for_namespace_ready(&ready_read, child)?;
                     target_pid_for_cleanup = Some(target_pid);
+
+                    // Dropped with the container, or here if setup fails.
+                    let broker_forwarder = match (broker_channel, config.broker_socket.as_ref()) {
+                        (Some((parent_end, child_end)), Some(broker)) => {
+                            drop(child_end);
+                            let listener = crate::network::broker_forwarder::receive(&parent_end)?;
+                            Some(crate::network::broker_forwarder::BrokerForwarder::spawn(
+                                listener, broker,
+                            )?)
+                        }
+                        _ => None,
+                    };
 
                     if !config.use_gvisor {
                         if let Some(ref socket_path) = config.console_socket {
@@ -1293,6 +1330,7 @@ impl Container {
                     Ok(CreatedContainer {
                         outcome_reader: outcome_pipe.map(|(reader, _)| reader),
                         _landlock_handoff: landlock_handoff,
+                        broker_forwarder,
                         mapped_gvisor_base,
                         config,
                         state_mgr,
@@ -1350,6 +1388,7 @@ impl Container {
                     native_seccomp.as_ref(),
                     native_landlock.as_ref(),
                     landlock_channel.map(|(_, child_end)| child_end),
+                    broker_channel.map(|(_, child_end)| child_end),
                     outcome_pipe.map(|(_, writer)| writer),
                     Some(ready_write),
                     userns_request_write,
@@ -1410,6 +1449,7 @@ impl Container {
         native_seccomp: Option<&NativeSeccomp>,
         native_landlock: Option<&NativeLandlock>,
         landlock_channel: Option<std::os::unix::net::UnixStream>,
+        broker_channel: Option<std::os::unix::net::UnixStream>,
         outcome_writer: Option<OwnedFd>,
         ready_pipe: Option<OwnedFd>,
         userns_request_pipe: Option<OwnedFd>,
@@ -1572,7 +1612,13 @@ impl Container {
             // network namespace leaves down. Raise it while this process
             // still holds CAP_NET_ADMIN over the namespace it just created.
             crate::network::netlink::set_link_up("lo")?;
+            if let (Some(addr), Some(channel)) =
+                (self.config.broker_proxy_listen, broker_channel.as_ref())
+            {
+                crate::network::broker_forwarder::bind_and_send(addr, channel)?;
+            }
         }
+        drop(broker_channel);
         if self.config.user_ns_config.is_some() {
             let request_fd = userns_request_pipe.as_ref().ok_or_else(|| {
                 NucleusError::ExecError(
@@ -1848,8 +1894,14 @@ impl Container {
         // 7d. Mount persistent or ephemeral volumes over the base filesystem.
         mount_volumes(&container_root, &self.config.volumes)?;
 
-        // 7d'. Broker-socket mode: expose the one host socket.
-        if let Some(broker) = &self.config.broker_socket {
+        // 7d'. Broker-socket mode: expose the one host socket, unless the
+        // supervisor relays to it from a loopback listener instead.
+        if let Some(broker) = self
+            .config
+            .broker_socket
+            .as_ref()
+            .filter(|_| self.config.mounts_broker_socket())
+        {
             broker.mount(&container_root)?;
         }
 
@@ -2764,6 +2816,8 @@ impl CreatedContainer {
         }
         health_guard.stop();
         sig_guard.stop();
+        // The workload is gone: stop relaying and release the namespace.
+        drop(self.broker_forwarder.take());
 
         // Run poststop hooks (best-effort)
         if let Some(ref hooks) = config.hooks {

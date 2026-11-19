@@ -182,7 +182,8 @@ The Cargo package name is `nucleus-container`; it installs the `nucleus` binary.
 # Run agent in isolated container with pre-populated context
 nucleus run --context ./agent-context/ -- /usr/bin/agent
 
-# Specify resource limits
+# Specify resource limits. A workload that exceeds --memory is OOM-killed
+# (swap is off). --memory-high SIZE adds a throttling watermark below it.
 nucleus run --memory 512M --cpus 2 --context ./ctx/ -- ./agent
 
 # Name your container
@@ -319,24 +320,37 @@ parents themselves, system trees such as `/etc` and `/proc`, and Nucleus' own
 state stay refused.
 
 **Brokered egress without a network.** `--broker-socket PATH` gives a workload
-one way out: a host unix socket, mounted read-only at `/run/nucleus/broker.sock`
-and named in `NUCLEUS_BROKER_SOCKET`. It requires `--network none` and works
-rootless. The container keeps its private network namespace with loopback as
-the only interface, and IP sockets are allowed so that a forwarder inside the
-container can listen on `127.0.0.1` for `HTTPS_PROXY` clients and relay through
-the socket. The host-side broker owns policy, credentials and auditing.
+one way out: a host unix socket behind which a host-side broker owns policy,
+credentials and auditing. It requires `--network none`, works rootless, and
+is native-runtime only (see below). The container keeps its private network
+namespace with loopback as the only interface, and IP sockets are allowed.
+
+With `--broker-proxy-listen 127.0.0.1:PORT` Nucleus runs the forwarder
+itself: the workload connects to that loopback address with TCP, and the
+supervisor relays each connection to the broker socket. The socket is not
+mounted into the container, the workload needs no forwarder binary, and
+`HTTPS_PROXY`/`HTTP_PROXY` (and lower-case forms) point at the listener
+unless you set them yourself or pass `--no-broker-proxy-env`. The
+`container_started` event reports the address as
+`container.broker_proxy_listen`.
 
 ```bash
-nucleus run --broker-socket /run/mitos/relay.sock \
-  --env HTTPS_PROXY=http://127.0.0.1:3128 -- ./agent
+nucleus run --runtime native --trust-level trusted \
+  --broker-socket /run/mitos/relay.sock \
+  --broker-proxy-listen 127.0.0.1:3128 -- ./agent
 ```
 
-The socket must be owned by the calling user. Under the native runtime,
-Landlock (kernel ABI 9 or later) confines pathname socket connections to the
-broker socket; on older kernels the mount namespace is the limit. Under gVisor
-the socket is passed with `--host-uds=open`, which has no per-socket form: the
-sandbox can connect to any host socket inside the paths you mount, so do not
-mount directories that contain other sockets.
+Without `--broker-proxy-listen`, the socket is mounted read-only at
+`/run/nucleus/broker.sock` (named in `NUCLEUS_BROKER_SOCKET`) and the workload
+runs its own forwarder on loopback.
+
+The socket must be owned by the calling user. In both forms Landlock (kernel
+ABI 9 or later) refuses connections to every other pathname unix socket, such
+as one inside a mounted volume; on older kernels only the mount namespace
+limits them. gVisor is refused: runsc can only reach a mounted host socket
+with `--host-uds=open`, which opens every host socket visible in the sandbox,
+not just the broker. Untrusted workloads, which require gVisor, therefore need
+`--trust-level trusted --runtime native` to use the broker.
 
 **Resource limits without root.** Container cgroups are created in the subtree
 delegated to the caller when there is one, so strict modes work for an

@@ -44,6 +44,11 @@ pub struct LandlockTcp {
     /// read from a policy file.
     #[serde(skip)]
     broker_socket: Option<PathBuf>,
+    /// Confine connections to pathname unix sockets: none are allowed but
+    /// `broker_socket`. Set in broker-socket mode, also when the supervisor
+    /// relays to the broker and no socket is mounted.
+    #[serde(skip)]
+    scope_unix_sockets: bool,
 }
 
 /// First ABI that can mediate connections to pathname unix sockets.
@@ -51,20 +56,22 @@ const RESOLVE_UNIX_ABI: u8 = 9;
 
 impl LandlockTcp {
     fn for_launch(&self, config: &crate::container::ContainerConfig) -> Self {
+        let brokered = config.broker_socket.is_some();
         let broker_socket = config
-            .broker_socket
-            .as_ref()
-            .map(|_| PathBuf::from(crate::filesystem::BROKER_SOCKET_CONTAINER_PATH));
-        match (&config.network, broker_socket) {
-            (NetworkMode::None, None) => Self {
+            .mounts_broker_socket()
+            .then(|| PathBuf::from(crate::filesystem::BROKER_SOCKET_CONTAINER_PATH));
+        match (&config.network, brokered) {
+            (NetworkMode::None, false) => Self {
                 bind: Some(vec![]),
                 connect: Some(vec![]),
                 broker_socket: None,
+                scope_unix_sockets: false,
             },
             // In broker-socket mode the namespace has no interface but
             // loopback, so TCP needs no port list to stay inside the sandbox.
-            (_, broker_socket) => Self {
+            (_, brokered) => Self {
                 broker_socket,
+                scope_unix_sockets: brokered,
                 ..self.clone()
             },
         }
@@ -75,13 +82,11 @@ impl LandlockTcp {
         // Scope pathname sockets to the broker where the kernel can. Older
         // kernels still confine the workload to sockets that are mounted
         // into its root, which the broker socket is and host services are not.
-        let scoped_socket = self
-            .broker_socket
-            .as_deref()
-            .filter(|_| require_abi(RESOLVE_UNIX_ABI).is_ok());
-        if scoped_socket.is_some() {
+        let scoped = self.scope_unix_sockets && require_abi(RESOLVE_UNIX_ABI).is_ok();
+        let scoped_socket = self.broker_socket.as_deref().filter(|_| scoped);
+        if scoped {
             handled_fs |= AccessFs::ResolveUnix;
-        } else if self.broker_socket.is_some() {
+        } else if self.scope_unix_sockets {
             warn!(
                 "Kernel Landlock ABI is below {RESOLVE_UNIX_ABI}: unix socket connections are \
                  limited by the mount namespace only"
@@ -473,8 +478,17 @@ mod tests {
             launch.broker_socket.as_deref(),
             Some(Path::new(crate::filesystem::BROKER_SOCKET_CONTAINER_PATH))
         );
+        assert!(launch.scope_unix_sockets);
         // A policy file cannot name the socket.
         assert!(toml::from_str::<LandlockTcp>("broker_socket = \"/x\"").is_err());
+
+        // With the supervisor relaying, no socket is mounted or allowed, but
+        // pathname sockets in mounted volumes stay out of reach.
+        let relayed = config.with_broker_proxy_listen("127.0.0.1:3128".parse().unwrap(), true);
+        let launch = LandlockTcp::default().for_launch(&relayed);
+        assert_eq!((launch.bind, launch.connect), (None, None));
+        assert_eq!(launch.broker_socket, None);
+        assert!(launch.scope_unix_sockets);
     }
 
     #[test]
@@ -514,6 +528,7 @@ mod tests {
             bind: None,
             connect: None,
             broker_socket: Some(PathBuf::from(&broker)),
+            scope_unix_sockets: true,
         };
         let status = tcp
             .create_workload_ruleset()
@@ -551,6 +566,7 @@ mod tests {
                     bind: Some(vec![0]),
                     connect: Some(vec![allowed]),
                     broker_socket: None,
+                    scope_unix_sockets: false,
                 },
             };
             assert!(policy.apply(false).unwrap());

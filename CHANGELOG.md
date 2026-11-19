@@ -7,7 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `--broker-proxy-listen 127.0.0.1:PORT` (launch config `broker_proxy_listen`)
+  runs the broker forwarder in the supervisor. The container init binds the
+  listener in its network namespace and hands it over with `SCM_RIGHTS`; the
+  supervisor relays each connection to the verified broker socket inode. The
+  socket is no longer mounted, the workload needs no forwarder binary, proxy
+  variables are injected unless `--no-broker-proxy-env`, and
+  `container_started` reports the address (#39).
+- `--memory-high SIZE` (launch config `memory_high`) sets an explicit memory
+  throttling watermark; it must not exceed `--memory`.
+- `container_summary` resource stats include `memory_events` (`high`, `max`,
+  `oom`, `oom_kill`) so callers can tell a memory failure from other exits.
+
 ### Fixed
+- `--memory` no longer sets `memory.high` to 90% of the limit. With swap
+  disabled that throttled a runaway workload just below the limit almost
+  indefinitely; it is now OOM-killed at `memory.max` (#37).
+- After a supervisor SIGKILL the reaper also removes the gVisor state and
+  bundle directory under `nucleus-gvisor/<id>` (#38).
 - Delegated cgroups of the systemd user manager are detected. The user manager
   sets no `delegate` xattr, so for a service or scope under
   `user@<uid>.service` Nucleus reads the unit's `Delegate` property with
@@ -22,6 +40,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   installed and was killed with `SIGSYS` (exit 159) without an error message.
 
 ### Changed
+- **Breaking:** `--broker-socket` is refused under gVisor, which could only reach the
+  socket with `--host-uds=open` and so let the sandbox connect to every host
+  socket in its mounts. Untrusted workloads with a broker need
+  `--trust-level trusted --runtime native` (#36).
 - The native seccomp filter refuses namespace creation (`unshare` or `clone`
   with `CLONE_NEW*` flags, and `setns`) with `EPERM` instead of killing the
   workload with `SIGSYS`, so nested sandboxes such as bubblewrap report an

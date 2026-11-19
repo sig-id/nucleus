@@ -289,6 +289,9 @@ pub struct ContainerEventMetadata {
     pub cgroup_path: Option<String>,
     pub workspace_mount: Option<WorkspaceMountEvent>,
     pub network_mode: String,
+    /// Loopback address where the supervisor relays to the broker socket.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub broker_proxy_listen: Option<String>,
 }
 
 impl ContainerEventMetadata {
@@ -317,6 +320,7 @@ impl ContainerEventMetadata {
                 network_mode_label(&config.network)
             }
             .to_string(),
+            broker_proxy_listen: config.broker_proxy_listen.map(|addr| addr.to_string()),
         }
     }
 }
