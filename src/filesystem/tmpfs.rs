@@ -100,6 +100,15 @@ impl TmpfsMount {
         Ok(())
     }
 
+    /// Stop owning the mount: dropping it no longer unmounts.
+    ///
+    /// Once the mount has become the root of a private mount namespace,
+    /// it lives exactly as long as that namespace and its path no longer
+    /// resolves, so there is nothing for this guard to clean up.
+    pub fn release(mut self) {
+        self.mounted = false;
+    }
+
     /// Get mount path
     pub fn path(&self) -> &Path {
         &self.path
@@ -122,6 +131,13 @@ impl Drop for TmpfsMount {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn released_mount_is_not_unmounted_on_drop() {
+        let mut tmpfs = TmpfsMount::new(Path::new("/nonexistent/nucleus-tmpfs"), None);
+        tmpfs.mounted = true;
+        tmpfs.release();
+    }
 
     #[test]
     fn test_tmpfs_mount_new() {

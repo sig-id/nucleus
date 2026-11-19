@@ -946,7 +946,9 @@ impl Container {
                 if config.service_mode.requires_cgroup_enforcement() {
                     return Err(NucleusError::CgroupError(format!(
                         "{} requires cgroup resource enforcement, but \
-                         cgroup creation failed: {}",
+                         cgroup creation failed: {}. Without root, run Nucleus in a \
+                         systemd unit with Delegate= or set NUCLEUS_CGROUP_ROOT to a \
+                         cgroup delegated to this user",
                         config.service_mode.label(),
                         e
                     )));
@@ -1908,6 +1910,13 @@ impl Container {
         // Filesystem: Populated -> Pivoted
         switch_root(&container_root, self.config.allow_chroot_fallback)?;
         fs_state = fs_state.transition(FilesystemState::Pivoted)?;
+        // The tmpfs is now this process's root and the runtime directory's
+        // host path no longer resolves. Their drop-time cleanup can do nothing
+        // useful, and after seccomp is installed it is fatal: a failed exec
+        // would unwind into umount2 and die with SIGSYS instead of reporting
+        // the error. The mount namespace dies with this process.
+        tmpfs.release();
+        let _ = runtime_dir.keep();
         debug!("Filesystem state: {:?}", fs_state);
 
         // 10b. Audit mount flags to verify filesystem hardening invariants

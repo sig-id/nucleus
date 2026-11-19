@@ -38,6 +38,7 @@ const BPF_RSH: u16 = 0x70;
 
 const BPF_JA: u16 = 0x00;
 const BPF_JEQ: u16 = 0x10;
+const BPF_JSET: u16 = 0x40;
 const BPF_K: u16 = 0x00;
 const BPF_X: u16 = 0x08;
 
@@ -100,16 +101,25 @@ fn compile_bitmap_bpf(
     compile_bitmap_bpf_with_errno_syscalls(rules, &[], mismatch_action, match_action, target_arch)
 }
 
+/// How an errno rule tests the low 32 bits of a syscall argument.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ArgMatch {
+    /// The argument equals the value (an int option or request code).
+    Eq(u32),
+    /// The argument has at least one bit of the mask set (a flag word).
+    AnyBit(u32),
+}
+
 /// An errno denial may cover a whole syscall or a single int-valued option.
 #[derive(Clone, Copy)]
 pub(super) struct ErrnoRule {
     pub nr: i64,
-    /// Match the low 32 bits of seccomp_data.args[0] (int-valued first
-    /// argument, e.g. a `prctl` option).
-    pub arg0: Option<u32>,
-    /// Match the low 32 bits of seccomp_data.args[1] (int-valued second
-    /// argument, e.g. an `ioctl` request code).
-    pub arg1: Option<u32>,
+    /// Test the low 32 bits of seccomp_data.args[0] (first argument, e.g. a
+    /// `prctl` option or `clone` flags).
+    pub arg0: Option<ArgMatch>,
+    /// Test the low 32 bits of seccomp_data.args[1] (second argument, e.g. an
+    /// `ioctl` request code).
+    pub arg1: Option<ArgMatch>,
     pub errno: i32,
 }
 
@@ -172,17 +182,25 @@ pub(super) fn compile_bitmap_bpf_with_errno_syscalls(
     // === Section 1b: Exact-match errno denies ===
     for rule in errno_syscalls {
         prog.push(bpf_stmt(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_NR_OFFSET));
-        let matches = rule.arg0.iter().chain(rule.arg1.iter()).count();
-        let skip = 2 * matches as u8 + 1;
+        let tests: Vec<(u32, ArgMatch)> = [(0, rule.arg0), (1, rule.arg1)]
+            .into_iter()
+            .filter_map(|(index, test)| test.map(|test| (index, test)))
+            .collect();
+        // Each argument test is a load and a jump; a failed test skips the
+        // remaining tests and the RET.
+        let skip = 2 * tests.len() as u8 + 1;
         prog.push(bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, rule.nr as u32, 0, skip));
         // All supported targets use little-endian seccomp_data arguments;
         // load the low 32 bits of the matched argument slot.
         let args_offset = std::mem::offset_of!(libc::seccomp_data, args) as u32;
-        for (index, value) in [(0, rule.arg0), (1, rule.arg1)] {
-            if let Some(value) = value {
-                prog.push(bpf_stmt(BPF_LD | BPF_W | BPF_ABS, args_offset + index * 8));
-                prog.push(bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, value, 0, 1));
-            }
+        for (position, (index, test)) in tests.iter().enumerate() {
+            let fail_skip = 2 * (tests.len() - position - 1) as u8 + 1;
+            prog.push(bpf_stmt(BPF_LD | BPF_W | BPF_ABS, args_offset + index * 8));
+            let (op, value) = match *test {
+                ArgMatch::Eq(value) => (BPF_JEQ, value),
+                ArgMatch::AnyBit(mask) => (BPF_JSET, mask),
+            };
+            prog.push(bpf_jump(BPF_JMP | op | BPF_K, value, 0, fail_skip));
         }
         prog.push(bpf_stmt(
             BPF_RET | BPF_K,
@@ -404,6 +422,14 @@ mod tests {
                         pc += 1 + insn.jf as usize;
                     }
                 }
+                0x45 => {
+                    // BPF_JMP | BPF_JSET | BPF_K
+                    if a & insn.k != 0 {
+                        pc += 1 + insn.jt as usize;
+                    } else {
+                        pc += 1 + insn.jf as usize;
+                    }
+                }
                 0x25 => {
                     // BPF_JMP | BPF_JGT | BPF_K
                     if a > insn.k {
@@ -451,6 +477,7 @@ mod tests {
     const RET_ALLOW: u32 = 0x7fff_0000; // SECCOMP_RET_ALLOW
     const RET_KILL: u32 = 0x8000_0000; // SECCOMP_RET_KILL_PROCESS
     const RET_ERRNO_ENOSYS: u32 = libc::SECCOMP_RET_ERRNO | libc::ENOSYS as u32;
+    const RET_ERRNO_EPERM: u32 = libc::SECCOMP_RET_ERRNO | libc::EPERM as u32;
 
     #[test]
     fn test_unconditional_allows() {
@@ -534,7 +561,7 @@ mod tests {
             &[ErrnoRule {
                 nr: 123,
                 arg0: None,
-                arg1: Some(libc::FICLONE as u32),
+                arg1: Some(ArgMatch::Eq(libc::FICLONE as u32)),
                 errno: libc::EOPNOTSUPP,
             }],
             SeccompAction::KillProcess,
@@ -747,10 +774,87 @@ mod tests {
         assert_eq!(action(libc::SIGCHLD, 0), RET_ALLOW);
         assert_eq!(action(libc::CLONE_THREAD, 0), RET_KILL);
         assert_eq!(action(libc::CLONE_VM, 1), RET_KILL);
+        // Namespace creation is refused before the profile's allow rules.
         assert_eq!(
             action(libc::CLONE_THREAD | libc::CLONE_NEWUSER, 1),
-            RET_KILL
+            RET_ERRNO_EPERM
         );
+    }
+
+    #[test]
+    fn test_errno_rule_tests_every_argument() {
+        let prog = compile_bitmap_bpf_with_errno_syscalls(
+            BTreeMap::new(),
+            &[ErrnoRule {
+                nr: 123,
+                arg0: Some(ArgMatch::AnyBit(0b1100)),
+                arg1: Some(ArgMatch::Eq(7)),
+                errno: libc::EPERM,
+            }],
+            SeccompAction::KillProcess,
+            SeccompAction::Allow,
+            TargetArch::x86_64,
+        )
+        .unwrap();
+        let action = |arg0, arg1| {
+            bpf_eval(
+                &prog,
+                &make_seccomp_data(123, AUDIT_ARCH_X86_64, [arg0, arg1, 0, 0, 0, 0]),
+            )
+        };
+        assert_eq!(action(0b0100, 7), RET_ERRNO_EPERM);
+        assert_eq!(action(0b1000, 7), RET_ERRNO_EPERM);
+        assert_eq!(action(0b0011, 7), RET_KILL);
+        assert_eq!(action(0b0100, 8), RET_KILL);
+        // A failed first test must not fall into the second one with A
+        // still holding args[0].
+        assert_eq!(action(7, 7), RET_ERRNO_EPERM);
+        assert_eq!(action(0, 0), RET_KILL);
+    }
+
+    #[test]
+    fn test_builtin_namespace_creation_returns_eperm() {
+        // Nested sandboxes (bwrap, unshare -U) must see EPERM, not SIGSYS.
+        let rules = crate::security::SeccompManager::minimal_filter_for_test(false, &[]);
+        let prog = compile_bitmap_bpf_with_errno_syscalls(
+            rules,
+            crate::security::SeccompManager::errno_denied_syscalls_for_test(),
+            SeccompAction::KillProcess,
+            SeccompAction::Allow,
+            TargetArch::x86_64,
+        )
+        .unwrap();
+        let action = |nr: i64, arg0: i32| {
+            bpf_eval(
+                &prog,
+                &make_seccomp_data(nr as u32, AUDIT_ARCH_X86_64, [arg0 as u64, 0, 0, 0, 0, 0]),
+            )
+        };
+        for flag in [
+            libc::CLONE_NEWUSER,
+            libc::CLONE_NEWNS,
+            libc::CLONE_NEWNET,
+            libc::CLONE_NEWIPC,
+            libc::CLONE_NEWUTS,
+            libc::CLONE_NEWPID,
+            libc::CLONE_NEWCGROUP,
+            libc::CLONE_NEWTIME,
+        ] {
+            assert_eq!(
+                action(libc::SYS_unshare, flag),
+                RET_ERRNO_EPERM,
+                "{flag:#x}"
+            );
+            assert_eq!(
+                action(libc::SYS_clone, flag | libc::SIGCHLD),
+                RET_ERRNO_EPERM,
+                "{flag:#x}"
+            );
+        }
+        assert_eq!(action(libc::SYS_setns, 0), RET_ERRNO_EPERM);
+        // fork() still works; unshare of non-namespace state stays denied.
+        assert_eq!(action(libc::SYS_clone, libc::SIGCHLD), RET_ALLOW);
+        assert_eq!(action(libc::SYS_unshare, libc::CLONE_FILES), RET_KILL);
     }
 
     #[test]

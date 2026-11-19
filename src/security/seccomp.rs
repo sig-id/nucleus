@@ -1,4 +1,4 @@
-use super::seccomp_bpf::ErrnoRule;
+use super::seccomp_bpf::{ArgMatch, ErrnoRule};
 use crate::container::{ContainerConfig, SeccompMode};
 use crate::error::{NucleusError, Result};
 #[cfg(any(
@@ -73,6 +73,9 @@ const DENIED_CLONE_NAMESPACE_FLAGS: u64 = (libc::CLONE_NEWUSER
     | libc::CLONE_NEWPID
     | libc::CLONE_NEWCGROUP
     | libc::CLONE_NEWTIME) as u64;
+
+// Errno rules test only the low 32 bits of the flag argument.
+const _: () = assert!(DENIED_CLONE_NAMESPACE_FLAGS <= u32::MAX as u64);
 
 impl SeccompManager {
     pub fn new() -> Self {
@@ -1240,10 +1243,35 @@ impl SeccompManager {
                 arg1: None,
                 errno: libc::ENOSYS,
             },
+            // Nested sandboxes (bubblewrap, `unshare -U`, Codex's tool
+            // sandbox) create namespaces. Refusing with EPERM, the errno an
+            // unprivileged caller gets from the kernel, lets them report the
+            // failure or detect that they already run inside a sandbox;
+            // killing them left only an opaque SIGSYS. clone without
+            // namespace flags and unshare of non-namespace state still go
+            // through the regular rules.
+            ErrnoRule {
+                nr: libc::SYS_clone,
+                arg0: Some(ArgMatch::AnyBit(DENIED_CLONE_NAMESPACE_FLAGS as u32)),
+                arg1: None,
+                errno: libc::EPERM,
+            },
+            ErrnoRule {
+                nr: libc::SYS_unshare,
+                arg0: Some(ArgMatch::AnyBit(DENIED_CLONE_NAMESPACE_FLAGS as u32)),
+                arg1: None,
+                errno: libc::EPERM,
+            },
+            ErrnoRule {
+                nr: libc::SYS_setns,
+                arg0: None,
+                arg1: None,
+                errno: libc::EPERM,
+            },
             // Nix wrappers probe PR_SET_MM_ARG_START and tolerate EPERM.
             ErrnoRule {
                 nr: libc::SYS_prctl,
-                arg0: Some(libc::PR_SET_MM as u32),
+                arg0: Some(ArgMatch::Eq(libc::PR_SET_MM as u32)),
                 arg1: None,
                 errno: libc::EPERM,
             },
@@ -1258,13 +1286,13 @@ impl SeccompManager {
             ErrnoRule {
                 nr: libc::SYS_ioctl,
                 arg0: None,
-                arg1: Some(libc::FICLONE as u32),
+                arg1: Some(ArgMatch::Eq(libc::FICLONE as u32)),
                 errno: libc::EOPNOTSUPP,
             },
             ErrnoRule {
                 nr: libc::SYS_ioctl,
                 arg0: None,
-                arg1: Some(libc::FICLONERANGE as u32),
+                arg1: Some(ArgMatch::Eq(libc::FICLONERANGE as u32)),
                 errno: libc::EOPNOTSUPP,
             },
         ]
@@ -2175,7 +2203,7 @@ mod tests {
             assert!(
                 SeccompManager::errno_denied_syscalls().iter().any(|rule| {
                     rule.nr == libc::SYS_ioctl
-                        && rule.arg1 == Some(request)
+                        && rule.arg1 == Some(ArgMatch::Eq(request))
                         && rule.errno == libc::EOPNOTSUPP
                 }),
                 "ioctl request {request:#x} must be denied with EOPNOTSUPP so cp falls back"
