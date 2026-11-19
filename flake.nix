@@ -261,6 +261,22 @@
           else
             srcRoot;
 
+        crateVersion = (lib.importTOML ./Cargo.toml).package.version;
+
+        # These tests need host semantics the Nix build sandbox withholds: its
+        # seccomp filter rejects setuid/setgid chmod, and /nix is not root-owned
+        # there, so hook trust checks refuse the interpreter. CI runs them.
+        sandboxIncompatibleTests = [
+          "filesystem::workspace::tests::workspace_copy_strips_setid_from_files_and_directories"
+          "oci::tests::hook_receives_state_with_unprivileged_credentials"
+          "oci::tests::test_oci_hook_nonzero_exit_is_error"
+          "oci::tests::test_oci_hooks_best_effort_continues_on_failure"
+        ];
+        sandboxTestSkipArgs =
+          "-- --exact " + lib.concatMapStringsSep " " (test: "--skip ${test}") sandboxIncompatibleTests;
+        sandboxNextestFilter =
+          "-E 'not (" + lib.concatMapStringsSep " | " (test: "test(=${test})") sandboxIncompatibleTests + ")'";
+
         # Common arguments
         commonArgs = {
           inherit src;
@@ -270,7 +286,7 @@
           ${if pkgs.stdenv.hostPlatform.isLinux then "NUCLEUS_PACKAGED_NFT" else null} = "${pkgs.nftables}/bin/nft";
           ${if pkgs.stdenv.hostPlatform.isLinux then "NUCLEUS_PACKAGED_SLIRP" else null} = "${pkgs.slirp4netns}/bin/slirp4netns";
           pname = "nucleus";
-          version = "0.4.0";
+          version = crateVersion;
           strictDeps = true;
 
           nativeBuildInputs = [
@@ -291,6 +307,7 @@
         my-crate = if cargoLockExists then craneLib.buildPackage (commonArgs // {
           inherit cargoArtifacts;
           nativeCheckInputs = gvisorRuntimePkgs;
+          cargoTestExtraArgs = sandboxTestSkipArgs;
           nativeBuildInputs = commonArgs.nativeBuildInputs ++ [ pkgs.makeWrapper ];
           postFixup = lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
             wrapProgram $out/bin/nucleus --prefix PATH : "${runtimePath}"
@@ -347,24 +364,25 @@
           my-crate-fmt = craneLib.cargoFmt {
             inherit src;
             pname = "nucleus";
-            version = "0.4.0";
+            version = crateVersion;
           };
 
           my-crate-audit = craneLib.cargoAudit {
             inherit src advisory-db;
             pname = "nucleus";
-            version = "0.4.0";
+            version = crateVersion;
           };
 
           my-crate-deny = craneLib.cargoDeny {
             inherit src;
             pname = "nucleus";
-            version = "0.4.0";
+            version = crateVersion;
           };
 
           my-crate-nextest = craneLib.cargoNextest (commonArgs // {
             inherit cargoArtifacts;
             nativeCheckInputs = gvisorRuntimePkgs;
+            cargoNextestExtraArgs = sandboxNextestFilter;
             partitions = 1;
             partitionType = "count";
           });

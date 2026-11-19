@@ -127,3 +127,15 @@ jobs:
         env:
           RUSTC_WRAPPER: ""
         run: cargo deny check advisories bans sources
+
+  nix-package:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: cachix/install-nix-action@3dc140bfc76c49fbd4dd958429132e3746bcb086 # v31.11.5
+
+      # Consumers build the flake package, including its tests, in the Nix sandbox.
+      - name: Build flake package
+        run: nix build --print-build-logs .#default
