@@ -971,11 +971,14 @@ impl Container {
             }
         };
 
-        let device_filter = gpu_device_set.as_ref().map(|set| crate::container::SavedDeviceFilter {
-            gpu: set.device_specs(),
-            supervisor: Self::gvisor_supervisor_device_specs(&config),
-            include_tty: config.terminal,
-        });
+        let device_filter =
+            gpu_device_set
+                .as_ref()
+                .map(|set| crate::container::SavedDeviceFilter {
+                    gpu: set.device_specs(),
+                    supervisor: Self::gvisor_supervisor_device_specs(&config),
+                    include_tty: config.terminal,
+                });
         if let Some(filter) = &device_filter {
             if let Some(cgroup) = &cgroup_opt {
                 // The deny-by-default filter also governs the runsc supervisor,
@@ -1817,6 +1820,26 @@ impl Container {
             &self.config.process_identity,
         )?;
 
+        // 7g. /tmp scratch: writable but never executable, like the sandbox
+        // home and /dev/shm. Files here can be neither execve'd nor mapped
+        // PROT_EXEC (mprotect included), which closes the last writable and
+        // simultaneously executable tmpfs surface. User volumes cannot
+        // override /tmp; it is a reserved runtime destination.
+        let tmp_target = crate::filesystem::mount_target(&container_root, Path::new("tmp"), true)?;
+        nix::mount::mount(
+            Some("tmpfs"),
+            &crate::filesystem::fd_path(&tmp_target),
+            Some("tmpfs"),
+            nix::mount::MsFlags::MS_NOSUID
+                | nix::mount::MsFlags::MS_NODEV
+                | nix::mount::MsFlags::MS_NOEXEC,
+            Some("mode=1777,size=512m"),
+        )
+        .map_err(|e| {
+            NucleusError::FilesystemError(format!("Failed to mount noexec /tmp tmpfs: {e}"))
+        })?;
+        debug!("Mounted noexec tmpfs on /tmp");
+
         mount_procfs(&container_root.join("proc"), self.config.proc_readonly)?;
 
         // 9c. Run createRuntime hooks (after namespaces created, before pivot_root)
@@ -1871,7 +1894,7 @@ impl Container {
         //
         // Custom cap policies (drop_except / apply_sets) do their own full drop,
         // so the two-phase approach only applies to the default drop-all path.
-        crate::filesystem::restrict_procfs_links()?;
+        crate::filesystem::verify_procfs_mount_flags()?;
         let mut cap_mgr = CapabilityManager::new();
         if let Some(sets) = &workload_caps {
             cap_mgr.prepare_sets(sets)?;

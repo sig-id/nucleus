@@ -58,16 +58,27 @@ keep = []
 # keep = ["NET_BIND_SERVICE"]
 ```
 
-Minimal set if needed:
-- `CAP_NET_BIND_SERVICE` - Bind to ports < 1024 (if networking enabled)
-- `CAP_SETUID/CAP_SETGID` - Only if agent needs user switching
+Policy validation is an **allowlist**: only the capabilities below may be
+kept, and everything else — including capabilities added by future kernels —
+is rejected in every service mode. The final pre-exec audit re-checks the
+live sets against the same allowlist.
 
-**Blocked capabilities:**
+**Allowlisted capabilities:**
+- `CAP_NET_BIND_SERVICE` - Bind to ports < 1024 (if networking enabled)
+- `CAP_KILL` - Signal own processes (PID namespace scopes the reach)
+- `CAP_IPC_LOCK` - `mlock` shared memory, bounded by `RLIMIT_MEMLOCK`
+- `CAP_LEASE` - File leases
+
+**Everything else is blocked**, notably:
 - `CAP_SYS_ADMIN` - Mount, pivot_root, etc.
 - `CAP_SYS_MODULE` - Load kernel modules
 - `CAP_SYS_RAWIO` - Direct disk access
 - `CAP_SYS_BOOT` - Reboot system
 - `CAP_SYS_PTRACE` - Trace arbitrary processes
+- `CAP_CHOWN`, `CAP_FOWNER`, `CAP_DAC_OVERRIDE`, `CAP_SETFCAP` - Rewrite
+  host-visible ownership/attributes (dangerous for root launches without a
+  user namespace)
+- `CAP_SYS_TIME` - Host clock changes
 
 ### 3. Seccomp (Syscall Filtering)
 
@@ -313,6 +324,39 @@ Security policy is separated from structural configuration (Nix) for auditabilit
 | Landlock filesystem rules | TOML | Per-service access needs, distinct from topology |
 
 All policy files support SHA-256 pinning for supply-chain integrity. Nix pins the hash at build time; Nucleus verifies at load time.
+
+## Known Limitations and Residual Risks
+
+Documented, accepted residuals of the current design (review findings):
+
+- **Egress enforcement is netns-local.** The domain/port allowlist is applied
+  with nftables inside the workload's own network namespace; there is no
+  host-side enforcement layer, so a workload that escapes to another network
+  namespace leaves the filter behind. Domain grants resolve to IP addresses,
+  so a grant covers every service fronted by the same CDN addresses.
+- **DNS grants fail closed together.** If any allowed domain resolves into a
+  protected range, the whole egress refresh fails and previous grants expire
+  (default 60s TTL); one poisoned answer for one domain therefore withdraws
+  every domain grant until resolution recovers.
+- **SCM_RIGHTS on AF_UNIX is not filterable.** Descriptor passing over Unix
+  sockets cannot be distinguished by seccomp arguments; the AF_UNIX
+  garbage-collection bug class stays reachable in exchange for local IPC.
+  `MSG_OOB` is denied on the flags argument of every send/recv entry point.
+- **`--env` values persist in images and checkpoints.** Committed image
+  manifests and checkpoint images record the launch environment; treat
+  `--env` as non-secret and use secrets (in-memory tmpfs) for credentials.
+- **The runsc version gate is self-reported.** runsc reports its own version,
+  and the floor only encodes known-bad releases (currently CVE-2026-95702);
+  it cannot attest the binary itself. Verified images and the attested
+  rootfs record are the stronger integrity boundary.
+- **gVisor has no filtered bridge networking.** gVisor plus bridge is
+  rejected outright (netstack and host netns cannot be combined safely), so
+  the default runtime in bridge mode is native: filtering lives in the
+  workload netns, gVisor provides none or host networking only.
+- **Agent-mode root launches without a user namespace.** A root launch with a
+  non-zero workload uid in agent mode runs without a user namespace; combine
+  with the capability allowlist this is contained, but `--user` remapping
+  (root_remapped) is the stronger configuration for root service launches.
 
 ## Attack Scenarios
 

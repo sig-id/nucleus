@@ -35,8 +35,25 @@ impl LazyContextPopulator {
     }
 
     /// Bind mount source directory to destination (read-only)
+    ///
+    /// The source is pinned once with `O_PATH`, the tree validation walks the
+    /// pin, and the bind mounts the pinned inode. A concurrent writer cannot
+    /// swap the source directory between validation and mount.
     fn bind_mount_context(source: &Path, dest: &Path) -> Result<()> {
-        ContextPopulator::new(source, dest).validate_source_tree()?;
+        let pinned = nix::fcntl::open(
+            source,
+            nix::fcntl::OFlag::O_PATH
+                | nix::fcntl::OFlag::O_DIRECTORY
+                | nix::fcntl::OFlag::O_CLOEXEC,
+            nix::sys::stat::Mode::empty(),
+        )
+        .map_err(|e| {
+            NucleusError::ContextError(format!(
+                "Context source {:?} cannot be pinned: {}",
+                source, e
+            ))
+        })?;
+        ContextPopulator::validate_pinned_tree(&pinned)?;
 
         info!(
             "Bind mounting context: {:?} -> {:?} (read-only)",
@@ -55,7 +72,7 @@ impl LazyContextPopulator {
             true,
         )?;
         super::bind_tree(
-            source,
+            &super::fd_path(&pinned),
             &target,
             true,
             super::READ_ONLY | libc::MOUNT_ATTR_NOEXEC,

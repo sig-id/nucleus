@@ -68,6 +68,11 @@ const PRODUCTION_MOUNT_EXPECTATIONS: &[ExpectedMount] = &[
         critical: true,
     },
     ExpectedMount {
+        path: "/tmp",
+        required_flags: &["nosuid", "nodev", "noexec"],
+        critical: false, // scratch tmpfs; keeps W^X closed for file-backed pages
+    },
+    ExpectedMount {
         path: "/run/secrets",
         required_flags: &["nosuid", "nodev", "noexec"],
         critical: false, // only present when secrets are configured
@@ -321,13 +326,21 @@ fn parse_mountinfo_line(line: &str) -> Option<(String, std::collections::HashSet
     Some((mount_point, options))
 }
 
-/// Disable traversal of procfs magic links before handing a native mount
-/// namespace to the workload. Apply this to procfs aliases in recursive binds
-/// as well as /proc. MS_NOEXEC on procfs alone does not constrain the target
-/// mount of a magic link.
-pub(crate) fn restrict_procfs_links() -> Result<()> {
+/// Verify every procfs mount handed to a native workload keeps its hardening
+/// flags (nosuid, nodev, noexec).
+///
+/// Execution through procfs descriptor links is denied by the layer that owns
+/// it: seccomp rejects `execveat(AT_EMPTY_PATH)`, Landlock's execute allowlist
+/// is evaluated against the link target's own path, and MNT_NOEXEC follows the
+/// resolved file's mount. A mount-wide `nosymfollow` flag was previously
+/// applied here, but it also broke `/proc/self`, `/proc/thread-self` and
+/// `/dev/fd` resolution (ELOOP) for every legitimate reader — anything
+/// reading `/proc/self/maps` or `/proc/self/exe` — so it is no longer set.
+/// Seccomp denies `mount_setattr`, `unshare` and `setns`, so the workload
+/// cannot weaken these flags itself.
+pub(crate) fn verify_procfs_mount_flags() -> Result<()> {
     let table = format!("/proc/{}/mountinfo", std::process::id());
-    let unprotected = || -> Result<Vec<String>> {
+    let offending = || -> Result<Vec<String>> {
         let mut file = std::fs::File::open(&table)?;
         if nix::sys::statfs::fstatfs(&file)?.filesystem_type() != nix::sys::statfs::PROC_SUPER_MAGIC
         {
@@ -346,31 +359,21 @@ pub(crate) fn restrict_procfs_links() -> Result<()> {
                 let (path, flags) = parse_mountinfo_line(line).ok_or_else(|| {
                     NucleusError::FilesystemError("Invalid procfs mount record".into())
                 })?;
-                if !flags.contains("nosymfollow") {
+                if !["nosuid", "nodev", "noexec"]
+                    .iter()
+                    .all(|required| flags.contains(*required))
+                {
                     targets.push(path);
                 }
             }
         }
         Ok(targets)
     };
-    for path in unprotected()? {
-        let fd = open(
-            Path::new(&path),
-            OFlag::O_PATH | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
-            Mode::empty(),
-        )?;
-        if nix::sys::statfs::fstatfs(&fd)?.filesystem_type() != nix::sys::statfs::PROC_SUPER_MAGIC {
-            return Err(NucleusError::FilesystemError(format!(
-                "Procfs mount changed at {path:?}"
-            )));
-        }
-        super::target::set_mount_attributes(&fd, libc::MOUNT_ATTR_NOSYMFOLLOW, false)
-            .map_err(|e| NucleusError::FilesystemError(format!("Cannot restrict procfs links at {path:?}: {e}")))?;
-    }
-    if !unprotected()?.is_empty() {
-        return Err(NucleusError::FilesystemError(
-            "Cannot restrict all workload procfs mounts".into(),
-        ));
+    let targets = offending()?;
+    if !targets.is_empty() {
+        return Err(NucleusError::FilesystemError(format!(
+            "Unrestricted procfs mounts remain in the workload namespace: {targets:?}"
+        )));
     }
     Ok(())
 }
@@ -856,6 +859,7 @@ const RESERVED_VOLUME_DESTINATION_PREFIXES: &[&str] = &[
     "/run/secrets",
     "/sbin",
     "/sys",
+    "/tmp",
     "/usr",
 ];
 

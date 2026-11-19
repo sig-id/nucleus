@@ -334,6 +334,13 @@ impl VerifiedImage {
             Err(e) => return Err(e.into()),
         };
         if signed {
+            // Verify the signature against the live tree before staging a
+            // private copy: an unsigned or tampered image must be rejected
+            // before any untrusted byte is copied into the temporary
+            // directory, so a large bogus image cannot fill the disk on the
+            // way to a verification failure.
+            let expected = image_digest(image_dir)?;
+            verify_signature_bytes(image_dir, &expected)?;
             let snapshot = tempfile::Builder::new()
                 .prefix("nucleus-image-")
                 .permissions(fs::Permissions::from_mode(0o700))
@@ -351,7 +358,13 @@ impl VerifiedImage {
                 ));
             }
             copy_image_tree(image_dir, snapshot.path(), None)?;
-            verify_image_signature(snapshot.path())?;
+            // The imported bytes must be exactly the verified bytes; a
+            // concurrent change to the source tree fails closed here.
+            if image_digest(snapshot.path())? != expected {
+                return Err(image_error(
+                    "Image contents changed while staging the verified snapshot".into(),
+                ));
+            }
             let manifest = NucleusImageManifest::load(snapshot.path())?;
             return Ok(Self {
                 manifest,
@@ -1097,7 +1110,11 @@ fn sign_image(dir: &Path) -> Result<()> {
     atomic_write_bytes(&dir.join(IMAGE_SIGNATURE_FILE), encoded.as_bytes(), 0o600)
 }
 
-fn verify_image_signature(dir: &Path) -> Result<()> {
+/// Verify the signature file in `dir` against an externally computed digest.
+///
+/// Splitting the digest out lets callers verify the live tree before staging
+/// a private copy, then re-verify the staged bytes against the same digest.
+fn verify_signature_bytes(dir: &Path, digest: &[u8; 32]) -> Result<()> {
     let bytes = read_file_nofollow_bytes(&dir.join(IMAGE_SIGNATURE_FILE))?;
     let encoded = std::str::from_utf8(&bytes).ok().and_then(|s| s.trim_end().strip_prefix("ed25519-v1:"))
         .ok_or_else(|| image_error("Expected an Ed25519 image signature. Recommit legacy HMAC images with a signing key.".into()))?;
@@ -1117,7 +1134,7 @@ fn verify_image_signature(dir: &Path) -> Result<()> {
     let verifier = VerifyingKey::from_bytes(&read_key(&public_path, false)?)
         .map_err(|_| image_error("Invalid Ed25519 verification key".into()))?;
     verifier
-        .verify_strict(&image_digest(dir)?, &Signature::from_bytes(&sig))
+        .verify_strict(digest, &Signature::from_bytes(&sig))
         .map_err(|_| image_error("Image integrity verification failed: signature mismatch".into()))
 }
 

@@ -53,29 +53,24 @@ pub struct CapSetPolicy {
     pub keep: Vec<String>,
 }
 
-/// Capabilities that are too dangerous for container workloads.
-/// Rejected in every workload service mode.
-pub(super) const DANGEROUS_CAPABILITIES: &[Capability] = &[
-    Capability::CAP_SYS_ADMIN,
-    Capability::CAP_SYS_MODULE,
-    Capability::CAP_SYS_RAWIO,
-    Capability::CAP_SYS_PTRACE,
-    Capability::CAP_DAC_OVERRIDE,
-    Capability::CAP_DAC_READ_SEARCH,
-    Capability::CAP_SYS_BOOT,
-    Capability::CAP_MAC_ADMIN,
-    Capability::CAP_MAC_OVERRIDE,
-    Capability::CAP_SYS_PACCT,
-    Capability::CAP_LINUX_IMMUTABLE,
-    Capability::CAP_BPF,
-    Capability::CAP_PERFMON,
-    Capability::CAP_NET_ADMIN,
-    Capability::CAP_SYS_RESOURCE,
-    Capability::CAP_MKNOD,
-    Capability::CAP_NET_RAW,
-    Capability::CAP_SETUID,
-    Capability::CAP_SETGID,
-    Capability::CAP_FOWNER,
+/// Capabilities a confined workload may keep in a policy.
+///
+/// Validation is an allowlist: every capability not listed here is rejected
+/// in every workload service mode, so future kernel capabilities are denied
+/// by default instead of silently grantable. Deliberately excluded are the
+/// identity-changing caps (SETUID/SETGID), host-fs rewriters (CHOWN, FOWNER,
+/// DAC_OVERRIDE, FSETID, SETFCAP, MKNOD), namespace/mount powers
+/// (SYS_ADMIN, SYS_CHROOT, CHECKPOINT_RESTORE), kernel and hardware control
+/// (SYS_MODULE, SYS_RAWIO, SYS_TIME, SYS_NICE, SYS_BOOT, SYS_RESOURCE,
+/// SYS_PACCT, SYSLOG, PERFMON, BPF), networking (NET_ADMIN, NET_RAW),
+/// MAC/audit (MAC_ADMIN, MAC_OVERRIDE, AUDIT_*) and scheduling tampering
+/// (WAKE_ALARM, BLOCK_SUSPEND). Only narrowly-scoped, namespaced or
+/// resource-bounded capabilities survive.
+pub(super) const ALLOWED_CAPABILITIES: &[Capability] = &[
+    Capability::CAP_NET_BIND_SERVICE,
+    Capability::CAP_KILL,
+    Capability::CAP_IPC_LOCK,
+    Capability::CAP_LEASE,
 ];
 
 impl CapsPolicy {
@@ -94,14 +89,20 @@ impl CapsPolicy {
             .chain(&sets.ambient)
             .collect();
         let mut rejected = Vec::new();
-        for &dangerous in DANGEROUS_CAPABILITIES {
-            if all_kept.contains(&&dangerous) {
-                rejected.push(format!("{:?}", dangerous));
+        for &kept in &all_kept {
+            if !ALLOWED_CAPABILITIES.contains(kept) {
+                rejected.push(format!("{:?}", kept));
             }
         }
         if !rejected.is_empty() {
             return Err(NucleusError::ConfigError(format!(
-                "Capability policy retains dangerous capabilities: [{}].",
+                "Capability policy requests capabilities outside the workload \
+                 allowlist [{}]: {}",
+                ALLOWED_CAPABILITIES
+                    .iter()
+                    .map(|cap| format!("{:?}", cap))
+                    .collect::<Vec<_>>()
+                    .join(", "),
                 rejected.join(", ")
             )));
         }
@@ -262,13 +263,13 @@ keep = []
     fn test_parse_keep_some_policy() {
         let toml = r#"
 [bounding]
-keep = ["NET_BIND_SERVICE", "CHOWN"]
+keep = ["NET_BIND_SERVICE", "KILL"]
 "#;
         let policy: CapsPolicy = toml::from_str(toml).unwrap();
         let keep = policy.resolve_keep_set().unwrap();
         assert_eq!(keep.len(), 2);
         assert!(keep.contains(&Capability::CAP_NET_BIND_SERVICE));
-        assert!(keep.contains(&Capability::CAP_CHOWN));
+        assert!(keep.contains(&Capability::CAP_KILL));
     }
 
     #[test]
@@ -299,10 +300,10 @@ keep = ["NET_BIND_SERVICE", "CHOWN"]
     fn test_dedup_across_sets() {
         let toml = r#"
 [bounding]
-keep = ["CHOWN"]
+keep = ["KILL"]
 
 [effective]
-keep = ["CHOWN"]
+keep = ["KILL"]
 "#;
         let policy: CapsPolicy = toml::from_str(toml).unwrap();
         let keep = policy.resolve_keep_set().unwrap();
@@ -316,7 +317,7 @@ keep = ["CHOWN"]
 keep = ["NET_BIND_SERVICE"]
 
 [effective]
-keep = ["CHOWN"]
+keep = ["KILL"]
 
 [ambient]
 keep = ["NET_BIND_SERVICE"]
@@ -325,12 +326,12 @@ keep = ["NET_BIND_SERVICE"]
         let resolved = policy.resolve_sets().unwrap();
 
         assert_eq!(resolved.bounding, vec![Capability::CAP_NET_BIND_SERVICE]);
-        assert_eq!(resolved.effective, vec![Capability::CAP_CHOWN]);
+        assert_eq!(resolved.effective, vec![Capability::CAP_KILL]);
         assert_eq!(resolved.ambient, vec![Capability::CAP_NET_BIND_SERVICE]);
         assert_eq!(resolved.inheritable, vec![Capability::CAP_NET_BIND_SERVICE]);
         assert_eq!(
             resolved.permitted,
-            vec![Capability::CAP_CHOWN, Capability::CAP_NET_BIND_SERVICE]
+            vec![Capability::CAP_KILL, Capability::CAP_NET_BIND_SERVICE]
         );
     }
 
@@ -349,10 +350,12 @@ keep = ["NET_BIND_SERVICE"]
     }
 
     #[test]
-    fn test_validate_production_rejects_newly_classified_dangerous_caps() {
+    fn test_validate_production_rejects_caps_outside_the_allowlist() {
+        // The policy is an allowlist: previously grantable caps such as CHOWN,
+        // SETFCAP and SYS_TIME are rejected alongside the long-denied set.
         let toml = r#"
 [bounding]
-keep = ["NET_RAW", "SETUID", "SETGID", "FOWNER", "MKNOD", "NET_ADMIN", "SYS_RESOURCE"]
+keep = ["NET_RAW", "SETUID", "SETGID", "FOWNER", "MKNOD", "NET_ADMIN", "SYS_RESOURCE", "CHOWN", "SETFCAP", "SYS_TIME"]
 "#;
         let policy: CapsPolicy = toml::from_str(toml).unwrap();
 
@@ -362,8 +365,29 @@ keep = ["NET_RAW", "SETUID", "SETGID", "FOWNER", "MKNOD", "NET_ADMIN", "SYS_RESO
         assert!(msg.contains("CAP_SETUID"));
         assert!(msg.contains("CAP_SETGID"));
         assert!(msg.contains("CAP_FOWNER"));
-        for cap in ["CAP_MKNOD", "CAP_NET_ADMIN", "CAP_SYS_RESOURCE"] {
-            assert!(msg.contains(cap));
+        for cap in [
+            "CAP_MKNOD",
+            "CAP_NET_ADMIN",
+            "CAP_SYS_RESOURCE",
+            "CAP_CHOWN",
+            "CAP_SETFCAP",
+            "CAP_SYS_TIME",
+        ] {
+            assert!(msg.contains(cap), "expected {cap} to be rejected: {msg}");
         }
+        assert!(
+            msg.contains("allowlist"),
+            "error should name the allowlist: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_allowlisted_capabilities_resolve() {
+        let toml = r#"
+[bounding]
+keep = ["NET_BIND_SERVICE", "KILL", "IPC_LOCK", "LEASE"]
+"#;
+        let policy: CapsPolicy = toml::from_str(toml).unwrap();
+        policy.validate_production().unwrap();
     }
 }

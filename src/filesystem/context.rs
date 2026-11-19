@@ -28,6 +28,23 @@ impl ContextPopulator {
 
         Self::validate_source(&self.source)?;
 
+        // Pin the source directory: the copy below resolves every child
+        // relative to this descriptor (openat + O_NOFOLLOW), never by
+        // re-resolving host paths a concurrent writer can swap.
+        let pinned = nix::fcntl::open(
+            &self.source,
+            nix::fcntl::OFlag::O_PATH
+                | nix::fcntl::OFlag::O_DIRECTORY
+                | nix::fcntl::OFlag::O_CLOEXEC,
+            nix::sys::stat::Mode::empty(),
+        )
+        .map_err(|e| {
+            NucleusError::ContextError(format!(
+                "Failed to pin context source {:?}: {}",
+                self.source, e
+            ))
+        })?;
+
         // Create destination if it doesn't exist
         if !self.dest.exists() {
             fs::create_dir_all(&self.dest).map_err(|e| {
@@ -39,7 +56,7 @@ impl ContextPopulator {
         }
 
         // Walk source tree and copy (depth-limited to prevent stack overflow)
-        self.copy_recursive(&self.source, &self.dest, 0)?;
+        Self::copy_recursive_fd(&pinned, &self.dest, 0)?;
 
         info!("Successfully populated context");
 
@@ -52,7 +69,17 @@ impl ContextPopulator {
     /// as copy mode.
     pub fn validate_source_tree(&self) -> Result<()> {
         Self::validate_source(&self.source)?;
-        self.validate_recursive(&self.source, 0)
+        Self::validate_dir(&self.source, 0)
+    }
+
+    /// Validate the tree under a pinned source directory.
+    ///
+    /// Bind mounts must validate and then mount the same inode: callers pin
+    /// the source once, validate through the pin and bind the pin, so a
+    /// concurrent writer cannot swap the directory between the checks and
+    /// the mount.
+    pub fn validate_pinned_tree(dir: &std::os::fd::OwnedFd) -> Result<()> {
+        Self::validate_dir(&super::fd_path(dir), 0)
     }
 
     /// Validate that a source path exists and is a directory.
@@ -123,36 +150,111 @@ impl ContextPopulator {
         Ok(result)
     }
 
-    /// Recursively copy directory contents
-    fn copy_recursive(&self, src: &Path, dst: &Path, depth: u32) -> Result<()> {
-        for (src_path, file_name, metadata) in Self::filtered_entries(src, depth)? {
-            let dst_path = dst.join(&file_name);
+    /// Recursively copy directory contents from a pinned source directory.
+    ///
+    /// Every child is pinned with `openat` + `O_NOFOLLOW` before use, so a
+    /// concurrent writer on the host source cannot swap a name between the
+    /// type check and the copy. Files are streamed from the pin into a fresh
+    /// private inode and published with an atomic rename; symlinks and
+    /// special files are skipped.
+    fn copy_recursive_fd(src: &std::os::fd::OwnedFd, dst: &Path, depth: u32) -> Result<()> {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        if depth > Self::MAX_RECURSION_DEPTH {
+            return Err(NucleusError::ContextError(format!(
+                "Maximum directory depth ({}) exceeded at {:?}",
+                Self::MAX_RECURSION_DEPTH,
+                super::fd_path(src)
+            )));
+        }
+        for name in Self::pinned_entry_names(src, depth)? {
+            let child = super::pinned_child(src, &name)?;
+            let kind = super::pinned_kind(&child)?;
+            let dst_path = dst.join(&name);
 
-            if metadata.is_dir() {
+            if kind == nix::sys::stat::SFlag::S_IFDIR {
                 fs::create_dir_all(&dst_path).map_err(|e| {
                     NucleusError::ContextError(format!(
                         "Failed to create directory {:?}: {}",
                         dst_path, e
                     ))
                 })?;
-                self.copy_recursive(&src_path, &dst_path, depth + 1)?;
-            } else if metadata.is_file() {
-                fs::copy(&src_path, &dst_path).map_err(|e| {
+                Self::copy_recursive_fd(&child, &dst_path, depth + 1)?;
+            } else if kind == nix::sys::stat::SFlag::S_IFREG {
+                // Re-open the pinned inode through its procfs descriptor
+                // link: resolution lands on exactly the pinned file, so no
+                // O_NOFOLLOW is needed (the link itself is a symlink).
+                let mut from = fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(super::fd_path(&child))
+                    .map_err(|e| {
+                        NucleusError::ContextError(format!(
+                            "Failed to open context file {:?}: {}",
+                            name, e
+                        ))
+                    })?;
+                let metadata = from
+                    .metadata()
+                    .map_err(|e| NucleusError::ContextError(format!("Context stat: {e}")))?;
+                if !metadata.is_file() {
+                    warn!("Skipping non-regular context file {:?}", name);
+                    continue;
+                }
+                let mut file = tempfile::NamedTempFile::new_in(dst).map_err(|e| {
                     NucleusError::ContextError(format!(
-                        "Failed to copy {:?} to {:?}: {}",
-                        src_path, dst_path, e
+                        "Failed to create temp file in {:?}: {}",
+                        dst, e
                     ))
                 })?;
-            } else if metadata.is_symlink() {
+                std::io::copy(&mut from, &mut file)
+                    .map_err(|e| NucleusError::ContextError(format!("Context copy: {e}")))?;
+                file.as_file()
+                    .set_permissions(fs::Permissions::from_mode(
+                        metadata.permissions().mode() & 0o7777,
+                    ))
+                    .map_err(|e| NucleusError::ContextError(format!("Context chmod: {e}")))?;
+                file.persist(&dst_path).map_err(|e| {
+                    NucleusError::ContextError(format!("Context publish: {}", e.error))
+                })?;
+            } else if kind == nix::sys::stat::SFlag::S_IFLNK {
                 // Skip symlinks entirely to prevent link-based escapes or host path leakage.
-                warn!("Skipping symlink in context: {:?}", src_path);
+                warn!("Skipping symlink in context: {:?}", name);
+            } else {
+                debug!("Skipping special context file {:?}", name);
             }
         }
 
         Ok(())
     }
 
-    fn validate_recursive(&self, src: &Path, depth: u32) -> Result<()> {
+    /// Entry names of a pinned directory, excluding filtered names.
+    fn pinned_entry_names(
+        dir: &std::os::fd::OwnedFd,
+        depth: u32,
+    ) -> Result<Vec<std::ffi::OsString>> {
+        if depth > Self::MAX_RECURSION_DEPTH {
+            return Err(NucleusError::ContextError(format!(
+                "Maximum directory depth ({}) exceeded",
+                Self::MAX_RECURSION_DEPTH
+            )));
+        }
+        let mut names = Vec::new();
+        for entry in fs::read_dir(super::fd_path(dir))
+            .map_err(|e| NucleusError::ContextError(format!("Failed to read directory: {}", e)))?
+        {
+            let entry = entry
+                .map_err(|e| NucleusError::ContextError(format!("Failed to read entry: {e}")))?;
+            let name = entry.file_name();
+            if Self::should_exclude_name(&name) {
+                debug!("Skipping excluded file: {:?}", name);
+                continue;
+            }
+            names.push(name);
+        }
+        Ok(names)
+    }
+
+    fn validate_dir(src: &Path, depth: u32) -> Result<()> {
         for (src_path, _file_name, metadata) in Self::filtered_entries(src, depth)? {
             if metadata.is_symlink() {
                 return Err(NucleusError::ContextError(format!(
@@ -162,7 +264,7 @@ impl ContextPopulator {
             }
 
             if metadata.is_dir() {
-                self.validate_recursive(&src_path, depth + 1)?;
+                Self::validate_dir(&src_path, depth + 1)?;
             } else if !metadata.is_file() {
                 return Err(NucleusError::ContextError(format!(
                     "Bind-mounted contexts may not contain special files: {:?}",
