@@ -2527,8 +2527,8 @@ impl Container {
                 &self.config.name,
                 AuditEventType::SeccompApplied,
                 format!(
-                    "mode={:?} network={}",
-                    self.config.seccomp_mode, allow_network
+                    "mode={:?} network={} allow_jit={}",
+                    self.config.seccomp_mode, allow_network, self.config.seccomp_allow_jit
                 ),
             );
         } else if !allow_degraded_security {

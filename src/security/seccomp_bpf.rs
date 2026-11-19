@@ -591,7 +591,7 @@ mod tests {
         // coreutils cp probes FICLONE on every copy and falls back to a
         // read/write loop on EOPNOTSUPP; killing the probe terminated
         // ordinary file copies with SIGSYS.
-        let rules = crate::security::SeccompManager::minimal_filter_for_test(false, &[]);
+        let rules = crate::security::SeccompManager::minimal_filter_for_test(false, &[], false);
         let prog = compile_bitmap_bpf_with_errno_syscalls(
             rules,
             crate::security::SeccompManager::errno_denied_syscalls_for_test(),
@@ -706,7 +706,7 @@ mod tests {
 
     #[test]
     fn test_denied_syscall_cannot_match_mprotect_arg_predicate() {
-        let rules = crate::security::SeccompManager::minimal_filter_for_test(false, &[]);
+        let rules = crate::security::SeccompManager::minimal_filter_for_test(false, &[], false);
         assert!(
             !rules.contains_key(&libc::SYS_sendto),
             "sendto must be denied when networking is disabled"
@@ -759,7 +759,7 @@ mod tests {
             ]
         });
         std::fs::write(profile.path(), contents.to_string()).unwrap();
-        let program = SeccompManager::compile_profile(profile.path(), None).unwrap();
+        let program = SeccompManager::compile_profile(profile.path(), None, false).unwrap();
         let action = |flags: i32, stack| {
             bpf_eval(
                 &program,
@@ -815,7 +815,7 @@ mod tests {
     #[test]
     fn test_builtin_namespace_creation_returns_eperm() {
         // Nested sandboxes (bwrap, unshare -U) must see EPERM, not SIGSYS.
-        let rules = crate::security::SeccompManager::minimal_filter_for_test(false, &[]);
+        let rules = crate::security::SeccompManager::minimal_filter_for_test(false, &[], false);
         let prog = compile_bitmap_bpf_with_errno_syscalls(
             rules,
             crate::security::SeccompManager::errno_denied_syscalls_for_test(),
@@ -859,7 +859,7 @@ mod tests {
 
     #[test]
     fn test_builtin_clone3_returns_enosys() {
-        let rules = crate::security::SeccompManager::minimal_filter_for_test(true, &[]);
+        let rules = crate::security::SeccompManager::minimal_filter_for_test(true, &[], false);
         assert!(
             !rules.contains_key(&libc::SYS_clone3),
             "clone3 must not be in the unconditional allow bitmap"
@@ -882,7 +882,8 @@ mod tests {
     // The requests must preserve all argument checks and network-mode gates.
     fn network_and_futex_program(network: bool) -> BpfProgram {
         let extra = ["futex", "socket", "socketpair", "setsockopt"].map(String::from);
-        let rules = crate::security::SeccompManager::minimal_filter_for_test(network, &extra);
+        let rules =
+            crate::security::SeccompManager::minimal_filter_for_test(network, &extra, false);
         compile_bitmap_bpf(
             rules,
             SeccompAction::KillProcess,
@@ -997,7 +998,7 @@ mod tests {
 
     #[test]
     fn test_builtin_prctl_cap_ambient_only_allows_is_set() {
-        let rules = crate::security::SeccompManager::minimal_filter_for_test(true, &[]);
+        let rules = crate::security::SeccompManager::minimal_filter_for_test(true, &[], false);
         assert!(
             rules
                 .get(&libc::SYS_prctl)
@@ -1080,10 +1081,10 @@ mod tests {
             "kcmp",
         ]
         .map(String::from);
-        let gpu = SeccompManager::compile_builtin(false, &extra, true).unwrap();
+        let gpu = SeccompManager::compile_builtin(false, &extra, true, false).unwrap();
         let custom = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(custom.path(), r#"{"defaultAction":"SCMP_ACT_KILL_PROCESS","architectures":[],"syscalls":[{"names":["mmap","mprotect","pkey_mprotect","shmat","personality","prctl","ioctl","mknodat","kcmp"],"action":"SCMP_ACT_ALLOW"}]}"#).unwrap();
-        let profile = SeccompManager::compile_profile(custom.path(), None).unwrap();
+        let profile = SeccompManager::compile_profile(custom.path(), None, false).unwrap();
         for prog in [&gpu, &profile] {
             for nr in [libc::SYS_mmap, libc::SYS_mprotect, libc::SYS_pkey_mprotect] {
                 for (prot, expected) in [
@@ -1186,7 +1187,7 @@ mod tests {
             );
         }
         for network in [false, true] {
-            let default = SeccompManager::compile_builtin(network, &[], false).unwrap();
+            let default = SeccompManager::compile_builtin(network, &[], false, false).unwrap();
             for nr in [
                 libc::SYS_splice,
                 libc::SYS_tee,
@@ -1207,6 +1208,63 @@ mod tests {
     }
 
     #[test]
+    fn jit_allowance_permits_wx_mappings_and_survives_profiles() {
+        use crate::security::SeccompManager;
+        let action = |prog: &BpfProgram, nr: i64, args: [u64; 6]| {
+            bpf_eval(
+                prog,
+                &make_seccomp_data(
+                    nr as u32,
+                    arch_audit_value(std::env::consts::ARCH.try_into().unwrap()),
+                    args,
+                ),
+            )
+        };
+        let rwx = libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC;
+        let jit = SeccompManager::compile_builtin(true, &[], false, true).unwrap();
+        let strict = SeccompManager::compile_builtin(true, &[], false, false).unwrap();
+
+        // V8 manages its code range through mprotect/pkey_mprotect and maps
+        // RWX during startup; the allowance keeps those calls alive instead
+        // of SIGSYS (#46).
+        for nr in [libc::SYS_mmap, libc::SYS_mprotect, libc::SYS_pkey_mprotect] {
+            assert_eq!(action(&jit, nr, [0, 4096, rwx as u64, 0, 0, 0]), RET_ALLOW);
+            assert_eq!(
+                action(&strict, nr, [0, 4096, rwx as u64, 0, 0, 0]),
+                RET_KILL
+            );
+        }
+        // The allowance grants no other memory escape hatch.
+        assert_eq!(
+            action(
+                &jit,
+                libc::SYS_shmat,
+                [0, 0, libc::SHM_EXEC as u64, 0, 0, 0]
+            ),
+            RET_KILL
+        );
+        assert_eq!(action(&jit, libc::SYS_memfd_create, [0; 6]), RET_KILL);
+
+        // The same relaxation reaches custom profiles: with the allowance a
+        // listed mprotect stays unconditional, without it the built-in W^X
+        // argument filters are merged in (SEC-01).
+        let custom = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(custom.path(), r#"{"defaultAction":"SCMP_ACT_KILL_PROCESS","architectures":[],"syscalls":[{"names":["mmap","mprotect"],"action":"SCMP_ACT_ALLOW"}]}"#).unwrap();
+        let profile_jit = SeccompManager::compile_profile(custom.path(), None, true).unwrap();
+        let profile_strict = SeccompManager::compile_profile(custom.path(), None, false).unwrap();
+        for nr in [libc::SYS_mmap, libc::SYS_mprotect] {
+            assert_eq!(
+                action(&profile_jit, nr, [0, 4096, rwx as u64, 0, 0, 0]),
+                RET_ALLOW
+            );
+            assert_eq!(
+                action(&profile_strict, nr, [0, 4096, rwx as u64, 0, 0, 0]),
+                RET_KILL
+            );
+        }
+    }
+
+    #[test]
     fn setsockopt_level_allowlist_and_msg_oob_survive_compilation() {
         use crate::security::SeccompManager;
         let action = |prog: &BpfProgram, nr: i64, args: [u64; 6]| {
@@ -1219,7 +1277,7 @@ mod tests {
                 ),
             )
         };
-        let network = SeccompManager::compile_builtin(true, &[], false).unwrap();
+        let network = SeccompManager::compile_builtin(true, &[], false, false).unwrap();
         let setsockopt = |level: i64, option: i64| {
             action(
                 &network,
@@ -1284,14 +1342,14 @@ mod tests {
         }
 
         // Without network mode the filtered network syscalls stay denied.
-        let offline = SeccompManager::compile_builtin(false, &[], false).unwrap();
+        let offline = SeccompManager::compile_builtin(false, &[], false, false).unwrap();
         assert_eq!(action(&offline, libc::SYS_setsockopt, [0; 6]), RET_KILL);
         assert_eq!(action(&offline, libc::SYS_sendto, [0; 6]), RET_KILL);
     }
 
     #[test]
     fn test_builtin_prctl_denies_pr_set_mm_before_capability_checks() {
-        let rules = crate::security::SeccompManager::minimal_filter_for_test(true, &[]);
+        let rules = crate::security::SeccompManager::minimal_filter_for_test(true, &[], false);
         let prog = compile_bitmap_bpf_with_errno_syscalls(
             rules,
             crate::security::SeccompManager::errno_denied_syscalls_for_test(),
@@ -1321,7 +1379,7 @@ mod tests {
 
     #[test]
     fn test_builtin_ioctl_allows_tcgets2_for_shell_terminal_probe() {
-        let rules = crate::security::SeccompManager::minimal_filter_for_test(true, &[]);
+        let rules = crate::security::SeccompManager::minimal_filter_for_test(true, &[], false);
         let prog = compile_bitmap_bpf_with_errno_syscalls(
             rules,
             crate::security::SeccompManager::errno_denied_syscalls_for_test(),
@@ -1348,7 +1406,7 @@ mod tests {
 
     #[test]
     fn test_preadv2_pwritev2_deny_nonzero_flags() {
-        let rules = crate::security::SeccompManager::minimal_filter_for_test(true, &[]);
+        let rules = crate::security::SeccompManager::minimal_filter_for_test(true, &[], false);
         for syscall in [libc::SYS_preadv2, libc::SYS_pwritev2] {
             assert!(
                 rules.get(&syscall).is_some_and(|chain| !chain.is_empty()),
@@ -1430,7 +1488,7 @@ mod tests {
         // the same result as seccompiler's linear-scan BPF for many syscalls.
         use seccompiler::SeccompFilter;
 
-        let rules = crate::security::SeccompManager::minimal_filter_for_test(true, &[]);
+        let rules = crate::security::SeccompManager::minimal_filter_for_test(true, &[], false);
         let rules2 = rules.clone();
 
         // Linear-scan BPF (seccompiler)
@@ -1498,7 +1556,7 @@ mod tests {
 
     #[test]
     fn test_program_size_is_compact() {
-        let rules = crate::security::SeccompManager::minimal_filter_for_test(true, &[]);
+        let rules = crate::security::SeccompManager::minimal_filter_for_test(true, &[], false);
         let prog = compile_bitmap_bpf(
             rules,
             SeccompAction::KillProcess,
@@ -1561,7 +1619,7 @@ mod tests {
 
     #[test]
     fn test_all_jump_offsets_valid() {
-        let rules = crate::security::SeccompManager::minimal_filter_for_test(true, &[]);
+        let rules = crate::security::SeccompManager::minimal_filter_for_test(true, &[], false);
         let prog = compile_bitmap_bpf(
             rules,
             SeccompAction::KillProcess,

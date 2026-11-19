@@ -341,6 +341,11 @@ pub struct SecurityEventMetadata {
     pub capabilities_status: String,
     pub rootless: bool,
     pub allow_degraded_security: bool,
+    /// Whether the launch requested the JIT allowance (`--allow-jit`), i.e.
+    /// the installed native seccomp filter permits write+execute mappings.
+    /// Callers attesting the reported posture treat this bit like
+    /// `allow_degraded_security`: an explicit weakening they must expect.
+    pub allow_jit: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gpu: Option<GpuEventSummary>,
 }
@@ -398,6 +403,7 @@ impl SecurityEventMetadata {
             seccomp_status: unobserved.into(),
             rootless: config.user_ns_config.is_some(),
             allow_degraded_security: config.allow_degraded_security,
+            allow_jit: config.seccomp_allow_jit,
             gpu,
         }
     }
@@ -537,6 +543,7 @@ mod tests {
         assert_eq!(value["security"]["seccomp_mode"], "enforce");
         assert_eq!(value["security"]["landlock_status"], "unknown");
         assert_eq!(value["security"]["capabilities_status"], "unknown");
+        assert_eq!(value["security"]["allow_jit"], false);
         assert!(value.get("resource_limits").is_some());
     }
 }

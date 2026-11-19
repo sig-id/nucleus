@@ -870,6 +870,16 @@ pub struct ContainerConfig {
     /// These are merged into the built-in filter; they do NOT replace it.
     pub seccomp_allow_syscalls: Vec<String>,
 
+    /// Per-launch JIT allowance (`--allow-jit`): permit mappings that are
+    /// writable and executable at the same time (`mmap`, `mprotect`,
+    /// `pkey_mprotect`) in the native seccomp filter, so JIT runtimes such
+    /// as V8/Node, the JVM, PyPy, LuaJIT and .NET can run under strict
+    /// isolation. W^X stays the default; the allowance is recorded in the
+    /// audit log and reported in the `container_started` event so callers
+    /// can attest it. Executable SysV shared memory (`shmat` with
+    /// `SHM_EXEC`) stays denied.
+    pub seccomp_allow_jit: bool,
+
     /// Path to capability policy file (TOML).
     pub caps_policy: Option<PathBuf>,
 
@@ -1027,6 +1037,7 @@ impl ContainerConfig {
             seccomp_mode: SeccompMode::default(),
             seccomp_trace_log: None,
             seccomp_allow_syscalls: Vec::new(),
+            seccomp_allow_jit: false,
             caps_policy: None,
             caps_policy_sha256: None,
             landlock_policy: None,
@@ -1459,6 +1470,12 @@ impl ContainerConfig {
     #[must_use]
     pub fn with_seccomp_allow_syscalls(mut self, syscalls: Vec<String>) -> Self {
         self.seccomp_allow_syscalls = syscalls;
+        self
+    }
+
+    #[must_use]
+    pub fn with_seccomp_allow_jit(mut self, allow_jit: bool) -> Self {
+        self.seccomp_allow_jit = allow_jit;
         self
     }
 
@@ -1968,6 +1985,12 @@ impl ContainerConfig {
             return Err(crate::error::NucleusError::ConfigError(
                 "gVisor runtime does not support --seccomp-allow; use a custom --seccomp-profile or --runtime native"
                     .to_string(),
+            ));
+        }
+
+        if self.seccomp_allow_jit {
+            return Err(crate::error::NucleusError::ConfigError(
+                "gVisor runtime does not support --allow-jit; use --runtime native".to_string(),
             ));
         }
 
@@ -2939,6 +2962,34 @@ mod tests {
 
         let err = cfg.validate_runtime_support().unwrap_err();
         assert!(err.to_string().contains("seccomp-allow"));
+    }
+
+    #[test]
+    fn test_gvisor_rejects_jit_allowance() {
+        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
+            .with_seccomp_allow_jit(true);
+
+        let err = cfg.validate_runtime_support().unwrap_err();
+        assert!(err.to_string().contains("--allow-jit"));
+    }
+
+    #[test]
+    fn test_jit_allowance_is_off_by_default_and_survives_strict_agent() {
+        use crate::container::ServiceMode;
+        let base = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
+            .with_gvisor(false);
+        assert!(!base.seccomp_allow_jit);
+        let jit = base.with_seccomp_allow_jit(true);
+        assert!(jit.seccomp_allow_jit);
+        // The allowance is a per-launch opt-in that strict-agent launches
+        // (JIT-based agent harnesses) must be able to make (#46).
+        jit.clone()
+            .with_service_mode(ServiceMode::StrictAgent)
+            .validate_strict_agent_mode()
+            .unwrap();
+        jit.validate_runtime_support().unwrap();
     }
 
     #[test]
