@@ -946,7 +946,9 @@ impl Container {
                 if config.service_mode.requires_cgroup_enforcement() {
                     return Err(NucleusError::CgroupError(format!(
                         "{} requires cgroup resource enforcement, but \
-                         cgroup creation failed: {}",
+                         cgroup creation failed: {}. Without root, run Nucleus in a \
+                         systemd unit with Delegate= or set NUCLEUS_CGROUP_ROOT to a \
+                         cgroup delegated to this user",
                         config.service_mode.label(),
                         e
                     )));

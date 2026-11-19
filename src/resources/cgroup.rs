@@ -25,6 +25,8 @@ const CGROUP_CLEANUP_RETRIES: usize = 50;
 const CGROUP_CLEANUP_SLEEP: Duration = Duration::from_millis(20);
 const CGROUP_FREEZE_RETRIES: usize = 100;
 const CGROUP_FREEZE_SLEEP: Duration = Duration::from_millis(10);
+/// Upper bound on asking the systemd user manager about a unit.
+const SYSTEMD_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Cgroup v2 manager
 ///
@@ -133,8 +135,10 @@ impl Cgroup {
     ///
     /// Ownership alone does not identify one: every cgroup below a systemd
     /// user manager is owned by the user, yet belongs to that manager. The
-    /// manager marks the boundary of a `Delegate=` unit with a `delegate`
-    /// extended attribute, so only a marked cgroup is treated as ours.
+    /// system manager marks the boundary of a `Delegate=` unit with a
+    /// `delegate` extended attribute. The user manager sets no marker, so for
+    /// a unit below `user@<uid>.service` its `Delegate` property is read from
+    /// the manager instead.
     ///
     /// Two layouts are recognised: this process sits directly in the
     /// delegated cgroup, or in a direct child of it (`DelegateSubgroup=`, the
@@ -163,13 +167,124 @@ impl Cgroup {
     }
 
     fn is_delegated_to_caller(path: &Path) -> bool {
-        let marked = ["user.delegate", "trusted.delegate"]
+        let writable = [
+            path.to_path_buf(),
+            path.join("cgroup.subtree_control"),
+            path.join("cgroup.procs"),
+        ]
+        .iter()
+        .all(|needed| nix::unistd::access(needed, nix::unistd::AccessFlags::W_OK).is_ok());
+        writable
+            && (Self::is_marked_delegated(path)
+                || Self::user_manager_unit(
+                    path,
+                    Path::new(CGROUP_V2_ROOT),
+                    nix::unistd::geteuid().as_raw(),
+                    Self::is_marked_delegated,
+                )
+                .is_some_and(|unit| Self::user_manager_delegates(&unit, path)))
+    }
+
+    fn is_marked_delegated(path: &Path) -> bool {
+        ["user.delegate", "trusted.delegate"]
             .iter()
-            .any(|name| Self::read_xattr(path, name).as_deref() == Some(b"1".as_slice()));
-        marked
-            && [path.to_path_buf(), path.join("cgroup.subtree_control")]
-                .iter()
-                .all(|needed| nix::unistd::access(needed, nix::unistd::AccessFlags::W_OK).is_ok())
+            .any(|name| Self::read_xattr(path, name).as_deref() == Some(b"1".as_slice()))
+    }
+
+    /// The unit name of `path` when it is a service or scope of this user's
+    /// systemd manager: below a `user@<uid>.service` the system manager
+    /// marked as delegated to `uid`.
+    fn user_manager_unit(
+        path: &Path,
+        mount: &Path,
+        uid: u32,
+        is_marked: impl Fn(&Path) -> bool,
+    ) -> Option<String> {
+        let unit = path.file_name()?.to_str()?;
+        if !(unit.ends_with(".service") || unit.ends_with(".scope")) {
+            return None;
+        }
+        let manager = format!("user@{uid}.service");
+        path.ancestors()
+            .skip(1)
+            .take_while(|ancestor| ancestor.starts_with(mount) && *ancestor != mount)
+            .find(|ancestor| ancestor.file_name().and_then(|n| n.to_str()) == Some(&manager))
+            .filter(|ancestor| is_marked(ancestor))
+            .map(|_| unit.to_string())
+    }
+
+    /// Ask this user's systemd manager whether `unit` is a `Delegate=` unit
+    /// whose cgroup is `path`.
+    fn user_manager_delegates(unit: &str, path: &Path) -> bool {
+        let Ok(relative) = path.strip_prefix(CGROUP_V2_ROOT) else {
+            return false;
+        };
+        let mut command = std::process::Command::new("systemctl");
+        command
+            .args([
+                "--user",
+                "show",
+                "--property=Delegate,ControlGroup",
+                "--",
+                unit,
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        if std::env::var_os("XDG_RUNTIME_DIR").is_none() {
+            command.env(
+                "XDG_RUNTIME_DIR",
+                format!("/run/user/{}", nix::unistd::geteuid().as_raw()),
+            );
+        }
+        let output = match Self::output_within(command, SYSTEMD_QUERY_TIMEOUT) {
+            Ok(output) if output.status.success() => output,
+            Ok(output) => {
+                debug!("systemctl --user show {unit} failed: {}", output.status);
+                return false;
+            }
+            Err(e) => {
+                debug!("Cannot query the systemd user manager for {unit}: {e}");
+                return false;
+            }
+        };
+        let delegated = Self::parse_unit_delegation(
+            &String::from_utf8_lossy(&output.stdout),
+            &Path::new("/").join(relative),
+        );
+        debug!("systemd user manager reports {unit} delegated: {delegated}");
+        delegated
+    }
+
+    /// Run `command`, killing it if it has not exited within `timeout`.
+    fn output_within(
+        mut command: std::process::Command,
+        timeout: Duration,
+    ) -> std::io::Result<std::process::Output> {
+        let mut child = command.spawn()?;
+        let deadline = std::time::Instant::now() + timeout;
+        while child.try_wait()?.is_none() {
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "systemctl did not answer",
+                ));
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        child.wait_with_output()
+    }
+
+    /// `systemctl show` output names a delegated unit whose cgroup is `cgroup`.
+    fn parse_unit_delegation(output: &str, cgroup: &Path) -> bool {
+        let value = |key: &str| {
+            output
+                .lines()
+                .find_map(|line| line.strip_prefix(key)?.strip_prefix('='))
+        };
+        value("Delegate") == Some("yes") && value("ControlGroup").map(Path::new) == Some(cgroup)
     }
 
     fn read_xattr(path: &Path, name: &str) -> Option<Vec<u8>> {
@@ -934,6 +1049,48 @@ mod tests {
             Some(mount.join("top"))
         );
         assert_eq!(Cgroup::delegated_root_for(mount, mount, |_| true), None);
+    }
+
+    #[test]
+    fn user_manager_units_are_found_below_the_marked_manager() {
+        let mount = Path::new("/sys/fs/cgroup");
+        let manager = mount.join("user.slice/user-1000.slice/user@1000.service");
+        let marked = |target: PathBuf| move |candidate: &Path| candidate == target;
+        let unit =
+            |path: &Path, uid| Cgroup::user_manager_unit(path, mount, uid, marked(manager.clone()));
+
+        let scope = manager.join("app.slice/run-p1-i2.scope");
+        assert_eq!(unit(&scope, 1000).as_deref(), Some("run-p1-i2.scope"));
+        let service = manager.join("app.slice/mitos.service");
+        assert_eq!(unit(&service, 1000).as_deref(), Some("mitos.service"));
+        // A DelegateSubgroup= child and slices are not units.
+        assert_eq!(unit(&service.join("sup"), 1000), None);
+        assert_eq!(unit(&manager.join("app.slice"), 1000), None);
+        // Another user's manager, or an unmarked one, is not ours to ask.
+        assert_eq!(unit(&scope, 1001), None);
+        assert_eq!(
+            Cgroup::user_manager_unit(&scope, mount, 1000, |_| false),
+            None
+        );
+        // System units are covered by the system manager's marker.
+        assert_eq!(unit(&mount.join("system.slice/mitos.service"), 1000), None);
+    }
+
+    #[test]
+    fn unit_delegation_requires_delegate_and_matching_cgroup() {
+        let cgroup = Path::new("/user.slice/user-1000.slice/user@1000.service/app.slice/x.scope");
+        let show = |delegate: &str, group: &str| {
+            Cgroup::parse_unit_delegation(
+                &format!("Delegate={delegate}\nControlGroup={group}\n"),
+                cgroup,
+            )
+        };
+        assert!(show("yes", cgroup.to_str().unwrap()));
+        assert!(!show("no", cgroup.to_str().unwrap()));
+        // A unit of that name elsewhere does not delegate this cgroup.
+        assert!(!show("yes", "/user.slice/other.scope"));
+        assert!(!show("yes", ""));
+        assert!(!Cgroup::parse_unit_delegation("", cgroup));
     }
 
     #[test]
