@@ -382,10 +382,16 @@
             version = crateVersion;
           };
 
+          # CI (ci.yml) runs `cargo deny check advisories bans sources`, but the
+          # Nix sandbox has no network or git to fetch the advisory database;
+          # advisories are covered by my-crate-audit with the locked advisory-db
+          # input (as CI does with a separate cargo audit). licenses are
+          # deliberately unchecked: deny.toml carries no allow list.
           my-crate-deny = craneLib.cargoDeny {
             inherit src;
             pname = "nucleus";
             version = crateVersion;
+            cargoDenyChecks = "bans sources";
           };
 
           my-crate-nextest = craneLib.cargoNextest (commonArgs // {
