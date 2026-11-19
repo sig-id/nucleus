@@ -14,7 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   like the OCI exec FIFO; the workload execs only when the byte arrives, so
   an orchestrator can verify the reported posture first. On EOF without a
   byte the container is torn down and Nucleus exits non-zero without running
-  the workload (#42).
+  the workload. A `SIGTERM` to the supervisor while the workload is held
+  cancels the hold and tears down the same way (exit status 143), so a held
+  container is never unkillable (#42).
 - `--broker-proxy-listen 127.0.0.1:PORT` (launch config `broker_proxy_listen`)
   runs the broker forwarder in the supervisor. The container init binds the
   listener in its network namespace and hands it over with `SCM_RIGHTS`; the
@@ -28,6 +30,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `oom`, `oom_kill`) so callers can tell a memory failure from other exits.
 
 ### Fixed
+- `SIGTERM` to a foreground `nucleus run` supervisor killed the supervisor
+  outright instead of being forwarded: glibc's `sigwait` unblocks the waited
+  signal set in the calling thread, so the forwarding thread became the one
+  thread where the signal's default disposition ran. The forwarded-signal
+  set is now blocked before the first helper thread is spawned (every
+  thread inherits the mask) and consumed with `sigtimedwait`, which never
+  touches the mask. `SIGTERM` now reaches the container's init, which can
+  shut the workload down gracefully; a workload that is PID 1 of its PID
+  namespace and installs no handler still ignores it (as with any OCI
+  runtime) — use `SIGKILL` for a guaranteed teardown.
 - `--memory` no longer sets `memory.high` to 90% of the limit. With swap
   disabled that throttled a runaway workload just below the limit almost
   indefinitely; it is now OOM-killed at `memory.max` (#37).

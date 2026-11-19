@@ -504,6 +504,39 @@ mod tests {
         }
     }
 
+    #[test]
+    fn start_gate_sigterm_cancels_the_hold_and_tears_down() {
+        let state = tempfile::tempdir().unwrap();
+        let mut launch = spawn_gated("echo WORKLOAD-RAN; exit 7", state.path());
+
+        wait_for_event(&mut launch, "container_started");
+
+        // The orchestrator vanishes without touching the gate; the
+        // supervisor's shutdown signal must cancel the hold (a PID-namespace
+        // init ignores default-terminating signals, so plain forwarding is
+        // not enough) and tear the container down in an orderly way.
+        unsafe {
+            libc::kill(launch.child.id() as libc::pid_t, libc::SIGTERM);
+        }
+
+        let output = launch.child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(143));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !stdout.contains("WORKLOAD-RAN"),
+            "the workload must not run when the hold is cancelled: {stdout}"
+        );
+
+        // The cancellation goes through the normal teardown path, so the
+        // summary reports exit status 143 instead of the supervisor dying.
+        let events = event_records(&launch.events_path);
+        let summary = events
+            .iter()
+            .find(|event| event["type"] == "container_summary")
+            .expect("container_summary after the cancelled hold");
+        assert_eq!(summary["exit_status"]["code"], 143);
+    }
+
     fn event_records(path: &std::path::Path) -> Vec<serde_json::Value> {
         std::fs::read_to_string(path)
             .unwrap()

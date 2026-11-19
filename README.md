@@ -310,29 +310,41 @@ only when the byte arrives, so an orchestrator can verify the reported
 posture (security status, limits, cgroup, mounts) before the workload's first
 instruction. If the descriptor reaches EOF instead, Nucleus tears the
 container down and exits non-zero without running the workload; the
-`container_summary` event carries a `Start gate closed` error. The gate works
-with `--config-fd`/`--events-fd`, must not share a descriptor with
-`--events-fd`, and is not available with `--detach`.
+`container_summary` event carries a `Start gate closed` error. A `SIGTERM`
+to the supervisor while the workload is held cancels the hold and tears the
+container down the same way (exit status 143). The gate must not share a
+descriptor with `--events-fd` and is not available with `--detach`. With
+`--config-fd` the gate belongs in the launch document (`"start_fd": 4`),
+since the document owns the whole request:
 
 ```bash
 mkfifo gate
-exec 9<>gate   # hold the gate open read-write; a bare 4<gate would block
-nucleus --events-fd 5 run --start-fd 4 --config-fd 3 \
-  3<request.json 5>events.jsonl 4<&9 &
+exec 9<>gate   # holder: a writer now exists, so the read-only open returns
+exec 4<gate    # the read-only end Nucleus inherits (9 is rw; it would never EOF)
+nucleus --events-fd 5 run --config-fd 3 \
+  3<request.json 5>events.jsonl 4<&4 9>&- &
 # ... read container_started from events.jsonl, verify the posture ...
 printf go >&9                     # release the workload
-# refuse instead with: exec 9>&- (EOF, no byte)
+# refuse instead with: exec 9>&-  (EOF, no byte)
 ```
 
-The gate descriptor should be the read end of a pipe (or an equivalent
+The gate descriptor should be a read-only pipe end (or an equivalent
 one-byte readable descriptor); it must be greater than 2 and is inherited by
-the container's init, which closes it before exec'ing the workload.
+the container's init, which closes it before exec'ing the workload. A
+descriptor that also carries a write end into Nucleus (an `<>` open) can
+never reach EOF, so refusals would hang — keep the writer only on the
+orchestrator side.
 
 **No orphans.** The container dies with its supervisor. Every setup process
 arms a parent-death signal, so killing only the `nucleus` process (SIGKILL, OOM)
 takes the container's init, and with it the PID namespace or the gVisor
 sandbox, down too. When the container has a cgroup, a small detached reaper
-kills and removes that cgroup once the supervisor is gone.
+kills and removes that cgroup once the supervisor is gone. `SIGTERM`, in
+contrast, is forwarded to the container's init (the workload, or the
+production mini-init) so it can shut down gracefully; as with any OCI
+runtime, a workload that is PID 1 of its PID namespace and installs no
+handler ignores it — use `SIGKILL` (or `nucleus stop`/`nucleus kill`) for a
+guaranteed teardown.
 
 **Caller-owned volumes.** `--volume` refuses every source under `/home`, `/tmp`,
 `/run` and `/var/lib`. Add the `caller-owned` option to mount a directory you
