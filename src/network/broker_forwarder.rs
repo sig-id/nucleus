@@ -206,73 +206,123 @@ fn accept_loop(
             warn!("Broker forwarder at {MAX_CONNECTIONS} connections; refusing one");
             continue;
         }
-        let upstream = match UnixStream::connect(&target) {
+        let upstream = match connect_without_waiting(&target) {
             Ok(upstream) => upstream,
             Err(e) => {
                 warn!("Cannot connect to broker socket {host_path:?}: {e}");
                 continue;
             }
         };
-        if let Err(e) = relay(client, upstream, shared) {
+        if let Err(e) = relay(client, upstream, shared, spawn_thread) {
             warn!("Broker forwarder cannot relay a connection: {e}");
         }
     }
+}
+
+/// Connect to the broker without blocking. A unix-socket connect only waits
+/// when the broker's backlog is full; that now fails with `EAGAIN` and the
+/// one connection is refused, so the accept loop stays responsive to
+/// shutdown.
+fn connect_without_waiting(target: &str) -> std::io::Result<UnixStream> {
+    use nix::sys::socket::{connect, socket, AddressFamily, SockFlag, SockType, UnixAddr};
+    let fd = socket(
+        AddressFamily::Unix,
+        SockType::Stream,
+        SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC,
+        None,
+    )?;
+    connect(fd.as_raw_fd(), &UnixAddr::new(target)?)?;
+    let stream = UnixStream::from(fd);
+    stream.set_nonblocking(false)?;
+    Ok(stream)
+}
+
+type Spawn = fn(&'static str, Box<dyn FnOnce() + Send>) -> std::io::Result<JoinHandle<()>>;
+
+fn spawn_thread(
+    name: &'static str,
+    body: Box<dyn FnOnce() + Send>,
+) -> std::io::Result<JoinHandle<()>> {
+    thread::Builder::new().name(name.into()).spawn(body)
 }
 
 /// Copy both directions of one connection on two threads, propagating
 /// half-closes so request/response protocols see end-of-file. The slot and
 /// the registered descriptors are released when both directions are done,
 /// including when a thread cannot be started.
-fn relay(client: TcpStream, upstream: UnixStream, shared: &Arc<Shared>) -> std::io::Result<()> {
+///
+/// The connection mutex is never held while a thread is spawned or a
+/// `Slot` may be dropped: `Slot::drop` takes it.
+fn relay(
+    client: TcpStream,
+    upstream: UnixStream,
+    shared: &Arc<Shared>,
+    spawn: Spawn,
+) -> std::io::Result<()> {
     let handles = (client.try_clone()?, upstream.try_clone()?);
     let (up_from, up_to) = (client.try_clone()?, upstream.try_clone()?);
-    let mut conns = shared
-        .conns
-        .lock()
-        .map_err(|_| std::io::Error::other("broker forwarder state poisoned"))?;
-    let id = conns.next_id;
-    conns.next_id += 1;
-    conns.open.insert(id, handles);
-    conns.threads.retain(|thread| !thread.is_finished());
+    let id = {
+        let mut conns = shared
+            .conns
+            .lock()
+            .map_err(|_| std::io::Error::other("broker forwarder state poisoned"))?;
+        let id = conns.next_id;
+        conns.next_id += 1;
+        conns.open.insert(id, handles);
+        conns.threads.retain(|thread| !thread.is_finished());
+        id
+    };
     let slot = Arc::new(Slot {
         shared: shared.clone(),
         id,
     });
+    // Unblocks a started direction so it finishes and drops its slot share.
+    let abort = |shared: &Shared| {
+        if let Ok(conns) = shared.conns.lock() {
+            if let Some((client, upstream)) = conns.open.get(&id) {
+                let _ = client.shutdown(Shutdown::Both);
+                let _ = upstream.shutdown(Shutdown::Both);
+            }
+        }
+    };
 
     let up_slot = slot.clone();
-    let up = thread::Builder::new()
-        .name("broker-up".into())
-        .spawn(move || {
+    // On failure the closure, with its slot share and descriptors, is
+    // dropped inside `spawn`; `slot` drops when this returns.
+    let up = spawn(
+        "broker-up",
+        Box::new(move || {
             let _slot = up_slot;
             let (mut from, mut to) = (up_from, up_to);
             let _ = std::io::copy(&mut from, &mut to);
             let _ = to.shutdown(Shutdown::Write);
-        });
-    // On failure the closure, its slot clone and its descriptors are dropped.
-    conns.threads.push(up?);
-    let down = thread::Builder::new()
-        .name("broker-down".into())
-        .spawn(move || {
+        }),
+    )?;
+    let down = spawn(
+        "broker-down",
+        Box::new(move || {
             let _slot = slot;
             let (mut from, mut to) = (upstream, client);
             let _ = std::io::copy(&mut from, &mut to);
             let _ = to.shutdown(Shutdown::Write);
             debug!("Broker connection direction closed");
-        });
-    match down {
+        }),
+    );
+    let mut started = vec![up];
+    let result = match down {
         Ok(down) => {
-            conns.threads.push(down);
+            started.push(down);
             Ok(())
         }
         Err(e) => {
-            // Unblock the upload thread so it releases the slot.
-            if let Some((client, upstream)) = conns.open.get(&id) {
-                let _ = client.shutdown(Shutdown::Both);
-                let _ = upstream.shutdown(Shutdown::Both);
-            }
+            abort(shared);
             Err(e)
         }
+    };
+    if let Ok(mut conns) = shared.conns.lock() {
+        conns.threads.extend(started);
     }
+    result
 }
 
 #[cfg(test)]
@@ -372,6 +422,88 @@ mod tests {
         assert_eq!(threads.strong_count(), 0);
         assert!(TcpStream::connect(addr).is_err());
         drop((clients, conns));
+    }
+
+    fn connected_pair(
+        broker: &std::os::unix::net::UnixListener,
+        socket_path: &std::path::Path,
+    ) -> (TcpStream, UnixStream, UnixStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (accepted, _) = listener.accept().unwrap();
+        let upstream = UnixStream::connect(socket_path).unwrap();
+        let (broker_end, _) = broker.accept().unwrap();
+        drop(client);
+        (accepted, upstream, broker_end)
+    }
+
+    fn fresh_shared() -> Arc<Shared> {
+        Arc::new(Shared {
+            stopping: AtomicBool::new(false),
+            conns: Mutex::new(Conns::default()),
+        })
+    }
+
+    #[test]
+    fn failed_thread_spawns_release_the_slot_without_deadlock() {
+        fn fail_all(
+            _: &'static str,
+            _: Box<dyn FnOnce() + Send>,
+        ) -> std::io::Result<JoinHandle<()>> {
+            Err(std::io::Error::other("no threads"))
+        }
+        fn fail_second(
+            name: &'static str,
+            body: Box<dyn FnOnce() + Send>,
+        ) -> std::io::Result<JoinHandle<()>> {
+            if name == "broker-down" {
+                return Err(std::io::Error::other("no threads"));
+            }
+            spawn_thread(name, body)
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("broker.sock");
+        let broker = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+
+        for spawn in [fail_all as Spawn, fail_second as Spawn] {
+            let shared = fresh_shared();
+            let (client, upstream, _broker_end) = connected_pair(&broker, &socket_path);
+            // Returns instead of deadlocking on the connection mutex.
+            assert!(relay(client, upstream, &shared, spawn).is_err());
+            assert!(wait_until(|| shared.conns.lock().unwrap().open.is_empty()));
+        }
+    }
+
+    #[test]
+    fn connect_refuses_instead_of_waiting_on_a_full_backlog() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("broker.sock");
+        // A listener that never accepts, with the smallest backlog.
+        let fd = nix::sys::socket::socket(
+            nix::sys::socket::AddressFamily::Unix,
+            nix::sys::socket::SockType::Stream,
+            nix::sys::socket::SockFlag::SOCK_CLOEXEC,
+            None,
+        )
+        .unwrap();
+        nix::sys::socket::bind(
+            fd.as_raw_fd(),
+            &nix::sys::socket::UnixAddr::new(&socket_path).unwrap(),
+        )
+        .unwrap();
+        nix::sys::socket::listen(&fd, nix::sys::socket::Backlog::new(0).unwrap()).unwrap();
+        let target = socket_path.to_str().unwrap();
+        let mut held = Vec::new();
+        let start = std::time::Instant::now();
+        let refused = loop {
+            match connect_without_waiting(target) {
+                Ok(stream) => held.push(stream),
+                Err(e) => break e,
+            }
+            assert!(held.len() < 64, "backlog never filled");
+        };
+        assert_eq!(refused.raw_os_error(), Some(libc::EAGAIN));
+        assert!(start.elapsed() < Duration::from_secs(1));
     }
 
     #[test]
