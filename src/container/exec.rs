@@ -213,10 +213,9 @@ impl Container {
                     debug!("Blocking dangerous GPU environment variable: {}", key);
                     continue;
                 }
-                env.push(
-                    CString::new(format!("{}={}", key, value))
-                        .map_err(|e| NucleusError::ExecError(format!("Invalid GPU env {}: {}", key, e)))?,
-                );
+                env.push(CString::new(format!("{}={}", key, value)).map_err(|e| {
+                    NucleusError::ExecError(format!("Invalid GPU env {}: {}", key, e))
+                })?);
             }
         }
 

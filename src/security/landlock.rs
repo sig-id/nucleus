@@ -363,7 +363,10 @@ impl LandlockManager {
                 && stat.st_rdev == makedev(1, 3)
             {
                 ruleset = ruleset
-                    .add_rule(PathBeneath::new(fd, AccessFs::WriteFile | AccessFs::Truncate))
+                    .add_rule(PathBeneath::new(
+                        fd,
+                        AccessFs::WriteFile | AccessFs::Truncate,
+                    ))
                     .map_err(ll_err)?;
             }
         }

@@ -582,7 +582,10 @@ fn requested_nonzero_workload_uid(user: Option<&str>) -> Option<u32> {
     }
     // Named user: resolve via libc; otherwise treat as unknown and let keep-id
     // apply (it maps the caller's own uid regardless of the requested name).
-    nix::unistd::User::from_name(spec).ok().flatten().map(|u| u.uid.as_raw())
+    nix::unistd::User::from_name(spec)
+        .ok()
+        .flatten()
+        .map(|u| u.uid.as_raw())
 }
 
 fn exit_code_from_i32(code: i32) -> ExitCode {
@@ -2657,10 +2660,12 @@ fn try_main() -> Result<i32> {
                 let gpu_config = GpuPassthroughConfig {
                     vendor: gpu.unwrap_or_default(),
                     devices,
-                    driver_capabilities: gpu_driver_capabilities
-                        .unwrap_or_else(|| nucleus::container::DEFAULT_GPU_DRIVER_CAPABILITIES.to_string()),
-                    visible_devices: gpu_visible_devices
-                        .unwrap_or_else(|| nucleus::container::DEFAULT_GPU_VISIBLE_DEVICES.to_string()),
+                    driver_capabilities: gpu_driver_capabilities.unwrap_or_else(|| {
+                        nucleus::container::DEFAULT_GPU_DRIVER_CAPABILITIES.to_string()
+                    }),
+                    visible_devices: gpu_visible_devices.unwrap_or_else(|| {
+                        nucleus::container::DEFAULT_GPU_VISIBLE_DEVICES.to_string()
+                    }),
                     bind_driver_libraries: !no_gpu_driver_libs,
                 };
                 config = config.with_gpu(gpu_config);
@@ -2730,13 +2735,7 @@ fn try_main() -> Result<i32> {
                 } else {
                     info!("Enabling rootless mode");
                 }
-                config = apply_userns(
-                    config,
-                    userns,
-                    &uidmap,
-                    &gidmap,
-                    user.as_deref(),
-                )?;
+                config = apply_userns(config, userns, &uidmap, &gidmap, user.as_deref())?;
             }
 
             if let Some(identity) =

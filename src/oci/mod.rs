@@ -1221,8 +1221,10 @@ impl OciConfig {
         }
 
         // NVIDIA environment variables.
-        let env: Vec<(String, String)> =
-            gpu_environment(gpu).into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+        let env: Vec<(String, String)> = gpu_environment(gpu)
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
         self = self.with_env(&env);
         Ok(self)
     }

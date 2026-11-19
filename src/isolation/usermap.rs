@@ -42,12 +42,8 @@ pub fn subid_range_for(path: &str, username: &str, uid: u32) -> Option<SubidRang
         for line in contents.lines() {
             let mut it = line.split(':');
             match (it.next(), it.next(), it.next()) {
-                (Some(name), Some(start), Some(count))
-                    if name == by && !name.is_empty() =>
-                {
-                    if let (Ok(start), Ok(count)) =
-                        (start.parse::<u32>(), count.parse::<u32>())
-                    {
+                (Some(name), Some(start), Some(count)) if name == by && !name.is_empty() => {
+                    if let (Ok(start), Ok(count)) = (start.parse::<u32>(), count.parse::<u32>()) {
                         if count > 0 {
                             return Some(SubidRange { start, count });
                         }
@@ -133,11 +129,15 @@ pub fn uid_is_mapped_in_current_userns(uid: u32) -> bool {
 pub fn current_username() -> Option<String> {
     // Prefer the real uid; fall back to environment if the libc lookup fails.
     let uid = nix::unistd::getuid().as_raw();
-    if let Some(cname) = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid)).ok().flatten()
+    if let Some(cname) = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
+        .ok()
+        .flatten()
     {
         return Some(cname.name);
     }
-    std::env::var("USER").or_else(|_| std::env::var("LOGNAME")).ok()
+    std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .ok()
 }
 
 /// Parse a single `container:host:size` mapping triplet (Podman `--uidmap` /
@@ -229,8 +229,7 @@ impl IdMapping {
         // Reject mapping host UID 0 unless explicitly allowed (e.g., root-remapped mode)
         if !allow_host_root && self.host_id == 0 && self.count > 0 {
             return Err(NucleusError::ConfigError(
-                "ID mapping includes host UID/GID 0; use a nonzero host range"
-                    .to_string(),
+                "ID mapping includes host UID/GID 0; use a nonzero host range".to_string(),
             ));
         }
 
@@ -327,8 +326,14 @@ impl UserNamespaceConfig {
         // and within what remains above the caller's own uid to avoid overlap.
         let ucount = urange.count.min(65_536);
         let gcount = grange.count.min(65_536);
-        let uid_mappings = vec![IdMapping::new(0, uid, 1), IdMapping::new(1, urange.start, ucount)];
-        let gid_mappings = vec![IdMapping::new(0, gid, 1), IdMapping::new(1, grange.start, gcount)];
+        let uid_mappings = vec![
+            IdMapping::new(0, uid, 1),
+            IdMapping::new(1, urange.start, ucount),
+        ];
+        let gid_mappings = vec![
+            IdMapping::new(0, gid, 1),
+            IdMapping::new(1, grange.start, gcount),
+        ];
         info!(
             "auto userns: container 0 -> host {}, container 1..{} -> host {}..{}",
             uid,
@@ -423,10 +428,10 @@ impl UserNamespaceConfig {
     pub fn needs_setuid_helper(&self) -> bool {
         let uid = nix::unistd::getuid().as_raw();
         let gid = nix::unistd::getgid().as_raw();
-        let trivial_uid = self.uid_mappings.len() == 1
-            && self.uid_mappings[0] == IdMapping::new(0, uid, 1);
-        let trivial_gid = self.gid_mappings.len() == 1
-            && self.gid_mappings[0] == IdMapping::new(0, gid, 1);
+        let trivial_uid =
+            self.uid_mappings.len() == 1 && self.uid_mappings[0] == IdMapping::new(0, uid, 1);
+        let trivial_gid =
+            self.gid_mappings.len() == 1 && self.gid_mappings[0] == IdMapping::new(0, gid, 1);
         !(trivial_uid && trivial_gid)
     }
 
@@ -752,9 +757,9 @@ mod tests {
             Some(IdMapping::new(1, 100_000, 65_536))
         );
         // Malformed inputs are rejected, not panicking.
-        assert_eq!(parse_map_triplet("0:1000"), None);        // missing size
-        assert_eq!(parse_map_triplet("0:1000:1:9"), None);    // too many fields
-        assert_eq!(parse_map_triplet("x:1000:1"), None);      // non-numeric
+        assert_eq!(parse_map_triplet("0:1000"), None); // missing size
+        assert_eq!(parse_map_triplet("0:1000:1:9"), None); // too many fields
+        assert_eq!(parse_map_triplet("x:1000:1"), None); // non-numeric
     }
 
     #[test]
@@ -770,12 +775,18 @@ mod tests {
         // Name lookup wins over uid.
         assert_eq!(
             subid_range_for(p, "alice", 1000),
-            Some(SubidRange { start: 200_000, count: 65_536 })
+            Some(SubidRange {
+                start: 200_000,
+                count: 65_536
+            })
         );
         // Numeric uid fallback when no name match.
         assert_eq!(
             subid_range_for(p, "nobody", 1000),
-            Some(SubidRange { start: 300_000, count: 65_536 })
+            Some(SubidRange {
+                start: 300_000,
+                count: 65_536
+            })
         );
         // No match at all.
         assert_eq!(subid_range_for(p, "ghost", 4242), None);
@@ -792,11 +803,7 @@ mod tests {
         assert_eq!(cfg.uid_mappings.len(), 2);
         assert_eq!(cfg.uid_mappings[1], IdMapping::new(1, 100_000, 65_536));
         // Missing gid specs is an error.
-        assert!(UserNamespaceConfig::from_map_specs(
-            &["0:1000:1".to_string()],
-            &[],
-        )
-        .is_err());
+        assert!(UserNamespaceConfig::from_map_specs(&["0:1000:1".to_string()], &[],).is_err());
         // Malformed spec is an error.
         assert!(UserNamespaceConfig::from_map_specs(
             &["bogus".to_string()],
