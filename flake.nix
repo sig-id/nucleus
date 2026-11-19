@@ -300,7 +300,7 @@
 
         # Build dependencies only (for caching). The stubbed sources use none of
         # the dependencies, so silence cargo's unused-dependency lint there only.
-        cargoArtifacts = if cargoLockExists then craneLib.buildDepsOnly (commonArgs // {
+        cargoArtifacts = if cargoLockExists then craneLib.buildDepsOnly (removeAttrs commonArgs [ "src" ] // {
           dummySrc = craneLib.mkDummySrc {
             inherit src;
             extraDummyScript = ''
