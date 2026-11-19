@@ -919,6 +919,7 @@ impl SeccompManager {
                 errno_rules.push(ErrnoRule {
                     nr,
                     arg0: None,
+                    arg1: None,
                     errno: libc::ENOSYS,
                 });
             }
@@ -1235,13 +1236,35 @@ impl SeccompManager {
             ErrnoRule {
                 nr: libc::SYS_clone3,
                 arg0: None,
+                arg1: None,
                 errno: libc::ENOSYS,
             },
             // Nix wrappers probe PR_SET_MM_ARG_START and tolerate EPERM.
             ErrnoRule {
                 nr: libc::SYS_prctl,
                 arg0: Some(libc::PR_SET_MM as u32),
+                arg1: None,
                 errno: libc::EPERM,
+            },
+            // coreutils 9.x `cp` probes FICLONE (and FICLONERANGE) on every
+            // copy attempt and falls back to a plain read/write loop when the
+            // ioctl fails with EOPNOTSUPP. Killing the probe would terminate
+            // ordinary file copies with SIGSYS on modern distributions, so the
+            // request is denied with the errno the kernel returns on
+            // filesystems without reflink support. Both fds are already open
+            // under the filter's file rules, so the fallback path performs the
+            // same copy with equivalent permissions.
+            ErrnoRule {
+                nr: libc::SYS_ioctl,
+                arg0: None,
+                arg1: Some(libc::FICLONE as u32),
+                errno: libc::EOPNOTSUPP,
+            },
+            ErrnoRule {
+                nr: libc::SYS_ioctl,
+                arg0: None,
+                arg1: Some(libc::FICLONERANGE as u32),
+                errno: libc::EOPNOTSUPP,
             },
         ]
     }
@@ -2137,6 +2160,30 @@ mod tests {
     #[test]
     fn test_trace_filter_compiles() {
         SeccompManager::compile_trace_filter().expect("trace filter must compile");
+    }
+
+    #[test]
+    fn test_ioctl_ficlone_denied_with_eopnotsupp_for_fallback() {
+        // coreutils cp (9.x) probes FICLONE/FICLONERANGE on every copy and
+        // falls back to a read/write loop on EOPNOTSUPP. Without the errno
+        // override the probe hit the default deny and cp died with SIGSYS.
+        for request in [libc::FICLONE as u32, libc::FICLONERANGE as u32] {
+            assert!(
+                SeccompManager::errno_denied_syscalls().iter().any(|rule| {
+                    rule.nr == libc::SYS_ioctl
+                        && rule.arg1 == Some(request)
+                        && rule.errno == libc::EOPNOTSUPP
+                }),
+                "ioctl request {request:#x} must be denied with EOPNOTSUPP so cp falls back"
+            );
+        }
+        // The FICLONE fallback must not relax the terminal-only ioctl
+        // allowlist: unknown request codes still fall to the default deny.
+        let rules = SeccompManager::minimal_filter(false, &[]).unwrap();
+        let ioctl_rules = rules
+            .get(&libc::SYS_ioctl)
+            .expect("ioctl stays arg-filtered");
+        assert!(!ioctl_rules.is_empty());
     }
 
     #[test]
