@@ -991,10 +991,70 @@ const DENIED_CALLER_OWNED_SOURCE_PREFIXES: &[&str] = &[
     "/var/run",
     "/var/spool",
     "/nix/var",
-    // Nucleus' own state: container records, runtime mounts, signing keys.
+    // Nucleus' own state when run as root: container records, runtime
+    // mounts, signing keys. Rootless locations are resolved at run time by
+    // `nucleus_private_paths`.
     "/var/lib/nucleus",
     "/run/nucleus",
+    "/run/nucleus-gvisor",
 ];
+
+/// Where this caller's Nucleus keeps state that a workload must never see:
+/// container records, gVisor artifacts, and the image and checkpoint keys.
+///
+/// These are the rootless counterparts of the fixed `/var/lib/nucleus` and
+/// `/run/nucleus` entries. They live in directories the caller owns, so the
+/// ownership test alone would admit them.
+fn nucleus_private_paths() -> Vec<PathBuf> {
+    let uid = nix::unistd::Uid::effective().as_raw();
+    let mut paths = vec![
+        PathBuf::from(format!("/tmp/nucleus-{uid}")),
+        std::env::temp_dir().join(format!("nucleus-gvisor-{uid}")),
+        PathBuf::from("/tmp/nucleus-checkpoint-hmac.key"),
+    ];
+    if let Some(runtime) = dirs::runtime_dir() {
+        paths.extend([runtime.join("nucleus"), runtime.join("nucleus-gvisor")]);
+    }
+    if let Some(data) = dirs::data_local_dir() {
+        paths.push(data.join("nucleus"));
+    }
+    if let Some(home) = dirs::home_dir() {
+        paths.push(home.join(".nucleus"));
+    }
+    // Operator-chosen locations for the same state.
+    paths.extend(
+        [
+            "NUCLEUS_STATE_DIR",
+            "NUCLEUS_GVISOR_ARTIFACT_BASE",
+            crate::image::IMAGE_SIGNING_KEY_ENV,
+            crate::image::IMAGE_VERIFY_KEY_ENV,
+        ]
+        .into_iter()
+        .filter_map(std::env::var_os)
+        .filter(|value| !value.is_empty())
+        .filter_map(|value| std::path::absolute(value).ok()),
+    );
+    // Match however the caller spelled the source: compare the resolved
+    // form of each location as well.
+    let resolved: Vec<_> = paths
+        .iter()
+        .filter_map(|path| path.canonicalize().ok())
+        .collect();
+    paths.extend(resolved);
+    paths
+}
+
+/// Refuse a caller-owned volume that would expose `private`, or part of it.
+pub(crate) fn reject_overlap_with_private_path(source: &Path, private: &Path) -> Result<()> {
+    if private.starts_with(source) || source.starts_with(private) {
+        return Err(NucleusError::ConfigError(format!(
+            "Caller-owned volume source '{}' would expose Nucleus state at '{}'",
+            source.display(),
+            private.display()
+        )));
+    }
+    Ok(())
+}
 
 /// Shared parents whose own contents belong to many owners. A caller-owned
 /// volume must be a directory strictly below them.
@@ -1027,6 +1087,9 @@ fn reject_denied_caller_owned_source(source: &Path) -> Result<()> {
                 denied
             )));
         }
+    }
+    for private in nucleus_private_paths() {
+        reject_overlap_with_private_path(source, &private)?;
     }
     for shared in SHARED_CALLER_OWNED_SOURCE_PARENTS {
         if Path::new(shared).starts_with(source) {
@@ -2098,6 +2161,54 @@ mod tests {
         if let Some(home) = dirs::home_dir() {
             assert!(verify_caller_owned_volume_source(&home).is_err());
         }
+    }
+
+    #[test]
+    fn caller_owned_volume_refuses_rootless_nucleus_state() {
+        // Rootless state lives in directories the caller owns, so only the
+        // explicit exclusion keeps it out of a workload's reach.
+        let private = nucleus_private_paths();
+        let uid = nix::unistd::Uid::effective().as_raw();
+        assert!(private.contains(&PathBuf::from(format!("/tmp/nucleus-{uid}"))));
+        for dir in [dirs::runtime_dir(), dirs::data_local_dir()]
+            .into_iter()
+            .flatten()
+        {
+            assert!(private.contains(&dir.join("nucleus")), "{dir:?}");
+        }
+        if let Some(home) = dirs::home_dir() {
+            assert!(private.contains(&home.join(".nucleus")));
+        }
+
+        let state = Path::new("/srv/agent/nucleus-state");
+        for source in [
+            "/srv/agent/nucleus-state",
+            "/srv/agent/nucleus-state/containers",
+            // An ancestor exposes the state just as well.
+            "/srv/agent",
+        ] {
+            let err = reject_overlap_with_private_path(Path::new(source), state).unwrap_err();
+            assert!(err.to_string().contains("Nucleus state"), "{err}");
+        }
+        reject_overlap_with_private_path(Path::new("/srv/agent/attempts/1"), state).unwrap();
+        reject_overlap_with_private_path(Path::new("/srv/agent/nucleus-state-2"), state).unwrap();
+    }
+
+    #[test]
+    fn caller_owned_volume_refuses_a_real_state_directory() {
+        let dir = caller_owned_scratch();
+        let state = dir.path().join("state");
+        std::fs::create_dir(&state).unwrap();
+        let attempt = dir.path().join("attempt");
+        std::fs::create_dir(&attempt).unwrap();
+        let state = state.canonicalize().unwrap();
+
+        // Exercised through the same check the verifier runs for each
+        // resolved private path.
+        let records = state.join("records");
+        std::fs::create_dir(&records).unwrap();
+        assert!(reject_overlap_with_private_path(&records, &state).is_err());
+        assert!(reject_overlap_with_private_path(&attempt.canonicalize().unwrap(), &state).is_ok());
     }
 
     #[test]

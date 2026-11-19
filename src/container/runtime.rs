@@ -285,6 +285,7 @@ impl Container {
             && config.workspace.mode != super::WorkspaceMode::CopyInOut)
             || !config.provider_configs.is_empty()
             || !config.secrets.is_empty()
+            || config.broker_socket.is_some()
             || config
                 .volumes
                 .iter()

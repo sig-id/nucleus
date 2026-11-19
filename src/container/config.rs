@@ -1796,6 +1796,16 @@ impl ContainerConfig {
                         )));
                     }
                     crate::filesystem::pin_bind_volume_source(source, caller_owned.as_ref())?;
+                    // A --root override is state the default locations do
+                    // not know about.
+                    if let (Some(_), Some(state_root)) = (caller_owned, &self.state_root) {
+                        for root in [Some(state_root.clone()), state_root.canonicalize().ok()]
+                            .into_iter()
+                            .flatten()
+                        {
+                            crate::filesystem::reject_overlap_with_private_path(source, &root)?;
+                        }
+                    }
                 }
                 VolumeSource::Tmpfs { .. } => {}
             }
