@@ -729,7 +729,12 @@ table bridge {table} {{
     ///
     /// Creates a memfd-backed resolv.conf and bind-mounts it over
     /// /etc/resolv.conf so it works even when the rootfs /etc is read-only.
-    /// The memfd is cleaned up when the container exits.
+    /// The memfd is cleaned up when the container exits. Kernels that cannot
+    /// clone a memfd's internal shmem mount reject that bind with EINVAL even
+    /// for root (verified on Linux 7.3.3 where both `open_tree(OPEN_TREE_CLONE)`
+    /// and `mount(2)` `MS_BIND` fail on memfds while regular-file binds work),
+    /// so a staging-file bind is used as the fallback instead of failing
+    /// container start.
     pub fn bind_mount_resolv_conf(root: &std::path::Path, dns: &[String]) -> Result<()> {
         let content: String = dns
             .iter()
@@ -770,18 +775,23 @@ table bridge {table} {{
         let target =
             crate::filesystem::mount_target(root, std::path::Path::new("etc/resolv.conf"), false)?;
         let memfd_path = format!("/proc/self/fd/{}", memfd.as_raw_fd());
-        crate::filesystem::bind_tree(
+        match crate::filesystem::bind_tree(
             std::path::Path::new(&memfd_path),
             &target,
             false,
             crate::filesystem::READ_ONLY | libc::MOUNT_ATTR_NOEXEC,
-        )?;
-
-        // memfd dropped here – the mount holds a kernel reference to the file,
-        // so it survives the fd close.
-
-        info!("Bind-mounted resolv.conf for bridge networking (rootfs mode, memfd)");
-        Ok(())
+        ) {
+            Ok(()) => {
+                // memfd dropped here – the mount holds a kernel reference to
+                // the file, so it survives the fd close.
+                info!("Bind-mounted resolv.conf for bridge networking (rootfs mode, memfd)");
+                Ok(())
+            }
+            Err(e) => {
+                warn!("memfd resolv.conf bind rejected ({e}); binding staging file instead");
+                Self::bind_mount_resolv_conf_staging(root, dns)
+            }
+        }
     }
 
     /// Fallback: bind-mount a staging resolv.conf file.
@@ -917,6 +927,67 @@ mod tests {
             "ORIGINAL_HOST_CONTENT\n",
             "resolv.conf setup must not write through attacker-controlled /tmp symlinks"
         );
+    }
+
+    #[test]
+    #[ignore = "requires CAP_SYS_ADMIN over a private mount namespace (run inside a user namespace or as root)"]
+    fn bind_mount_resolv_conf_overlays_read_only_etc() {
+        // Run in a fork child with a private mount namespace.
+        match unsafe { nix::unistd::fork().unwrap() } {
+            nix::unistd::ForkResult::Parent { child } => assert_eq!(
+                nix::sys::wait::waitpid(child, None).unwrap(),
+                nix::sys::wait::WaitStatus::Exited(child, 0)
+            ),
+            nix::unistd::ForkResult::Child => {
+                let result = std::panic::catch_unwind(|| {
+                    nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNS).unwrap();
+                    nix::mount::mount(
+                        None::<&str>,
+                        "/",
+                        None::<&str>,
+                        nix::mount::MsFlags::MS_PRIVATE | nix::mount::MsFlags::MS_REC,
+                        None::<&str>,
+                    )
+                    .unwrap();
+                    let temp = tempfile::tempdir().unwrap();
+                    let root = temp.path().join("rootfs");
+                    std::fs::create_dir_all(root.join("etc")).unwrap();
+                    // Pre-existing host resolv.conf that the bind must shadow.
+                    std::fs::write(root.join("etc/resolv.conf"), "nameserver 192.0.2.99\n")
+                        .unwrap();
+
+                    let outcome =
+                        BridgeNetwork::bind_mount_resolv_conf(&root, &["203.0.113.53".to_string()]);
+                    if let Err(e) = &outcome {
+                        eprintln!("bind_mount_resolv_conf error: {e}");
+                    }
+                    outcome.expect("resolv.conf bind must succeed via memfd or staging fallback");
+
+                    assert_eq!(
+                        std::fs::read_to_string(root.join("etc/resolv.conf")).unwrap(),
+                        "nameserver 203.0.113.53\n",
+                        "bind must shadow the underlying file"
+                    );
+                    let err = std::fs::write(root.join("etc/resolv.conf"), b"x").unwrap_err();
+                    assert_eq!(
+                        err.raw_os_error(),
+                        Some(libc::EROFS),
+                        "bind must be read-only"
+                    );
+                    let staging = std::fs::read_dir(temp.path())
+                        .unwrap()
+                        .filter_map(|e| e.ok())
+                        .filter(|e| {
+                            e.file_name()
+                                .to_string_lossy()
+                                .starts_with(".resolv.conf.nucleus.")
+                        })
+                        .count();
+                    assert_eq!(staging, 0, "no staging leftovers may remain on disk");
+                });
+                unsafe { libc::_exit(i32::from(result.is_err())) }
+            }
+        }
     }
 
     /// All interfaces, sockets, forwarding and firewall changes in this test live
