@@ -317,6 +317,17 @@ pub(crate) enum HookNamespace {
     Container,
 }
 
+const HOOK_WAIT_MAX: std::time::Duration = std::time::Duration::from_millis(50);
+
+fn next_hook_wait(
+    delay: &mut std::time::Duration,
+    remaining: std::time::Duration,
+) -> std::time::Duration {
+    let wait = (*delay).min(remaining);
+    *delay = (*delay * 2).min(HOOK_WAIT_MAX);
+    wait
+}
+
 /// A runtime-namespace hook validated before entering the container namespaces.
 #[derive(Debug)]
 pub(crate) struct PreparedHook {
@@ -708,6 +719,9 @@ impl OciHooks {
         let timeout_secs = hook.timeout.unwrap_or(30) as u64;
         let start = std::time::Instant::now();
         let timeout = std::time::Duration::from_secs(timeout_secs);
+        // Fast hooks should not pay the old fixed 50 ms polling interval. Start
+        // small, then cap the polling cost for longer-running hooks.
+        let mut wait_delay = std::time::Duration::from_millis(1);
 
         loop {
             match child.try_wait() {
@@ -748,7 +762,8 @@ impl OciHooks {
                             phase, hook.path, timeout_secs
                         )));
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    let remaining = timeout.saturating_sub(start.elapsed());
+                    std::thread::sleep(next_hook_wait(&mut wait_delay, remaining));
                 }
                 Err(e) => {
                     return Err(NucleusError::HookError(format!(
@@ -2775,6 +2790,19 @@ mod tests {
         drop(f);
     }
 
+    #[test]
+    fn hook_wait_backoff_starts_at_one_ms_and_caps_at_fifty_ms() {
+        let mut delay = std::time::Duration::from_millis(1);
+        let remaining = std::time::Duration::from_secs(1);
+        let waits: Vec<_> = (0..8)
+            .map(|_| next_hook_wait(&mut delay, remaining).as_millis())
+            .collect();
+        assert_eq!(waits, [1, 2, 4, 8, 16, 32, 50, 50]);
+
+        let short_remaining = std::time::Duration::from_millis(7);
+        assert_eq!(next_hook_wait(&mut delay, short_remaining), short_remaining);
+    }
+
     fn bash_hook(body: &str) -> OciHook {
         let bash = Path::new(&find_bash()).canonicalize().unwrap();
         OciHook {
@@ -3003,6 +3031,14 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("exited with status"));
+    }
+
+    #[test]
+    fn test_oci_hook_timeout_kills_and_reaps_child() {
+        let mut hook = bash_hook("sleep 30");
+        hook.timeout = Some(0);
+        let err = OciHooks::execute_hook(&hook, "{}", "test").unwrap_err();
+        assert!(err.to_string().contains("timed out after 0s"));
     }
 
     #[test]
