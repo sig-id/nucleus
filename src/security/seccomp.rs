@@ -1808,6 +1808,8 @@ fn syscall_name_to_number(name: &str) -> Option<i64> {
         "fadvise64" => Some(SYS_FADVISE64),
         "fsync" => Some(libc::SYS_fsync),
         "fdatasync" => Some(libc::SYS_fdatasync),
+        "statfs" => Some(libc::SYS_statfs),
+        "fstatfs" => Some(libc::SYS_fstatfs),
         "flock" => Some(libc::SYS_flock),
         #[cfg(any(
             target_arch = "x86_64",
@@ -1949,6 +1951,10 @@ fn syscall_name_to_number(name: &str) -> Option<i64> {
         "times" => Some(libc::SYS_times),
         "sched_yield" => Some(libc::SYS_sched_yield),
         "sched_getaffinity" => Some(libc::SYS_sched_getaffinity),
+        "sched_getparam" => Some(libc::SYS_sched_getparam),
+        "sched_getscheduler" => Some(libc::SYS_sched_getscheduler),
+        "llistxattr" => Some(libc::SYS_llistxattr),
+        "lgetxattr" => Some(libc::SYS_lgetxattr),
         "getcpu" => Some(libc::SYS_getcpu),
         "rseq" => Some(libc::SYS_rseq),
         "close_range" => Some(libc::SYS_close_range),
@@ -2445,6 +2451,22 @@ mod tests {
     fn test_generic_file_syscall_names_resolve_for_profiles() {
         assert_eq!(syscall_name_to_number("fadvise64"), Some(SYS_FADVISE64));
         assert_eq!(syscall_name_to_number("sendfile"), Some(SYS_SENDFILE));
+    }
+
+    #[test]
+    fn test_base_allowed_read_only_queries_resolve_for_profiles() {
+        let base = SeccompManager::base_allowed_syscalls();
+        for (name, nr) in [
+            ("statfs", libc::SYS_statfs),
+            ("fstatfs", libc::SYS_fstatfs),
+            ("llistxattr", libc::SYS_llistxattr),
+            ("lgetxattr", libc::SYS_lgetxattr),
+            ("sched_getparam", libc::SYS_sched_getparam),
+            ("sched_getscheduler", libc::SYS_sched_getscheduler),
+        ] {
+            assert_eq!(syscall_name_to_number(name), Some(nr), "{name}");
+            assert!(base.contains(&nr), "{name} must stay base-allowed");
+        }
     }
 
     #[test]
